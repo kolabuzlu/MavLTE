@@ -285,6 +285,43 @@ class GuiTest(unittest.TestCase):
         self.assertEqual(self.text(app.camera.status), "No photo: " + mr.SNAP_PROBLEMS[mr.SNAP_NO_CAMERA])
         self.assertEqual(app.camera.status.cget("fg"), mavlte.AMBER)
 
+    def test_position_of_the_aircraft(self):
+        app = self.app
+        value = lambda label: self.text(app.craft_values[label])  # noqa: E731
+
+        def report(**kw):
+            fields = dict(gnss_time=int(time.time()), lat=411234567, lon=289876543, alt=150_000, sats=11,
+                          fix=mr.FIX_3D, fc_silent=0)
+            fields.update(kw)
+            self.loop.call_soon_threadsafe(self.vehicle.send_packet, mr.POSITION, mr.Position(**fields).pack())
+
+        self.pump(lambda: app.camera.enabled, what="aircraft online")
+        report(fix=mr.FIX_NONE, lat=mr.UNKNOWN_I32, lon=mr.UNKNOWN_I32, sats=3)
+        self.pump(lambda: value("Position") == "GNSS searching (3 satellites)", what="searching")
+        self.assertEqual(value("Module"), "flight controller talking")
+        self.assertEqual(app.map_link.cget("fg"), mavlte.LED_OFF)  # nothing to show on a map yet
+        report(flags=mr.POS_FC_SILENT, fc_silent=130, battery_pct=78, battery_mv=3950)  # it came down
+        self.pump(lambda: value("Position") == "41.12346, 28.98765 · 11 satellites", what="live position")
+        self.assertEqual(value("Module"), "flight controller silent for 2 min · battery 78%")
+        self.assertEqual(app.craft_values["Module"].cget("fg"), mavlte.RED)
+        self.assertEqual(app.map_link.cget("fg"), mavlte.BLUE)
+        copied, opened = [], []
+        with mock.patch.object(app.root, "clipboard_clear"), \
+                mock.patch.object(app.root, "clipboard_append", copied.append), \
+                mock.patch.object(mavlte.webbrowser, "open", opened.append):
+            app.copy_position()
+            app.open_map()
+        self.assertEqual(copied, ["41.123457, 28.987654"])
+        self.assertEqual(opened, ["https://www.google.com/maps/search/?api=1&query=41.123457,28.987654"])
+
+        # the aircraft goes quiet too: its last known position stays, in amber
+        self.relay.ONLINE_TIMEOUT = 0.5
+        self.vehicle_quiet = True
+        self.loop.call_soon_threadsafe(self.vehicle_task.cancel)
+        self.pump(lambda: value("Position").startswith("last known 41.12346, 28.98765, "), what="last known")
+        self.assertEqual(app.craft_values["Position"].cget("fg"), mavlte.AMBER)
+        self.assertEqual(value("Module"), "-")
+
     def test_wrong_key_says_no_answer(self):
         app = self.app
         app.apply_settings(app.settings.name, app.settings.server, KEY_V.hex())  # not the GCS key: no answer

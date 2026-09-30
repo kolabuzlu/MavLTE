@@ -141,7 +141,8 @@ def wait_for(test, cond, what, timeout=8.0, pump=None):
 class PlaneTest(unittest.TestCase):
     def setUp(self):
         for name, value in (("STARTUP_QUICK", (0.05, 0.05, 0.05)), ("REGISTER_AGAIN_S", 0.2), ("RAT_SWITCH_S", 0.2),
-                            ("EVENTS", {})):  # the link's random troubles have tests of their own
+                            ("EVENTS", {}),  # the link's random troubles have tests of their own
+                            ("GNSS_TTFF_QUICK", 0.5), ("LOCATOR_INTERVAL", 0.2)):
             patcher = mock.patch.object(plane_sim, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -271,6 +272,41 @@ class PlaneTest(unittest.TestCase):
         g.loop.call_soon_threadsafe(inbox.request, 0)
         wait_for(self, lambda: inbox.problem, "the answer")
         self.assertEqual(inbox.problem, mr.SNAP_PROBLEMS[mr.SNAP_NO_CAMERA])
+
+    def test_locator_after_a_crash(self):
+        """The flight battery goes (a crash): the LTE module runs on in its cell and keeps reporting where
+        the plane is, and that the flight controller is silent."""
+        p, g = self.plane, self.ground
+        positions = []
+
+        async def attach():
+            g.gcs.on_packet = lambda ptype, body: positions.append(mr.Position.unpack(body)) if ptype == mr.POSITION \
+                else None
+
+        g.run(attach())
+        silent = mock.patch.object(mr, "FC_SILENT_S", 1)
+        silent.start()
+        self.addCleanup(silent.stop)
+        p.call(p.set_cell, True)
+        p.call(p.set_lte, True)
+        p.call(p.set_battery, True)
+        wait_for(self, lambda: any(pos.has_fix for pos in positions), "a GNSS fix at the ground station")
+        pos = [pos for pos in positions if pos.has_fix][-1]
+        self.assertLess(abs(pos.lat - 411234567) + abs(pos.lon - 289876543), 2000)  # within a few metres
+        self.assertFalse(pos.fc_is_silent)
+        self.assertEqual(pos.battery_pct, 100)
+
+        p.call(p.set_battery, False)
+        wait_for(self, lambda: not g.fc_clients, "flight controller dead")
+        wait_for(self, lambda: positions[-1].fc_is_silent, "the module reports the silence")
+        last = positions[-1]
+        self.assertTrue(last.has_fix)
+        self.assertLess(abs(last.lat - 411234567) + abs(last.lon - 289876543), 2000)  # where it came down
+        self.assertEqual(last.speed, 0)
+        self.assertIsNotNone(p.modem)  # on its cell
+
+        p.call(p.set_cell, False)  # the cell out as well: now it is gone
+        wait_for(self, lambda: p.modem is None, "module off")
 
     def test_module_starts_switched_off(self):
         p = self.plane
@@ -430,7 +466,7 @@ class WindowTest(unittest.TestCase):
                          pump=root.update)
                 wait_for(self, lambda: win.lte_led.color == ui.BLUE, "steady blue: a GCS is there",
                          pump=root.update)
-                expected = "Ready: Snapshot in MavLTE takes a photo" if plane_sim.Image is not None \
+                expected = "Ready for Snapshot in MavLTE" if plane_sim.Image is not None \
                     else "Needs Pillow: pip install pillow"
                 self.assertEqual(text(win.camera_text), expected)
                 win.toggle_camera(False)

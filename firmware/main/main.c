@@ -3,7 +3,9 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
+#include "sdkconfig.h"
 
+#include "battery.h"
 #include "board.h"
 #include "bridge.h"
 #include "modem.h"
@@ -24,6 +26,9 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     board_get();
+#if CONFIG_BRIDGE_LOCATOR
+    battery_start();
+#endif
     bridge_start();
     status_start();
     modem_start();

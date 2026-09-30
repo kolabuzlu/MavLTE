@@ -114,6 +114,15 @@ MAX_BACKLOG_S = 2.0  # data queued in the network beyond this much sending time 
 # the rest stays for the telemetry, and less when the round trip shows the link filling up.
 CAMERA_QUALITY = 80
 PHOTO_CAP = {NET_2G: 2048, NET_LTE: 32768}
+# The LTE module's own GNSS (the A7670E has one): time to its first fix after the module powers on (a
+# cold start; the real one takes half a minute or so under an open sky), and its typical error.
+GNSS_TTFF = 25.0
+GNSS_TTFF_QUICK = 3.0
+GNSS_ERROR_M = 2.0
+LOCATOR_INTERVAL = 5.0  # seconds between the module's position reports, as the firmware sends them
+# The 18650 cell in the board's holder keeps the module on without the flight battery: a 3000 mAh cell at
+# about 150 mA (ESP32, the modem idling between reports, GNSS) lasts some 20 hours.
+CELL_HOURS = 20.0
 
 
 def speed_text(bytes_per_s: float) -> str:
@@ -199,13 +208,18 @@ class FcState:
         self.armed = False
         self.volts: Optional[float] = None
         self.alt: Optional[float] = None  # metres above home
-        # for the camera: where the plane is and how it lies in the air
+        # for the camera and the LTE module's GNSS: where the plane is and how it lies in the air
         self.lat = self.lon = mr.UNKNOWN_I32  # 1e-7 degrees
         self.alt_mm = mr.UNKNOWN_I32  # above home
+        self.alt_msl_mm = mr.UNKNOWN_I32  # above sea level
         self.heading = mr.UNKNOWN_HEADING  # centidegrees
+        self.vx = self.vy = 0  # cm/s, north and east
         self.roll = self.pitch = 0.0  # degrees, right wing down and nose up positive
+        self.last_rx = 0.0  # when the flight controller last sent anything (time.monotonic), 0: never
 
     def feed(self, data: bytes, now: float) -> None:
+        if data:
+            self.last_rx = now
         buf = self.buf
         buf += data
         i = 0
@@ -249,8 +263,10 @@ class FcState:
             roll, pitch = struct.unpack_from("<ff", payload, 4)
             if math.isfinite(roll) and math.isfinite(pitch):
                 self.roll, self.pitch = math.degrees(roll), math.degrees(pitch)
-        elif msgid == 33:  # GLOBAL_POSITION_INT: lat, lon (1e-7 degrees), relative_alt (mm), hdg (cdeg)
-            self.lat, self.lon, _, self.alt_mm = struct.unpack_from("<iiii", payload, 4)
+        elif msgid == 33:  # GLOBAL_POSITION_INT: lat, lon (1e-7 degrees), alt, relative_alt (mm), vx, vy
+            # (cm/s), hdg (cdeg)
+            self.lat, self.lon, self.alt_msl_mm, self.alt_mm = struct.unpack_from("<iiii", payload, 4)
+            self.vx, self.vy = struct.unpack_from("<hh", payload, 20)
             self.heading = struct.unpack_from("<H", payload, 26)[0]
             self.alt = self.alt_mm / 1000
 
@@ -386,16 +402,49 @@ class Network(sitl_demo.LinkEmulator):
                 transport.close()
 
 
+class Gnss:
+    """The LTE module's GNSS receiver: no fix for a while after the module powers on (a cold start),
+    then where the plane is, with a real receiver's small errors. `truth` is where the plane really is:
+    SITL's position while the flight controller lives, and after it dies where the plane came down."""
+
+    def __init__(self, started: float, ttff: float, rng: Optional[random.Random] = None) -> None:
+        self.started, self.ttff = started, ttff
+        self.rng = rng or random.Random()
+
+    def read(self, now: float, truth: Optional[Tuple[int, int, int, int, int]], moving: bool) -> mr.Position:
+        since = now - self.started
+        if truth is None or since < self.ttff:
+            return mr.Position(gnss_time=int(time.time()) if since > 1 else 0, sats=min(3, int(since / 8)))
+        lat, lon, alt, vx, vy = truth
+        err = self.rng.gauss
+        m_to_lat = 1e7 / 111_320  # 1e-7 degrees per metre
+        m_to_lon = m_to_lat / max(0.01, math.cos(math.radians(lat / 1e7)))
+        speed, course = (math.hypot(vx, vy), math.degrees(math.atan2(vy, vx)) % 360) if moving else (0.0, 0.0)
+        return mr.Position(
+            gnss_time=int(time.time()),
+            lat=int(lat + err(0, GNSS_ERROR_M) * m_to_lat),
+            lon=int(lon + err(0, GNSS_ERROR_M) * m_to_lon),
+            alt=mr.UNKNOWN_I32 if alt == mr.UNKNOWN_I32 else int(alt + err(0, 2 * GNSS_ERROR_M) * 1000),
+            speed=min(mr.U16_UNKNOWN - 1, int(speed)),
+            course=int(course * 100),
+            hdop=self.rng.randint(70, 110),
+            sats=self.rng.randint(9, 12),
+            fix=mr.FIX_3D,
+        )
+
+
 class Modem:
     """One power-on of the LTE module."""
 
-    def __init__(self) -> None:
+    def __init__(self, gnss_ttff: float = GNSS_TTFF) -> None:
         self.started = time.monotonic()
         self.stage = "starting"  # starting, searching, registered, data (mobile data up)
         self.net: Optional[Network] = None
         self.client: Optional[mr.TunnelClient] = None
         self.batcher: Optional[mr.Batcher] = None
         self.photos: Optional[mr.PhotoOutbox] = None
+        self.gnss = Gnss(self.started, gnss_ttff)
+        self.position: Optional[mr.Position] = None  # the last one reported
 
     def send(self, chunk: bytes) -> None:
         if self.client is not None and self.client.gcs_present:  # like the firmware: held back without a GCS
@@ -413,11 +462,16 @@ class Plane:
         self.start_fc = start_fc  # starts the flight controller (SITL); None: it runs by itself
         # the switches
         self.battery = False
-        self.lte = False  # switched on, the module runs whenever the battery is on
+        self.lte = False  # switched on, the module runs whenever the battery (or its cell) is on
         self.camera = Image is not None  # the board's CAM DIP switch
+        self.cell = False  # an 18650 cell in the board's holder: the module runs on without the flight battery
         self.quick = False
         self.network = NET_LTE
         self.signal = GOOD_SIGNAL
+        self.cell_pct = 100.0
+        self.cell_at = time.monotonic()
+        # where the plane really is (lat, lon, alt MSL mm, vx, vy), as SITL last said: the GNSS's truth
+        self.truth: Optional[Tuple[int, int, int, int, int]] = None
         # flight controller
         self.fc = FcState()
         self.fc_error = ""
@@ -445,13 +499,17 @@ class Plane:
     def set_battery(self, on: bool) -> None:
         if on == self.battery:
             return
+        self._cell_update()
         self.battery = on
         if on:
             self.fc, self.fc_error = FcState(), ""
             self.fc_task = self.loop.create_task(self._power_up())
         else:
-            log.info("battery off")
-            self._modem_off()
+            if self.cell and self.modem is not None:
+                log.info("battery off: the flight controller is dead; the LTE module runs on its cell")
+            else:
+                log.info("battery off")
+                self._modem_off()
             if self.fc_task is not None:
                 self.fc_task.cancel()
                 self.fc_task = None
@@ -459,10 +517,34 @@ class Plane:
 
     def set_lte(self, on: bool) -> None:
         self.lte = on
-        if on and self.battery:
+        if on and (self.battery or self.cell):
             self._modem_on()
         elif not on:
             self._modem_off()
+
+    def set_cell(self, on: bool) -> None:
+        """Puts the 18650 cell in the board's holder, or takes it out."""
+        self._cell_update()
+        self.cell = on
+        log.info("LTE module: cell %s", "in" if on else "out")
+        if on and self.lte and not self.battery:
+            self._modem_on()
+        elif not on and not self.battery:
+            self._modem_off()
+
+    def _cell_update(self) -> None:
+        """The cell charges from the flight battery (about 1% a minute) and runs the module without it."""
+        now = time.monotonic()
+        elapsed, self.cell_at = now - self.cell_at, now
+        if not self.cell:
+            return
+        if self.battery:
+            self.cell_pct = min(100.0, self.cell_pct + elapsed / 60)
+        elif self.modem is not None:
+            self.cell_pct = max(0.0, self.cell_pct - elapsed / (CELL_HOURS * 36))
+            if self.cell_pct <= 0:
+                log.warning("LTE module: its cell is empty")
+                self._modem_off()
 
     def set_network(self, network: int) -> None:
         old, self.network = self.network, network
@@ -532,7 +614,10 @@ class Plane:
 
     def _from_fc(self, data: bytes) -> None:
         now = time.monotonic()
-        self.fc.feed(data, now)
+        fc = self.fc
+        fc.feed(data, now)
+        if fc.lat != mr.UNKNOWN_I32:
+            self.truth = (fc.lat, fc.lon, fc.alt_msl_mm, fc.vx, fc.vy)
         m = self.modem
         if m is not None and m.batcher is not None:
             for chunk in m.batcher.feed(data, now):
@@ -562,7 +647,7 @@ class Plane:
 
     def _modem_on(self) -> None:
         if self.modem is None:
-            self.modem = Modem()
+            self.modem = Modem(GNSS_TTFF_QUICK if self.quick else GNSS_TTFF)
             self.modem_task = self.loop.create_task(self._modem_run(self.modem))
 
     def _modem_off(self) -> None:
@@ -613,6 +698,7 @@ class Plane:
         """Sends what the batcher holds once it is 50 ms old, as the firmware does, and logs the
         relay session coming and going."""
         session = 0
+        reported = 0.0
         while True:
             await asyncio.sleep(0.005)
             now = time.monotonic()
@@ -620,12 +706,29 @@ class Plane:
             if chunk:
                 m.send(chunk)
             m.photos.pump(now)
+            if now - reported >= LOCATOR_INTERVAL and m.client.session:  # the locator, as the firmware
+                reported = now
+                self._cell_update()
+                m.position = self._position(m, now)
+                m.client.send_packet(mr.POSITION, m.position.pack())
             if m.client.session != session:
                 session = m.client.session
                 if session:
                     log.info("LTE module: connected to the relay %s (session %08x)", self.server_text, session)
                 else:
                     log.warning("LTE module: lost the relay session")
+
+    def _position(self, m: Modem, now: float) -> mr.Position:
+        """The module's position report: its GNSS, how long the flight controller has been silent, and
+        its cell, if it has one."""
+        heard = self.fc.last_rx
+        silent = mr.U16_UNKNOWN if not heard else min(mr.U16_UNKNOWN - 1, int(now - heard))
+        flags = mr.POS_FC_SILENT if heard and silent >= mr.FC_SILENT_S else 0
+        pos = m.gnss.read(now, self.truth, moving=not flags)
+        if self.cell:
+            pct = int(round(self.cell_pct))
+            pos = pos._replace(battery_pct=pct, battery_mv=3300 + 9 * pct)
+        return pos._replace(flags=pos.flags | flags, fc_silent=silent)
 
     def _radio(self) -> Tuple[int, int]:
         rat = NETWORKS[self.network][1]
@@ -650,6 +753,7 @@ class Plane:
 
         def off() -> None:
             self.set_battery(False)
+            self._modem_off()  # a module on its cell runs on without the battery
             done.set()
 
         self.call(off)
@@ -792,8 +896,9 @@ class SimWindow:
         self.lte_bars = ui.Bars(top, s, ui.SURFACE)
         self.lte_bars.pack(side="right")
         self.lte_values = self._grid(card, ("State", "Network", "Signal", "Link", "Round trip", "GCS", "Data",
-                                            "Camera"),
-                                     {"Network": self._network, "Signal": self._signal, "Camera": self._camera})
+                                            "Camera", "GPS", "Backup cell"),
+                                     {"Network": self._network, "Signal": self._signal, "Camera": self._camera,
+                                      "Backup cell": self._backup_cell})
         self.quick = tk.BooleanVar(value=self.plane.quick)
         tk.Checkbutton(card, text="Quick start (the real modem takes about 16 s)", variable=self.quick,
                        command=self.toggle_quick, bg=ui.SURFACE, fg=ui.TEXT, selectcolor=ui.FIELD,
@@ -901,6 +1006,23 @@ class SimWindow:
     def toggle_quick(self) -> None:
         self.plane.quick = self.quick.get()
 
+    def _backup_cell(self, parent) -> tk.Frame:
+        """An 18650 cell in the board's holder: with it, the module runs on when the flight battery goes
+        (a crash, say), and keeps reporting where the plane is."""
+        s = self.scale
+        frame = tk.Frame(parent, bg=ui.SURFACE)
+        self.cell_switch = ui.Switch(frame, s * 0.8, ui.SURFACE, self.toggle_cell)
+        self.cell_switch.set(self.plane.cell)
+        self.cell_switch.pack(side="left", anchor="n", pady=(round(2 * s), 0))
+        self.cell_text = tk.Label(frame, text="", bg=ui.SURFACE, fg=ui.TEXT, font=self.font, anchor="w",
+                                  justify="left", wraplength=round(230 * s))
+        self.cell_text.pack(side="left", padx=(round(8 * s), 0))
+        return frame
+
+    def toggle_cell(self, on: bool) -> None:
+        self.cell_switch.set(on)
+        self.plane.call(self.plane.set_cell, on)
+
     def toggle_camera(self, on: bool) -> None:
         on = on and Image is not None
         self.camera_switch.set(on)
@@ -934,7 +1056,33 @@ class SimWindow:
         self._show_fc(now)
         self._show_lte(now, blink=self.tick % 10 < 5)
         self._show_camera()
+        self._show_locator()
         self.poll_job = self.root.after(self.POLL_MS, self.poll)
+
+    def _show_locator(self) -> None:
+        """What the module's GNSS reports, and its cell."""
+        p = self.plane
+        m = p.modem
+        pos = m.position if m is not None else None
+        if m is None:
+            gps = "-"
+        elif pos is None:
+            gps = "Starting…" if m.stage != "data" else "-"
+        elif pos.has_fix:
+            gps = f"{pos.lat / 1e7:.5f}, {pos.lon / 1e7:.5f} · {pos.sats} satellites"
+        else:
+            gps = f"Searching ({pos.sats} satellites)" if p.truth is not None or pos.sats else \
+                "Searching (start the flight controller to give the plane a place)"
+        self._set(self.lte_values["GPS"], gps)
+        if not p.cell:
+            cell = "None: off with the flight battery"
+        elif p.battery:
+            cell = f"{p.cell_pct:.0f}%, charging"
+        elif m is not None:
+            cell = f"{p.cell_pct:.0f}%, the module runs on it"
+        else:
+            cell = f"{p.cell_pct:.0f}%"
+        self._set(self.cell_text, cell)
 
     def _show_camera(self) -> None:
         p = self.plane
@@ -943,7 +1091,7 @@ class SimWindow:
             text = "Needs Pillow: pip install pillow"
         elif not p.camera:
             text = "Off: the aircraft answers that it has no camera"
-        elif not p.battery:
+        elif not p.battery and p.modem is None:  # (on the board, the camera also runs on the module's cell)
             text = "-"
         elif photos is not None and photos.busy:
             sender = photos.sender
@@ -955,7 +1103,7 @@ class SimWindow:
             text = (f"Sent {info.width}×{info.height}, {info.size / 1024:.0f} KB in {took:.1f} s" if sent
                     else f"Gave up on {info.width}×{info.height}: nothing more from the relay")
         else:
-            text = "Ready: Snapshot in MavLTE takes a photo"
+            text = "Ready for Snapshot in MavLTE"
         self._set(self.camera_text, text)
 
     def _show_fc(self, now: float) -> None:
@@ -998,7 +1146,7 @@ class SimWindow:
             color = ui.BLUE
         self.lte_led.set(color)
 
-        if not p.battery:
+        if m is None and not p.battery and not p.cell:
             state = "No power: the battery is off"
         elif m is None:
             state = "Off"

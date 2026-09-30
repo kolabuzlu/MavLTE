@@ -1,6 +1,7 @@
 #include "modem.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,6 +21,7 @@
 
 #include "board.h"
 #include "bridge.h"
+#include "locator.h"
 #include "status.h"
 
 #define MODEM_UART UART_NUM_1
@@ -30,6 +32,8 @@
 #define NVS_NAMESPACE "modem"
 #define NVS_BAD_PIN "bad_pin"     /* the menuconfig SIM PIN that the SIM card rejected */
 #define NVS_SLOW_UART "slow_uart" /* 1: the modem did not answer at CONFIG_BRIDGE_MODEM_BAUD */
+#define NVS_NO_CMUX "no_cmux"     /* 1: the modem did not take CMUX: plain data calls, no GNSS during them */
+#define RADIO_EVERY_MS 10000      /* signal and network, read again during a CMUX data call */
 
 #if CONFIG_BRIDGE_NETWORK_LTE_ONLY
 #define NETWORK_MODE 38 /* AT+CNMP: LTE only */
@@ -46,6 +50,8 @@ static EventGroupHandle_t events;
 static bool power_switchable; /* DIP switch "4G" is off, so the firmware controls the modem's power */
 static bool pin_rejected;     /* never retry a wrong SIM PIN: three tries lock the SIM */
 static bool fast_baud_failed; /* the modem took AT+IPR but did not answer at that rate: stay at BOOT_BAUD */
+static bool cmux_off;         /* data calls without the multiplexer (it failed, or no locator) */
+static bool in_cmux;          /* this data call runs over CMUX: AT commands still work during it */
 static int baud = BOOT_BAUD;
 
 static uint32_t now_ms(void)
@@ -203,6 +209,45 @@ static bool set_fast_baud(void)
     return esp_modem_sync(dce) == ESP_OK;
 }
 
+static char answer[320]; /* the modem's answer to the last command() */
+
+static esp_err_t answer_line(uint8_t *data, size_t len)
+{
+    size_t n = len < sizeof(answer) - 1 ? len : sizeof(answer) - 1;
+    memcpy(answer, data, n);
+    answer[n] = '\0';
+    if (strstr(answer, "\nOK") || strncmp(answer, "OK", 2) == 0) {
+        return ESP_OK;
+    }
+    if (strstr(answer, "ERROR")) {
+        return ESP_FAIL;
+    }
+    return ESP_ERR_TIMEOUT; /* more to come */
+}
+
+/* Sends an AT command ("AT...\r") and keeps its whole answer in `answer`. */
+static esp_err_t command(const char *at, uint32_t timeout_ms)
+{
+    answer[0] = '\0';
+    return esp_modem_command(dce, at, answer_line, timeout_ms);
+}
+
+/* The line of `answer` that starts with `prefix`, into out; "" if there is none. */
+static const char *answer_field(const char *prefix, char *out, size_t n)
+{
+    const char *p = strstr(answer, prefix);
+    size_t i = 0;
+    if (p) {
+        for (p += strlen(prefix); *p == ' '; p++) {
+        }
+        for (; p[i] && p[i] != '\r' && p[i] != '\n' && i < n - 1; i++) {
+            out[i] = p[i];
+        }
+    }
+    out[i] = '\0';
+    return out;
+}
+
 /* A wrong PIN counts on the SIM card across restarts, and three lock it: once the SIM rejects the
  * PIN from menuconfig, it is remembered in flash and not sent again, not even after a restart. */
 static bool pin_known_bad(void)
@@ -296,6 +341,21 @@ static bool configure(void)
             esp_modem_set_network_mode(dce, NETWORK_MODE); /* the modem saves it */
         }
     }
+    static bool identified;
+    if (!identified && command("AT+SIMCOMATI\r", 2000) == ESP_OK) { /* the GNSS answers differ between them */
+        identified = true;
+        char model[40], revision[48];
+        ESP_LOGI(TAG, "modem %s, firmware %s", answer_field("Model:", model, sizeof(model)),
+                 answer_field("Revision:", revision, sizeof(revision)));
+    }
+#if CONFIG_BRIDGE_LOCATOR
+    /* The GNSS runs from now on, during data calls too, so that a fix is at hand whenever it is read
+     * (after its "+CGNSSPWR: READY!", 10-30 s later). Its NMEA stays off the UART, which carries PPP. */
+    if (command("AT+CGNSSPWR=1\r", 5000) != ESP_OK) {
+        ESP_LOGW(TAG, "the modem's GNSS did not start (%s)", answer);
+    }
+    command("AT+CGNSSTST=0\r", 2000);
+#endif
     return true;
 }
 
@@ -391,9 +451,50 @@ static void report_radio(void)
     bridge_set_radio(dbm, act >= 0 && act < 0xFF ? (uint8_t)act : BRIDGE_RAT_UNKNOWN);
 }
 
+#if CONFIG_BRIDGE_LOCATOR
+static unsigned cmux_failures;
+
+/* The modem refused the multiplexer: after the second time in a row, data calls go without it (and
+ * without GNSS readings during them), remembered in flash like the UART speed. */
+static void cmux_failed(void)
+{
+    if (++cmux_failures < 2) {
+        ESP_LOGW(TAG, "the modem did not take CMUX; trying again");
+        return;
+    }
+    cmux_off = true;
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u8(nvs, NVS_NO_CMUX, 1);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    ESP_LOGW(TAG, "the modem does not take CMUX: data calls without it from now on, so no GNSS positions during "
+                  "them (erase the flash to try again)");
+    bridge_set_gnss(NULL);
+}
+#endif
+
 static bool dial(void)
 {
     xEventGroupClearBits(events, PPP_UP | PPP_DOWN);
+    in_cmux = false;
+#if CONFIG_BRIDGE_LOCATOR
+    if (!cmux_off) {
+        /* PPP on one CMUX channel, AT commands (GNSS, signal) on another, over the same UART */
+        if (esp_modem_set_mode(dce, ESP_MODEM_MODE_CMUX) != ESP_OK) {
+            if (esp_modem_get_mode(dce) != ESP_MODEM_MODE_CMUX) { /* the multiplexer did not start */
+                cmux_failed();
+            } else { /* it did, but the data call did not */
+                ESP_LOGW(TAG, "the modem did not accept the data call (APN \"%s\")", CONFIG_BRIDGE_APN);
+            }
+            return false;
+        }
+        cmux_failures = 0;
+        in_cmux = true;
+        esp_modem_set_echo(dce, false); /* each CMUX channel has its own echo setting */
+    } else
+#endif
     if (esp_modem_set_mode(dce, ESP_MODEM_MODE_DATA) != ESP_OK) {
         ESP_LOGW(TAG, "the modem did not accept the data call (APN \"%s\")", CONFIG_BRIDGE_APN);
         return false;
@@ -410,7 +511,26 @@ static bool dial(void)
  * esp_modem_sync() finds out whether it still answers. */
 static void hang_up(void)
 {
-    esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
+    if (esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND) != ESP_OK && in_cmux) {
+        /* The A7670 answers the multiplexer's close-down with a frame esp_modem does not accept: it
+         * reports a failure, although both sides have left CMUX. Forget the mode, so that the next
+         * data call is allowed to start it again. */
+        esp_modem_set_mode(dce, ESP_MODEM_MODE_UNDEF);
+    }
+    in_cmux = false;
+}
+
+/* A modem still in CMUX from before the ESP32 restarted does not answer plain AT commands: the
+ * multiplexer's close-down frame (DLCI 0) takes it back, at either rate it may run at. */
+static void leave_cmux(void)
+{
+    static const char close_down[] = "\xF9\x03\xEF\x05\xC3\x01\xF2\xF9";
+    const int rates[2] = {CONFIG_BRIDGE_MODEM_BAUD, BOOT_BAUD};
+    for (int i = 0; i < 2; i++) {
+        uart_set_baudrate(MODEM_UART, rates[i]);
+        baud = rates[i];
+        command(close_down, 300); /* no answer that counts */
+    }
 }
 
 /* Last resort: new esp_modem instance and, if we control it, a power cycle of the modem. */
@@ -434,9 +554,67 @@ static void hard_reset(void)
 
 typedef enum { LINK_PPP_LOST, LINK_RELAY_SILENT } link_end_t;
 
-/* Watches the connection until it ends. */
+#if CONFIG_BRIDGE_LOCATOR
+/* 1e-7 degrees as text, without floating point in printf */
+static const char *degrees(char *out, size_t n, int32_t v)
+{
+    uint32_t a = v < 0 ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+    snprintf(out, n, "%s%" PRIu32 ".%06" PRIu32, v < 0 ? "-" : "", a / 10000000, a % 10000000 / 10);
+    return out;
+}
+
+/* The GNSS position, over the CMUX command channel while PPP runs on the other. Before the GNSS is
+ * ready the modem answers ERROR: then there is simply no reading this time. */
+static void read_gnss(void)
+{
+    static int had_fix = -1;
+    static bool shown_raw;
+    static uint32_t last_time;
+    gnss_fix_t fix;
+    if (command("AT+CGNSSINFO\r", 2000) != ESP_OK || !gnss_parse(answer, &fix)) {
+        return; /* the next reading, in a few seconds */
+    }
+    if (fix.fix >= GNSS_FIX_2D && fix.time && fix.time == last_time) {
+        gnss_clear(&fix); /* the same fix again, its time standing still: the GNSS has lost it */
+    }
+    last_time = fix.time;
+    bridge_set_gnss(&fix);
+    int has_fix = fix.fix >= GNSS_FIX_2D;
+    if (has_fix && !shown_raw) { /* the modem's own words, once: their form differs between firmware versions */
+        shown_raw = true;
+        char raw[140];
+        ESP_LOGI(TAG, "GNSS: %s", answer_field("+CGNSSINFO:", raw, sizeof(raw)));
+    }
+    if (has_fix != had_fix) {
+        had_fix = has_fix;
+        if (has_fix) {
+            char lat[16], lon[16];
+            ESP_LOGI(TAG, "GNSS: position %s, %s from %u satellites", degrees(lat, sizeof(lat), fix.lat),
+                     degrees(lon, sizeof(lon), fix.lon), fix.sats);
+        } else {
+            ESP_LOGI(TAG, "GNSS: no position yet (is its antenna on the board's GNSS connector, under open sky?)");
+        }
+    }
+}
+#endif
+
+/* Signal and network again, for the link status (only possible during a CMUX data call). */
+static void read_radio(void)
+{
+    char name[ESP_MODEM_C_API_STR_BUF_SIZE] = "";
+    int act = -1;
+    int16_t dbm = signal_dbm();
+    esp_modem_get_operator_name(dce, name, &act);
+    bridge_set_radio(dbm, act >= 0 && act < 0xFF ? (uint8_t)act : BRIDGE_RAT_UNKNOWN);
+}
+
+/* Watches the connection until it ends; during a CMUX call, reads the GNSS and the signal too. */
 static link_end_t stay_online(void)
 {
+    uint32_t last_radio = now_ms();
+#if CONFIG_BRIDGE_LOCATOR
+    uint32_t last_gnss = now_ms() - 60000;
+#endif
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(events, PPP_DOWN, pdFALSE, pdFALSE, pdMS_TO_TICKS(1000));
         if (bits & PPP_DOWN) {
@@ -447,6 +625,19 @@ static link_end_t stay_online(void)
         if (bridge_relay_silence_ms() > RELAY_SILENCE_LIMIT_MS) {
             ESP_LOGW(TAG, "nothing from the relay for %d minutes; redialling", RELAY_SILENCE_LIMIT_MS / 60000);
             return LINK_RELAY_SILENT;
+        }
+        if (!in_cmux) {
+            continue;
+        }
+#if CONFIG_BRIDGE_LOCATOR
+        if ((uint32_t)(now_ms() - last_gnss) >= CONFIG_BRIDGE_LOCATOR_INTERVAL * 1000) {
+            last_gnss = now_ms();
+            read_gnss();
+        }
+#endif
+        if ((uint32_t)(now_ms() - last_radio) >= RADIO_EVERY_MS) {
+            last_radio = now_ms();
+            read_radio();
         }
     }
 }
@@ -467,10 +658,15 @@ static void modem_task(void *arg)
             continue;
         }
         if (!sync_modem(30000)) {
-            ESP_LOGE(TAG, "the modem does not answer on its UART");
-            failures++;
-            hard_reset();
-            continue;
+            leave_cmux();
+            if (sync_modem(5000)) {
+                ESP_LOGI(TAG, "the modem was still multiplexed (CMUX) from before the ESP32 restarted");
+            } else {
+                ESP_LOGE(TAG, "the modem does not answer on its UART");
+                failures++;
+                hard_reset();
+                continue;
+            }
         }
         if (!set_fast_baud()) {
             failures++;
@@ -518,10 +714,17 @@ void modem_start(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_LOST_IP, on_ip_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, on_ppp_status, NULL));
     nvs_handle_t nvs;
-    uint8_t slow = 0;
+    uint8_t slow = 0, no_cmux = 0;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
         nvs_get_u8(nvs, NVS_SLOW_UART, &slow);
+        nvs_get_u8(nvs, NVS_NO_CMUX, &no_cmux);
         nvs_close(nvs);
+    }
+    if (no_cmux) {
+        cmux_off = true;
+        bridge_set_gnss(NULL);
+        ESP_LOGW(TAG, "data calls without CMUX, so no GNSS positions during them: the modem did not take it before "
+                      "(erase the flash to try again)");
     }
     if (slow) {
         fast_baud_failed = true;

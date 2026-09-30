@@ -6,7 +6,8 @@
  * Sends a MAVLink 2 frame (msgid 0, payload = 32-bit counter + 5 zero bytes) every 5 ms while
  * connected and echoes every frame it receives back to the server. Its camera takes the same
  * photo every time: PHOTO_BYTES bytes, byte i = (i * 13 + 7) & 0xFF, over Istanbul at 120 m, heading
- * 45 degrees. Prints its statistics on exit. Used by relay/tests/test_c_client.py. */
+ * 45 degrees. Its locator reports, once a second, a GNSS fix at the same place (11 satellites), with the
+ * flight controller silent for 42 s. Prints its statistics on exit. Used by relay/tests/test_c_client.py. */
 #define _POSIX_C_SOURCE 200809L
 
 #include <netdb.h>
@@ -18,6 +19,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "locator.h"
 #include "mavframe.h"
 #include "snapshot.h"
 #include "tunnel.h"
@@ -148,7 +150,7 @@ int main(int argc, char **argv)
     const snap_config_t snap_cfg = {.take = take, .release = release};
     snap_init(&snap, &tun, &snap_cfg);
 
-    uint32_t start = now_ms(), last_frame = start, counter = 0;
+    uint32_t start = now_ms(), last_frame = start, last_position = start, counter = 0;
     uint32_t duration = (uint32_t)atoi(argv[4]) * 1000;
     uint8_t rx[2048];
     while ((uint32_t)(now_ms() - start) < duration) {
@@ -175,6 +177,15 @@ int main(int argc, char **argv)
         }
         mav_batcher_poll(&batcher, now, 20, emit, NULL);
         snap_poll(&snap, now, 65536.0f);
+        if (tun_connected(&tun) && (uint32_t)(now - last_position) >= 1000) {
+            uint8_t body[LOCATOR_BODY_LEN];
+            gnss_fix_t fix;
+            gnss_parse("+CGNSSINFO: 3,06,03,02,4107.407402,N,02859.259258,E,300926,120000.0,150.5,0.0,0.0,1.2,0.9,0.8",
+                       &fix);
+            last_position = now;
+            locator_pack(body, &fix, LOCATOR_FC_SILENT, 42, LOCATOR_U16_UNKNOWN, LOCATOR_BATTERY_UNKNOWN);
+            tun_send_packet(&tun, TUN_POSITION, body, sizeof(body));
+        }
     }
     printf("sessions=%u tx_packets=%u tx_bytes=%u rx_packets=%u rx_bytes=%u dropped=%u bad=%u frames=%u "
            "photos=%u\n",

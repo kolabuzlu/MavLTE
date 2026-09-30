@@ -6,7 +6,8 @@ on each: Available (green, left) while the aircraft's LTE module is online at th
 the switches; Connected (blue, next to the switch) while it is online and that port is on. Both
 switches start off. With both off the app only watches: the aircraft holds its telemetry back.
 Snapshot asks the aircraft for a photo from its camera, whatever the switches; photos are kept in
-Pictures\\MavLTE, each with a .json beside it saying when and where it was taken.
+Pictures\\MavLTE, each with a .json beside it saying when and where it was taken. Position shows
+where the LTE module's own GNSS puts the aircraft, live or last known, with a map link.
 
     python mavlte.py            (or double-click MavLTE.pyw, or run MavLTE.exe: build_release.py)
 
@@ -31,6 +32,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 import uuid
+import webbrowser
 from dataclasses import dataclass
 from tkinter import messagebox, ttk
 from typing import Callable, List, Optional, Tuple
@@ -884,11 +886,17 @@ class App:
         grid = tk.Frame(craft, bg=SURFACE)
         grid.pack(fill="x", padx=pad, pady=(0, pad))
         self.craft_values = {}
-        for row, label in enumerate(("Signal", "Round trip", "Packet loss", "Traffic")):
+        for row, label in enumerate(("Link", "Packet loss", "Traffic", "Position", "Module")):
             tk.Label(grid, text=label, bg=SURFACE, fg=MUTED, font=self.font).grid(row=row, column=0, sticky="w")
-            value = tk.Label(grid, text="-", bg=SURFACE, fg=TEXT, font=self.font, anchor="w")
-            value.grid(row=row, column=1, sticky="w", padx=(12, 0))
+            cell = tk.Frame(grid, bg=SURFACE)
+            cell.grid(row=row, column=1, sticky="w", padx=(12, 0))
+            value = tk.Label(cell, text="-", bg=SURFACE, fg=TEXT, font=self.font, anchor="w")
+            value.pack(side="left")
             self.craft_values[label] = value
+            if label == "Position":  # the LTE module's own GNSS: where to look for the aircraft
+                self.map_link = self._link(cell, "Map", self.open_map)
+                self.copy_link = self._link(cell, "Copy", self.copy_position)
+        self.shown_fix: Optional[mr.Position] = None  # the position Map and Copy use
         self.camera = CameraRow(self, craft)
         self.camera.pack(fill="x")
         newest = photo_files(self.settings.photo_folder())
@@ -1181,6 +1189,7 @@ class App:
             self.craft_bars.set(None)
             self.rate_mark = (now, agent.to_gcs_bytes, agent.from_gcs_bytes) if agent else (now, 0, 0)
             self.rates = (0.0, 0.0)
+            self._show_position(agent, False)
             return
         if status is None:
             self.craft_led.set(LED_OFF)
@@ -1196,19 +1205,87 @@ class App:
             self._set(self.craft_state, f"Offline, last heard {status.idle_ms / 1000:.0f} s ago")
         online = bool(status and status.online)
         self.craft_bars.set(self._bars(status) if online else None)
-        if online:
-            radio = [mr.RAT_NAMES.get(status.rat, "")] if status.rat != mr.RAT_UNKNOWN else []
+        if online:  # the aircraft's radio and its round trip to the relay, on one line
+            link = [mr.RAT_NAMES.get(status.rat, "")] if status.rat != mr.RAT_UNKNOWN else []
             if status.rssi_dbm != mr.RSSI_UNKNOWN:
-                radio.append(f"{status.rssi_dbm} dBm")
-            self._set(v["Signal"], " ".join(radio) or "not reported")
-            self._set(v["Round trip"], f"{status.rtt_ms} ms, aircraft ↔ relay" if status.rtt_ms != mr.U16_UNKNOWN
-                      else "-")
+                link.append(f"{status.rssi_dbm} dBm")
+            link = [" ".join(link)] if link else []
+            if status.rtt_ms != mr.U16_UNKNOWN:
+                link.append(f"round trip {status.rtt_ms} ms")
+            self._set(v["Link"], " · ".join(link) or "-")
             self._set(v["Packet loss"], f"up {mr.fmt_permille(status.up_loss)}, down {mr.fmt_permille(status.down_loss)}")
         else:
-            for label in ("Signal", "Round trip", "Packet loss"):
+            for label in ("Link", "Packet loss"):
                 self._set(v[label], "-")
         down, up = self.rates
         self._set(v["Traffic"], f"↓ {down / 1000:.1f} KB/s telemetry, ↑ {up / 1000:.1f} KB/s commands")
+        self._show_position(agent, online)
+
+    LIVE_S = 15.0  # a position report older than this (the module sends one every 5 s) is not live
+
+    def _show_position(self, agent, online: bool) -> None:
+        """The aircraft's own GNSS position, whatever its flight controller does: live while it reports,
+        else the last known one (the relay keeps it). Map and Copy take the one shown."""
+        pos = agent.position if agent is not None else None
+        fix = agent.last_fix if agent is not None else None
+        now_unix = time.time()
+        live = online and pos is not None and now_unix - pos.time < self.LIVE_S
+        shown, color = None, TEXT
+        if live and pos.has_fix:
+            shown = pos
+            text = f"{pos.lat / 1e7:.5f}, {pos.lon / 1e7:.5f} · {pos.sats} satellites"
+        elif fix is not None:
+            shown = fix
+            text = f"last known {fix.lat / 1e7:.5f}, {fix.lon / 1e7:.5f}, {mr.fmt_age(now_unix - fix.time)} ago"
+            color = AMBER if not online else MUTED
+        elif live and pos.flags & mr.POS_NO_GNSS:
+            text, color = "the LTE module cannot read its GNSS", MUTED
+        elif live:
+            text, color = f"GNSS searching ({pos.sats} satellites)", MUTED
+        else:
+            text, color = "-", TEXT
+        self.shown_fix = shown
+        self._paint(self.craft_values["Position"], text, color)
+        for link in (self.map_link, self.copy_link):
+            self._paint(link, link.cget("text"), BLUE if shown else LED_OFF)
+
+        module, color = "-", TEXT
+        if live:
+            if pos.fc_silent == mr.U16_UNKNOWN:
+                module, color = "flight controller not heard yet", AMBER
+            elif pos.fc_is_silent:
+                module, color = f"flight controller silent for {mr.fmt_age(pos.fc_silent)}", RED
+            else:
+                module = "flight controller talking"
+            if pos.battery_pct != mr.BATTERY_UNKNOWN:
+                module += f" · battery {pos.battery_pct}%"
+        self._paint(self.craft_values["Module"], module, color)
+
+    def _link(self, parent: tk.Misc, text: str, command: Callable[[], None]) -> tk.Label:
+        link = tk.Label(parent, text=text, bg=SURFACE, fg=LED_OFF, font=self.font_small, cursor="hand2")
+        link.pack(side="left", padx=(round(8 * self.scale), 0))
+        link.bind("<Button-1>", lambda _e: command())
+        return link
+
+    def open_map(self) -> None:
+        """The position on Google Maps (in the browser, or the Maps app on a phone), satellite view at hand."""
+        pos = self.shown_fix
+        if pos is not None:
+            webbrowser.open(f"https://www.google.com/maps/search/?api=1&query={pos.lat / 1e7:.6f},{pos.lon / 1e7:.6f}")
+
+    def copy_position(self) -> None:
+        pos = self.shown_fix
+        if pos is None:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(f"{pos.lat / 1e7:.6f}, {pos.lon / 1e7:.6f}")
+        self.copy_link.configure(text="Copied")
+        self.root.after(1500, lambda: self.copy_link.configure(text="Copy"))
+
+    @staticmethod
+    def _paint(label: tk.Label, text: str, color: str) -> None:
+        if label.cget("text") != text or label.cget("fg") != color:
+            label.configure(text=text, fg=color)
 
     @staticmethod
     def _set(label: tk.Label, text: str) -> None:

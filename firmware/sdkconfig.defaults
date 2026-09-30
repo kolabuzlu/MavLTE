@@ -29,3 +29,14 @@ CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
 
 # Camera (esp32-camera): its DMA buffer lives in internal RAM, as do the photos (PSRAM stays off)
 CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=16384
+
+# esp_modem's multiplexer (CMUX) with the A7670E, which sends frames of up to 1500 bytes (2-byte
+# lengths): no defragmenting into the DTE buffer, which then overflows; a buffer that grows for
+# the odd long answer instead; a pause between opening channels; room for whole AT answers.
+CONFIG_ESP_MODEM_CMUX_DEFRAGMENT_PAYLOAD=n
+CONFIG_ESP_MODEM_USE_INFLATABLE_BUFFER_IF_NEEDED=y
+CONFIG_ESP_MODEM_CMUX_DELAY_AFTER_DLCI_SETUP=100
+CONFIG_ESP_MODEM_C_API_STR_MAX=256
+
+# UART interrupts keep running while flash is written (the modem at 921600 baud has no flow control)
+CONFIG_UART_ISR_IN_IRAM=y

@@ -143,6 +143,13 @@ class CVehicleTest(unittest.IsolatedAsyncioTestCase):
         with open(path[:-4] + ".json") as f:
             self.assertEqual(json.load(f)["latitude"], 41.1234567)
 
+        # its locator, from the modem's answer to AT+CGNSSINFO (NMEA-style degrees and minutes)
+        await self.until(lambda: agent.last_fix is not None)
+        pos = agent.last_fix
+        self.assertEqual((pos.lat, pos.lon, pos.sats, pos.fix), (411234567, 289876543, 11, mr.FIX_3D))
+        self.assertEqual((pos.alt, pos.hdop, pos.fc_silent, pos.gnss_time), (150_500, 90, 42, 1790769600))
+        self.assertTrue(pos.fc_is_silent)
+
         out, err = await asyncio.wait_for(proc.communicate(), 15)
         self.assertEqual(proc.returncode, 0, err.decode())
         stats = dict(item.split("=") for item in out.decode().split())

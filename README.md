@@ -33,11 +33,15 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
   which comes to you through the relay without holding up the telemetry, with where and when it
   was taken. Only when you ask: the camera takes nothing by itself. The relay keeps photos for
   7 days, and the app collects the ones it missed when it next connects.
+- **Locator**: the LTE module's own GNSS reports where the aircraft is every 5 s, whatever the
+  flight controller does. After a crash that kills the flight controller, the module keeps
+  reporting as long as it has power (an 18650 cell on the board), and says the flight controller
+  has gone silent. The relay keeps the last known position; the app shows it with a map link.
 
 | Folder | What |
 |---|---|
 | [firmware/](firmware) | ESP-IDF firmware for the ESP32-S3 (PlatformIO or `idf.py`) |
-| [relay/](relay) | `mavrelay.py`: the relay server, the GCS agent and a Python vehicle for bench tests; `MavLTE.pyw` / `mavlte.py`: the MavLTE app (the GCS agent as a window), `build_release.py` makes it into `MavLTE.exe`; `sitl_demo.py`: the whole link with ArduPilot SITL on one PC; `PlaneSim.pyw` / `plane_sim.py`: SITL as a plane with a battery switch, a virtual LTE module and a virtual camera |
+| [relay/](relay) | `mavrelay.py`: the relay server, the GCS agent and a Python vehicle for bench tests; `MavLTE.pyw` / `mavlte.py`: the MavLTE app (the GCS agent as a window), `build_release.py` makes it into `MavLTE.exe`; `sitl_demo.py`: the whole link with ArduPilot SITL on one PC; `PlaneSim.pyw` / `plane_sim.py`: SITL as a plane with a battery switch, a virtual LTE module with its GNSS and a backup cell, and a virtual camera |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | Tunnel protocol |
 
 ## Setup, in order
@@ -74,7 +78,8 @@ Watch it work with `journalctl -u mavrelay -f`. Every five minutes it logs a sum
 logs every connection, address change and link loss as it happens.
 
 The aircraft's photos are kept in `/var/lib/mavrelay/snapshots` for 7 days (`snapshot_dir` and
-`snapshot_days` in `mavrelay.ini`), each as a `.jpg` with a `.json` beside it. Updating an older
+`snapshot_days` in `mavrelay.ini`), each as a `.jpg` with a `.json` beside it. Its last known
+position is in `/var/lib/mavrelay/locator.json`. Updating an older
 relay: run the installer again, which also installs the new service file (it gives the service
 that folder); your keys stay.
 
@@ -100,6 +105,7 @@ the chip to tell them apart and prints `board version V1` or `V2` at start-up.
 | Mobile network technology | Automatic (LTE, falls back to 2G) or LTE only |
 | Board version, flight controller pins | leave on detect / `-1` |
 | Flight controller baud rate | `115200` |
+| Locator | on, every 5 s |
 | Camera | on (off, or no camera fitted: the aircraft answers that it has none) |
 
 The rest (modem UART speed, batching, sending with no GCS connected, JPEG quality) can stay as
@@ -145,11 +151,19 @@ I (512) board: Waveshare ESP32-S3-A7670E-4G, board version V2
 I (522) bridge: flight controller: ESP32 TX GPIO2 -> FC RX, ESP32 RX GPIO3 <- FC TX, 115200 baud; relay ...
 I (532) modem: modem power on (GPIO21)
 I (9870) modem: modem UART at 921600 baud
+I (10120) modem: modem A7670E-FASE, firmware A7670M7_V1.11.1
 I (14210) modem: registered with Turkcell, LTE, signal -75 dBm
 I (16150) bridge: mobile data up, address 10.83.12.4
 I (16420) bridge: relay relay.example.com is 203.0.113.10, port 14650
 I (16530) bridge: connected to the relay (session 5c1e0a77)
+I (47120) modem: GNSS: 3,06,03,02,4107.407402,N,02859.259258,E,300926,120000.00,150.5,0.0,0.0,1.2,0.9,0.8
+I (47125) modem: GNSS: position 41.123457, 28.987654 from 11 satellites
 ```
+
+The GNSS needs half a minute or so under open sky for its first position after power-up (the
+modem's GNSS keeps nothing while it has no power, so every power-up is a cold start). The first
+position is also logged as the modem wrote it: its form differs between modem firmware versions,
+so that line and the modem's firmware line are worth including in a report if positions look wrong.
 
 Once a minute the bridge logs its counters: relay state, round-trip time, bytes each way.
 
@@ -184,13 +198,18 @@ flight controller. Either:
 
 - feed **5 V from its own BEC (2 A or more)** into the header's **5V** pin, or
 - run it from an **18650 cell** in the holder: it also keeps the link alive if the flight
-  battery fails. Both together work as well; the BEC then charges the cell.
+  battery fails. Both together work as well; the BEC then charges the cell. With both, the
+  **locator** keeps working after a crash that disconnects or destroys the flight battery: the
+  module reports its position on the cell for many hours, and the cell's charge from the board's
+  fuel gauge. On V2 boards the gauge shares the camera's bus, whose pull-up resistors take their
+  power from the camera: with DIP switch CAM off, the charge may not be known.
 
 The 5V pin is wired straight to the USB-C port's power line. Unplug the BEC (or the flight
 battery) before you connect USB-C to a PC.
 
-**Antennas and SIM.** Screw the LTE antenna onto the modem's main antenna connector; the GNSS
-antenna is not needed. Insert a nano-SIM with a data plan, PIN removed.
+**Antennas and SIM.** Screw the LTE antenna onto the modem's main antenna connector, and the
+GNSS antenna (the small ceramic patch) onto the board's GNSS connector, for the locator: mount it
+flat, facing the sky, away from the LTE antenna. Insert a nano-SIM with a data plan, PIN removed.
 
 **Camera.** It sits on the board's own connector, so it needs no wiring. Mount the board (or the
 camera on an extension cable) looking where you want your photos, away from the propeller.
@@ -246,12 +265,19 @@ server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
 - Each card has two **LEDs**. **Available** (green, on the left) lights while the aircraft's LTE
   module is online at the relay, even with the switches off. **Connected** (blue, next to the
   switch) lights while it is online and that port is on. The bars show its 4G signal. The
-  header shows the link to the relay, the *Aircraft* panel signal, round trip, packet loss and
-  traffic, and ☰ → Show log the details.
+  header shows the link to the relay, the *Aircraft* panel the aircraft's link (signal and
+  round trip), packet loss and traffic, and ☰ → Show log the details.
 - In Mission Planner pick **UDP**, port **14550**, or **TCP**, host **127.0.0.1**, port **5760**.
   QGroundControl finds UDP 14550 by itself.
 - With both switches off the app only watches: the Available LEDs keep working, but the aircraft
   holds its telemetry back, so it uses almost no mobile data.
+- **Position**, in the *Aircraft* panel, is where the LTE module's own GNSS puts the aircraft,
+  live every 5 s, whatever the switches. **Map** opens it in Google Maps (on a phone: the Maps
+  app), **Copy** puts the coordinates on the clipboard. With the aircraft offline, it shows the
+  last known position and how long ago that was (in amber): the relay keeps it, so the app shows
+  it even when it was closed at the time. **Module** says whether the flight controller still
+  talks to the module, in red when it has gone silent (a crash, say) while the module still
+  reports, and the module's battery when it has a cell.
 - **Snapshot**, at the bottom of the *Aircraft* panel, asks the aircraft for a photo, whatever the
   switches: pick **Small** (320×240, about 5–10 KB), **Medium** (640×480, 10–30 KB) or **Large**
   (1024×768, 25–80 KB) beside it. The line below shows the photo arriving; it then opens in a
@@ -276,7 +302,7 @@ and the agent reports the link to the relay and the aircraft as text:
 
 ```
 2026-09-30 14:02:11 INFO    connected to server 203.0.113.10:14650 (session 5c1e0a77)
-2026-09-30 14:02:12 INFO    vehicle: online, LTE -71 dBm, rtt to server 64 ms, loss up 0.0% down 0.0%
+2026-09-30 14:02:12 INFO    vehicle: online, LTE -71 dBm, rtt to server 64 ms, loss up 0.0% down 0.0%; GNSS 41.123457, 28.987654 (9 satellites, 3 s ago)
 ```
 
 The agent talks UDP to the relay, so a lost packet on a patchy laptop connection (a phone
@@ -364,6 +390,12 @@ section of `mavrelay.ini`.
   minute (excellent signal) to two or three minutes (fair), as the photo only takes what the
   telemetry leaves. With a weak 2G signal even the telemetry does not fit, and a photo hardly
   gets through.
+- **GPS** is the module's own GNSS: its first position about 25 s after the module powers on
+  (3 s with *Quick start*), then where the SITL plane is, within a few metres.
+- **Backup cell** is an 18650 cell in the board's holder. With it in, switch the **Battery**
+  off in flight to stage a crash: the flight controller dies, the module runs on and keeps
+  reporting where the plane came down, and MavLTE shows the flight controller silent (red).
+  Take the cell out as well, and the plane is gone: MavLTE keeps its last known position.
 
 Put the MavLTE app beside it and watch its LEDs follow: they go dark about 3 s after the plane
 goes quiet.
@@ -384,8 +416,9 @@ IP and UDP headers the way a mobile operator bills them:
 | what Mission Planner asks for (all streams at 4 Hz) | on | about 24 MB per hour |
 
 A full parameter download is about 0.1 MB. While no MavLTE app (or agent) is connected, the aircraft sends
-no telemetry, only the link check (about 0.5 MB per hour). A longer batch interval saves header
-bytes at the cost of telemetry delay; commands from the GCS are never delayed.
+no telemetry, only the link check (about 0.5 MB per hour) and the locator's position every 5 s
+(about 65 KB per hour). A longer batch interval saves header bytes at the cost of telemetry
+delay; commands from the GCS are never delayed.
 
 A photo costs its size plus about 6%: roughly 10 KB small, 25 KB medium, 60 KB large. Only the
 aircraft's uplink counts; photos coming again from the relay (to a second laptop, or ones
@@ -421,17 +454,19 @@ missed while the app was closed) travel over your laptop's internet.
 | `No photo: the aircraft has no camera` | DIP switch CAM on, the camera's ribbon cable seated in its connector (contacts the right way round), *Camera* on in menuconfig. The ESP32 log says why. |
 | `No photo: the camera could not take the photo` | The ESP32 log says why; for *Large*, too little free memory: take *Medium*. |
 | Photos have no position in their notes | The flight controller sends no `GLOBAL_POSITION_INT` on the bridge's port: set the `POSITION` stream rate (see above). |
+| Position says `GNSS searching` for minutes | The GNSS antenna on the board's GNSS connector, flat and with open sky above it; not under carbon fibre or metal. Indoors it hardly ever gets a fix. |
+| Position says `the LTE module cannot read its GNSS` | The modem did not take its multiplexer (CMUX), which reading the GNSS during the data call needs; the ESP32 log says so. The link works without it. To try again: erase the flash (`pio run -t erase`) and upload. |
 
 ## Development
 
 ```bash
 cd relay && python -m unittest discover -s tests       # relay, protocol, end-to-end over UDP
-cd firmware/test/host && make test                      # C core: SHA-256/HMAC, framing, tunnel, snapshots, position
+cd firmware/test/host && make test                      # C core: SHA-256/HMAC, framing, tunnel, snapshots, positions, GNSS
 ```
 
 On Linux, macOS or WSL the relay tests also build `firmware/test/host/tunnel_harness` and run the
 firmware's C tunnel code against the Python relay, including a relay restart, and have it send a
-photo to a Python GCS agent.
+photo and its GNSS position to a Python GCS agent.
 
 **One version number for everything:** the firmware (`firmware/main/version.h`) and the app,
 simulator and relay (`__version__` in `relay/mavrelay.py`) always carry the same number; a test

@@ -34,7 +34,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -305,6 +305,18 @@ def fmt_addr(addr) -> str:
 
 def fmt_permille(value: int) -> str:
     return "?" if value == U16_UNKNOWN else f"{value / 10:.1f}%"
+
+
+def fmt_age(seconds: float) -> str:
+    """12 s, 5 min, 3 h 20 min, 2 days."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s} s"
+    if s < 3600:
+        return f"{s // 60} min"
+    if s < 86400:
+        return f"{s // 3600} h {s % 3600 // 60} min" if s % 3600 >= 60 else f"{s // 3600} h"
+    return f"{s // 86400} days" if s >= 2 * 86400 else "1 day"
 
 
 def mono_ms() -> int:
@@ -582,6 +594,62 @@ def rto_for(rtt_ms: int) -> float:
 
 
 # ---------------------------------------------------------------------------------------------
+# Locator: where the aircraft is, from the LTE module's own GNSS, whatever the flight controller
+# does (docs/PROTOCOL.md, "Locator")
+
+POSITION = 13
+# GNSS time (unix seconds), latitude and longitude (1e-7 degrees), altitude (mm above sea level),
+# speed (cm/s), course (centidegrees), HDOP (x100), satellites used, fix, flags, seconds since the
+# flight controller was last heard, the module's battery (mV, %), time (unix seconds, set by the relay)
+POSITION_BODY = struct.Struct("<IiiiHHHBBBHHBI")
+FIX_NONE, FIX_2D, FIX_3D = 0, 2, 3
+POS_FC_SILENT = 0x01  # nothing from the flight controller for FC_SILENT_S or more
+POS_NO_GNSS = 0x02  # the module cannot read its GNSS (fix fields unknown)
+FC_SILENT_S = 10
+BATTERY_UNKNOWN = 0xFF
+
+
+class Position(NamedTuple):
+    gnss_time: int = 0
+    lat: int = UNKNOWN_I32  # 1e-7 degrees
+    lon: int = UNKNOWN_I32
+    alt: int = UNKNOWN_I32  # mm above mean sea level
+    speed: int = U16_UNKNOWN  # cm/s
+    course: int = U16_UNKNOWN  # centidegrees
+    hdop: int = U16_UNKNOWN  # x100
+    sats: int = 0
+    fix: int = FIX_NONE
+    flags: int = 0
+    fc_silent: int = U16_UNKNOWN  # seconds; U16_UNKNOWN: not heard since the module started
+    battery_mv: int = U16_UNKNOWN
+    battery_pct: int = BATTERY_UNKNOWN
+    time: int = 0  # unix seconds, when the relay got it
+
+    def pack(self) -> bytes:
+        return POSITION_BODY.pack(*self)
+
+    @classmethod
+    def unpack(cls, body: bytes) -> "Position":
+        return cls(*POSITION_BODY.unpack_from(body))
+
+    @property
+    def has_fix(self) -> bool:
+        return self.fix >= FIX_2D and self.lat != UNKNOWN_I32 and self.lon != UNKNOWN_I32
+
+    @property
+    def fc_is_silent(self) -> bool:
+        return bool(self.flags & POS_FC_SILENT)
+
+    def describe(self) -> str:
+        """For the log: where, or why not."""
+        if self.flags & POS_NO_GNSS:
+            return "no GNSS"
+        if not self.has_fix:
+            return f"no GNSS fix yet ({self.sats} satellites)"
+        return f"{self.lat / 1e7:.6f}, {self.lon / 1e7:.6f}, {self.sats} satellites"
+
+
+# ---------------------------------------------------------------------------------------------
 # Server
 
 
@@ -848,6 +916,70 @@ class PhotoStore:
                 gcs.deliveries = [s for s in gcs.deliveries if not (s.done or s.failed)]
 
 
+class LocatorStore:
+    """The relay's side of the locator: passes each POSITION from the aircraft on to every GCS agent,
+    and keeps the last one with a fix, in `path` so that it survives a restart. An agent that
+    connects gets that one at once: the last known position, even with the aircraft long gone."""
+
+    SAVE_EVERY = 4.0  # seconds between writes to disk: every fix, as the aircraft sends one every 5 s
+
+    def __init__(self, relay: "RelayServer", path: Optional[str]) -> None:
+        self.relay = relay
+        self.path = path
+        self.last: Optional[Position] = None  # the newest, fix or not
+        self.last_fix: Optional[Position] = None
+        self.saved_at = -1e9
+        self.fc_silent = False
+        if path:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    meta = json.load(f)
+                self.last_fix = Position(*(int(meta[field]) for field in Position._fields))
+                slog.info("last known position of the aircraft: %s", self.last_fix.describe())
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                slog.warning("cannot read %s: %s", path, exc)
+
+    def from_vehicle(self, body: bytes, now: float) -> None:
+        if len(body) < POSITION_BODY.size:
+            return
+        pos = Position.unpack(body)._replace(time=int(time.time()))
+        if self.last is None or pos.has_fix != self.last.has_fix:
+            slog.info("aircraft's GNSS: %s", pos.describe())
+        if pos.fc_is_silent != self.fc_silent:
+            self.fc_silent = pos.fc_is_silent
+            if self.fc_silent:
+                slog.warning("the aircraft's flight controller is silent (%s s); its LTE module still reports",
+                             pos.fc_silent)
+            else:
+                slog.info("the aircraft's flight controller talks again")
+        self.last = pos
+        if pos.has_fix:
+            self.last_fix = pos
+            if now - self.saved_at >= self.SAVE_EVERY:
+                self._save(pos)
+                self.saved_at = now
+        for gcs in self.relay.gcs_sessions():
+            self.relay._send(gcs, POSITION, pos.pack())
+
+    def welcome(self, gcs: "Session") -> None:
+        """A GCS agent that just connected hears the last known position."""
+        if self.last_fix is not None:
+            self.relay._send(gcs, POSITION, self.last_fix.pack())
+
+    def _save(self, pos: Position) -> None:
+        if not self.path:
+            return
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+            with open(self.path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(dict(pos._asdict(), latitude=pos.lat / 1e7, longitude=pos.lon / 1e7), f, indent=1)
+            os.replace(self.path + ".tmp", self.path)
+        except OSError as exc:
+            slog.warning("cannot save the aircraft's position: %s", exc)
+
+
 class RelayServer(asyncio.DatagramProtocol):
     """Forwards MAVLink between the vehicle session and all GCS sessions (and plain TCP clients)."""
 
@@ -858,11 +990,13 @@ class RelayServer(asyncio.DatagramProtocol):
     SUMMARY_INTERVAL = 300.0
 
     def __init__(self, keys: Dict[int, bytes], session_timeout: float = 120.0, max_gcs: int = 8,
-                 photo_folder: Optional[str] = None, photo_days: float = 7.0) -> None:
+                 photo_folder: Optional[str] = None, photo_days: float = 7.0,
+                 state_dir: Optional[str] = None) -> None:
         self.keys = keys
         self.session_timeout = session_timeout
         self.max_gcs = max_gcs
         self.photos = PhotoStore(self, photo_folder, photo_days)
+        self.locator = LocatorStore(self, os.path.join(state_dir, "locator.json") if state_dir else None)
         self.sessions: Dict[int, Session] = {}
         self.vehicle: Optional[Session] = None
         self.tcp: Optional[TcpGcsPort] = None
@@ -923,7 +1057,10 @@ class RelayServer(asyncio.DatagramProtocol):
                 self.to_vehicle(pkt.body)
         elif pkt.type == PING:
             self._on_ping(sess, pkt.body)
-        elif pkt.type >= SNAP_REQ:
+        elif pkt.type == POSITION:
+            if sess.role == ROLE_VEHICLE:
+                self.locator.from_vehicle(pkt.body, now)
+        elif SNAP_REQ <= pkt.type <= SNAP_SYNC:
             self.photos.on_packet(sess, pkt.type, pkt.body, now)
 
     # -- forwarding
@@ -1005,6 +1142,7 @@ class RelayServer(asyncio.DatagramProtocol):
                 gcs.remove(victim)
                 slog.info("%s dropped: too many GCS sessions", victim.describe())
             slog.info("%s connected", sess.describe())
+            self.locator.welcome(sess)
 
     def _on_ping(self, sess: Session, body: bytes) -> None:
         if len(body) < 4:
@@ -1767,7 +1905,7 @@ class UdpLink(asyncio.DatagramProtocol):
 async def run_server(opts) -> None:
     keys = {ROLE_VEHICLE: opts.vehicle_key, ROLE_GCS: opts.gcs_key}
     relay = RelayServer(keys, session_timeout=opts.session_timeout, photo_folder=getattr(opts, "snapshot_dir", None),
-                        photo_days=getattr(opts, "snapshot_days", 7.0))
+                        photo_days=getattr(opts, "snapshot_days", 7.0), state_dir=getattr(opts, "state_dir", None))
     loop = asyncio.get_running_loop()
     host, port = opts.listen
     await loop.create_datagram_endpoint(lambda: relay, local_addr=(host or "0.0.0.0", port))
@@ -1788,10 +1926,12 @@ async def run_server(opts) -> None:
 
 
 class StatusPrinter:
-    """Logs the vehicle link status: at once when it changes, otherwise every `interval` seconds."""
+    """Logs the vehicle link status: at once when it changes, otherwise every `interval` seconds.
+    where() adds the aircraft's position, if the agent knows it."""
 
-    def __init__(self, interval: float) -> None:
+    def __init__(self, interval: float, where: Optional[Callable[[], str]] = None) -> None:
         self.interval = interval
+        self.where = where
         self.state: Optional[Tuple[bool, bool]] = None
         self.last = 0.0
 
@@ -1799,7 +1939,8 @@ class StatusPrinter:
         now = time.monotonic()
         state = (status.online, status.idle_ms == U16_UNKNOWN)
         if state != self.state or now - self.last >= self.interval:
-            glog.info("%s", status.describe())
+            where = self.where() if self.where else ""
+            glog.info("%s%s", status.describe(), f"; {where}" if where else "")
             self.state, self.last = state, now
 
 
@@ -1836,8 +1977,11 @@ class GcsAgent:
         # snapshots, for an agent that keeps photos (the MavLTE app)
         self.photos = PhotoInbox(self.client, photo_dir, on_photo) if photo_dir else None
         if self.photos is not None:
-            self.client.on_packet = self.photos.on_packet
             self.client.on_session = self.photos.sync
+        # the locator: the aircraft's own position, from its LTE module's GNSS
+        self.position: Optional[Position] = None  # the newest: live, or the last known one from the relay
+        self.last_fix: Optional[Position] = None
+        self.client.on_packet = self._on_packet
 
     @property
     def watching(self) -> bool:
@@ -1859,6 +2003,37 @@ class GcsAgent:
         self.status, self.status_time = status, time.monotonic()
         if self.on_status is not None:
             self.on_status(status)
+
+    def _on_packet(self, ptype: int, body: bytes) -> None:
+        if ptype == POSITION:
+            if len(body) >= POSITION_BODY.size:
+                self._got_position(Position.unpack(body))
+        elif self.photos is not None:
+            self.photos.on_packet(ptype, body)
+
+    POSITION_LIVE = 15.0  # seconds: an older report (the relay's last known one) is history
+
+    def _got_position(self, pos: Position) -> None:
+        old = self.position
+        self.position = pos
+        if pos.has_fix and (self.last_fix is None or pos.time >= self.last_fix.time):
+            self.last_fix = pos
+        age = time.time() - pos.time
+        if pos.time and age >= self.POSITION_LIVE:
+            glog.info("last known position of the aircraft, %s ago: %s", fmt_age(age), pos.describe())
+        elif pos.fc_is_silent and not (old and old.fc_is_silent):
+            glog.warning("the aircraft's flight controller is silent (%s s); its LTE module still reports: %s",
+                         pos.fc_silent, pos.describe())
+        elif old is None or old.has_fix != pos.has_fix or old.fc_is_silent != pos.fc_is_silent:
+            glog.info("aircraft's position (its own GNSS): %s", pos.describe())
+
+    def position_text(self) -> str:
+        """The aircraft's last known position for the log, or ''."""
+        pos = self.last_fix
+        if pos is None:
+            return ""
+        age = f", {fmt_age(time.time() - pos.time)} ago" if pos.time else ""
+        return f"GNSS {pos.lat / 1e7:.6f}, {pos.lon / 1e7:.6f} ({pos.sats} satellites{age})"
 
     def _to_gcs(self, payload: bytes) -> None:
         self.to_gcs_bytes += len(payload)
@@ -1943,7 +2118,9 @@ class GcsAgent:
 
 
 async def run_gcs(opts) -> None:
-    agent = GcsAgent(opts.server, opts.key, on_status=StatusPrinter(opts.status_interval))
+    printer = StatusPrinter(opts.status_interval)
+    agent = GcsAgent(opts.server, opts.key, on_status=printer)
+    printer.where = agent.position_text
     if opts.udp:
         await agent.start_udp(opts.udp)
     if opts.tcp:
@@ -2130,9 +2307,11 @@ def resolve_options(args: argparse.Namespace) -> argparse.Namespace:
         allow = o.get("tcp_allow", "127.0.0.1/32, ::1/128")
         out.tcp_allow = [ipaddress.ip_network(n.strip(), strict=False) for n in allow.split(",") if n.strip()]
         out.session_timeout = float(o.get("session_timeout", 120))
-        # photos: in systemd's StateDirectory (/var/lib/mavrelay) when run as the service
+        # photos and the aircraft's last known position: in systemd's StateDirectory (/var/lib/mavrelay)
+        # when run as the service
         home = os.environ.get("STATE_DIRECTORY") or os.path.dirname(os.path.abspath(getattr(args, "config", None)
                                                                                       or "mavrelay.ini"))
+        out.state_dir = home
         folder = str(o.get("snapshot_dir", os.path.join(home, "snapshots")))
         out.snapshot_dir = None if folder.lower() in ("off", "no", "none", "") else folder
         out.snapshot_days = float(o.get("snapshot_days", 7))

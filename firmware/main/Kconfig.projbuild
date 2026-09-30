@@ -102,6 +102,23 @@ menu "MavLTE"
             saves mobile data. The bridge keeps its session with the relay alive either way and
             resumes within about a second after a GCS connects.
 
+    config BRIDGE_LOCATOR
+        bool "Locator: the modem's own GNSS position, every few seconds"
+        default y
+        help
+            The A7670E's GNSS (its antenna on the board's GNSS connector) reports where the aircraft
+            is to the relay and MavLTE, whatever the flight controller does: after a crash too, as
+            long as the board has power (an 18650 cell in its holder). The relay keeps the last known
+            position. About 65 KB of mobile data an hour. Reading the GNSS during the data call needs
+            the modem's multiplexer (CMUX); if the modem does not take it, the firmware goes on
+            without it and still reports whether the flight controller talks.
+
+    config BRIDGE_LOCATOR_INTERVAL
+        int "Locator: seconds between position reports"
+        depends on BRIDGE_LOCATOR
+        range 2 300
+        default 5
+
     config BRIDGE_CAMERA
         bool "Camera: a photo when MavLTE asks for one (Snapshot)"
         default y

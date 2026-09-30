@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "battery.h"
 #include "board.h"
 #include "snapshot.h"
 
@@ -30,13 +31,17 @@ static const camera_pins_t V2_PINS = {.xclk = 39, .pclk = 46, .vsync = 42, .href
 
 static esp_err_t start(framesize_t frame_size, size_t buffer)
 {
-    const camera_pins_t *pins = board_get()->version == 1 ? &V1_PINS : &V2_PINS;
+    const bool v1 = board_get()->version == 1;
+    const camera_pins_t *pins = v1 ? &V1_PINS : &V2_PINS;
+    /* On V2 boards the fuel gauge shares the SCCB bus: the camera uses the bus battery.c made */
+    const int shared = v1 ? -1 : battery_i2c_port();
     const camera_config_t config = {
         .pin_pwdn = -1, /* tied low on the board: the camera is on whenever DIP switch CAM is */
         .pin_reset = -1,
         .pin_xclk = pins->xclk,
-        .pin_sccb_sda = 15,
-        .pin_sccb_scl = 16,
+        .pin_sccb_sda = shared >= 0 ? -1 : 15,
+        .pin_sccb_scl = shared >= 0 ? -1 : 16,
+        .sccb_i2c_port = shared >= 0 ? shared : 0,
         .pin_d7 = 14,
         .pin_d6 = 13,
         .pin_d5 = 12,

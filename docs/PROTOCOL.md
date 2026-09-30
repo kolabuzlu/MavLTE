@@ -46,6 +46,7 @@ corrupts the frames around it.
 | 10   | SNAP_DATA | V → S → GCS | session / seq | `photo_id u32, chunk u16`, then the chunk (1024 bytes, the last one shorter) |
 | 11   | SNAP_ACK  | GCS → S → V | session / seq | `photo_id u32, flags u8` (bit 0: all there, bit 1: have the SNAP_INFO), then a bitmap of the chunks received |
 | 12   | SNAP_SYNC | GCS → S | session / seq | `newest_photo_id u32` |
+| 13   | POSITION  | V → S → GCS | session / seq | `gnss_time u32, lat i32, lon i32, alt_mm i32, speed_cms u16, course_cdeg u16, hdop u16, sats u8, fix u8, flags u8, fc_silent_s u16, battery_mv u16, battery_pct u8, time u32` (see [Locator](#locator)) |
 
 Unknown values are `0xFFFF` for u16 fields, `0x7FFF` for `rssi_dbm` and `0xFF` for `rat`.
 `rat` uses the 3GPP TS 27.007 access technology numbers (0 GSM, 3 EDGE, 7 LTE, ...).
@@ -152,6 +153,27 @@ it did not ask for only if its id is within 10 minutes of its clock (asked for b
 restarted).
 
 Status values: 0 OK, 1 NO_AIRCRAFT, 2 NO_CAMERA, 3 FAILED, 4 BUSY, 5 NO_ANSWER.
+
+## Locator
+
+Where the aircraft is, from the LTE module's own GNSS receiver, whatever the flight controller
+does: a crashed aircraft whose flight controller is dead still reports its position as long as
+the module has power.
+
+- The vehicle sends POSITION every few seconds (5 s by default) while it has a session: the
+  GNSS time (unix seconds, 0 if unknown), latitude and longitude (1e-7 degrees), altitude above
+  mean sea level (mm), ground speed (cm/s), course (centidegrees), HDOP (×100), satellites, and
+  `fix` (0 none, 2 2D, 3 3D). Without a fix, the position fields are unknown (`0x80000000`,
+  `0xFFFF`). `flags` bit 0: the flight controller has sent nothing for 10 s or more; bit 1: the
+  module cannot read its GNSS. `fc_silent_s` is the time since the flight controller last sent
+  anything (`0xFFFF`: nothing since the module started). The module's battery: millivolts and
+  percent (`0xFFFF`, `0xFF` unknown). `time` is 0.
+- The server sets `time` to its unix time and passes the POSITION on to every active GCS
+  session, watching ones too. It keeps the last POSITION with a fix (on disk, so that it
+  survives a restart) and sends it to each GCS session when that becomes active: an agent that
+  connects later still learns the last known position.
+- A GCS agent treats a POSITION whose `time` is 15 s old or more as the last known position, not
+  a live one.
 
 ## Not provided
 

@@ -19,9 +19,11 @@
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
 
+#include "battery.h"
 #include "board.h"
 #include "camera.h"
 #include "mavframe.h"
+#include "locator.h"
 #include "mavpos.h"
 #include "snapshot.h"
 #include "tunnel.h"
@@ -55,6 +57,14 @@ static const uint8_t *downlink; /* set by the tunnel's data callback while tun_i
 static size_t downlink_len;
 static snap_outbox_t snap;       /* snapshots: photos from the camera on request (guarded by lock) */
 static mav_position_t position;  /* where the flight controller says the aircraft is (guarded by lock) */
+/* the locator (guarded by lock): the modem's GNSS, and when the flight controller was last heard */
+static gnss_fix_t gnss;
+static uint32_t gnss_ms;       /* when gnss was read */
+static int gnss_state;         /* 0: not read yet, 1: readable, -1: cannot be read (no CMUX) */
+static uint32_t fc_heard_ms;   /* last byte from the flight controller */
+static bool fc_heard;          /* since boot */
+static uint16_t battery_mv = LOCATOR_U16_UNKNOWN; /* the board's cell, from its fuel gauge */
+static uint8_t battery_pct = LOCATOR_BATTERY_UNKNOWN;
 #if CONFIG_BRIDGE_CAMERA
 static QueueHandle_t camera_jobs; /* for the camera task, which may take a second or two per photo */
 typedef struct {
@@ -213,6 +223,8 @@ static void uart_task(void *arg)
         xSemaphoreTake(lock, portMAX_DELAY);
         if (n > 0) {
             stats.fc_rx_bytes += (uint32_t)n;
+            fc_heard_ms = now;
+            fc_heard = true;
             mav_batcher_feed(&batcher, buf, (size_t)n, now, batch_emit, NULL);
             mav_position_feed(&position, buf, (size_t)n, now); /* for the notes on a photo */
         }
@@ -282,11 +294,46 @@ static void log_stats(void)
              stats.send_errors);
 }
 
+#if CONFIG_BRIDGE_LOCATOR
+/* The locator's report (called with lock held): the last GNSS fix, if it is recent, and how long the
+ * flight controller has been silent; after a crash too, as long as the board has power. */
+static void send_position(uint32_t now)
+{
+    uint8_t body[LOCATOR_BODY_LEN];
+    uint8_t flags = 0;
+    const gnss_fix_t *fix = NULL;
+    gnss_fix_t none;
+    if (gnss_state < 0) {
+        flags |= LOCATOR_NO_GNSS;
+    } else if (gnss_state > 0 && (uint32_t)(now - gnss_ms) < 3 * CONFIG_BRIDGE_LOCATOR_INTERVAL * 1000) {
+        fix = &gnss;
+    } else {
+        gnss_clear(&none); /* not read (lately): no fix */
+        fix = &none;
+    }
+    uint16_t silent = LOCATOR_U16_UNKNOWN;
+    if (fc_heard) {
+        uint32_t s = (uint32_t)(now - fc_heard_ms) / 1000;
+        silent = s < LOCATOR_U16_UNKNOWN ? (uint16_t)s : LOCATOR_U16_UNKNOWN - 1;
+        if (silent >= LOCATOR_FC_SILENT_S) {
+            flags |= LOCATOR_FC_SILENT;
+        }
+    }
+    locator_pack(body, fix, flags, silent, battery_mv, battery_pct);
+    tun_send_packet(&tun, TUN_POSITION, body, sizeof(body));
+}
+#endif
+
 static void net_task(void *arg)
 {
     static uint8_t rx[TUN_MAX_DATAGRAM + 16];
     uint32_t sock_generation = 0;
     uint32_t last_stats = now_ms();
+#if CONFIG_BRIDGE_LOCATOR
+    uint32_t last_position = now_ms();
+    uint32_t last_battery = now_ms() - 60000, battery_every = 30000;
+    unsigned battery_misses = 0;
+#endif
     for (;;) {
         bool up = xEventGroupGetBits(net_events) & NET_UP;
         if (!up || sock_generation != net_generation) {
@@ -331,9 +378,29 @@ static void net_task(void *arg)
                 close_socket();
             }
         }
+#if CONFIG_BRIDGE_LOCATOR
+        if ((uint32_t)(now_ms() - last_battery) >= battery_every) { /* the cell, for the locator */
+            last_battery = now_ms();
+            uint16_t mv = LOCATOR_U16_UNKNOWN;
+            uint8_t pct = LOCATOR_BATTERY_UNKNOWN;
+            bool read = battery_read(&mv, &pct);
+            battery_misses = read ? 0 : battery_misses + 1;
+            battery_every = battery_misses < 3 ? 30000 : 600000; /* no gauge: seldom try again */
+            xSemaphoreTake(lock, portMAX_DELAY);
+            battery_mv = read ? mv : LOCATOR_U16_UNKNOWN;
+            battery_pct = read ? pct : LOCATOR_BATTERY_UNKNOWN;
+            xSemaphoreGive(lock);
+        }
+#endif
         xSemaphoreTake(lock, portMAX_DELAY);
         tun_poll(&tun, now_ms());
         snap_poll(&snap, now_ms(), photo_cap());
+#if CONFIG_BRIDGE_LOCATOR
+        if (tun_connected(&tun) && (uint32_t)(now_ms() - last_position) >= CONFIG_BRIDGE_LOCATOR_INTERVAL * 1000) {
+            last_position = now_ms();
+            send_position(last_position);
+        }
+#endif
         bool reopen = reopen_socket;
         reopen_socket = false;
         xSemaphoreGive(lock);
@@ -381,6 +448,21 @@ bridge_state_t bridge_state(void)
         xSemaphoreGive(lock);
     }
     return state;
+}
+
+void bridge_set_gnss(const gnss_fix_t *fix)
+{
+    if (lock) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        if (fix) {
+            gnss = *fix;
+            gnss_ms = now_ms();
+            gnss_state = 1;
+        } else {
+            gnss_state = -1;
+        }
+        xSemaphoreGive(lock);
+    }
 }
 
 void bridge_set_radio(int16_t rssi_dbm, uint8_t rat)

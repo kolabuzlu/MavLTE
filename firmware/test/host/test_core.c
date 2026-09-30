@@ -1,9 +1,10 @@
-/* Host tests for the portable firmware core (sha256, mavframe, tunnel, snapshot, mavpos).
+/* Host tests for the portable firmware core (sha256, mavframe, tunnel, snapshot, mavpos, locator).
  * Build and run: make test */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "locator.h"
 #include "mavframe.h"
 #include "mavpos.h"
 #include "sha256.h"
@@ -885,6 +886,92 @@ static void test_position(void)
     CHECK(pos.lat == -335000000);
 }
 
+/* ------------------------------------------------------------------ locator */
+
+static void test_gnss_parse(void)
+{
+    gnss_fix_t f;
+    /* NMEA-style degrees and minutes (A76XX firmware of 2023-2024), with the answer's OK after it */
+    CHECK(gnss_parse("\r\n+CGNSSINFO: 3,12,05,06,3113.343286,N,12121.234064,E,131124,091747.0,32.9,0.0,255.0,"
+                     "1.1,0.8,0.7\r\n\r\nOK\r\n", &f));
+    CHECK(f.fix == GNSS_FIX_3D && f.sats == 23);
+    CHECK(f.lat == 312223881 && f.lon == 1213539010); /* 31 deg 13.343286', 121 deg 21.234064' */
+    CHECK(f.time == 1731489467u);                     /* 2024-11-13 09:17:47 UTC */
+    CHECK(f.alt_mm == 32900 && f.speed == 0 && f.course == 25500 && f.hdop == 80);
+
+    /* decimal degrees (other firmware), 2D, southern and western, moving */
+    CHECK(gnss_parse("+CGNSSINFO: 2,09,05,00,33.9123456,S,70.6123456,W,300926,120000.0,150.5,12.3,45.6,1.2,0.9,0.8",
+                     &f));
+    CHECK(f.fix == GNSS_FIX_2D && f.sats == 14);
+    CHECK(f.lat == -339123456 && f.lon == -706123456);
+    CHECK(f.time == 1790769600u); /* 2026-09-30 12:00:00 UTC */
+    CHECK(f.alt_mm == 150500 && f.speed == 632 && f.course == 4560 && f.hdop == 90);
+
+    /* answers seen from real modems (A7670SA-FASE A7670M7_V1.11.1 of 2022, A7670SA of 2025, SIM7670G,
+     * SIM7670 of 2025): empty course, DOPs like "12.", 3 or 4 satellite fields, an extra field at the end */
+    CHECK(gnss_parse("+CGNSSINFO: 3,08,,00,00,1947.80135,S,04354.86991,W,151122,124230.00,802.6,0.414,,12.,5.1,10.",
+                     &f));
+    CHECK(f.fix == GNSS_FIX_3D && f.sats == 8 && f.lat == -197966891 && f.lon == -439144985);
+    CHECK(f.alt_mm == 802600 && f.speed == 21 && f.course == LOCATOR_U16_UNKNOWN && f.hdop == 510);
+    CHECK(f.time == gnss_unix_time(2022, 11, 15, 12, 42, 30));
+    CHECK(gnss_parse("+CGNSSINFO: 3,08,,,,22.5711975,N,113.8874359,E,010625,084112.00,20.9,0.000,,2.08,1.15,1.74,13",
+                     &f));
+    CHECK(f.lat == 225711975 && f.lon == 1138874359 && f.hdop == 115 && f.speed == 0 && f.sats == 8);
+    CHECK(gnss_parse("+CGNSSINFO: 3,11,07,10,14,45.391761,N,122.797858,W,140726,161102.000,54.9,0.01,215.75,0.82,"
+                     "0.43,0.70,36", &f));
+    CHECK(f.lat == 453917610 && f.lon == -1227978580 && f.sats == 42 && f.course == 21575 && f.hdop == 43);
+    CHECK(gnss_parse("+CGNSSINFO: 3,13,06,18,31.399003,N,73.175373,E,261225,191834.000,195.5,0.16,0.00,0.80,0.53,"
+                     "0.60,25", &f));
+    CHECK(f.lat == 313990030 && f.lon == 731753730 && f.sats == 37 && f.speed == 8 && f.hdop == 53);
+    CHECK(f.time == gnss_unix_time(2025, 12, 26, 19, 18, 34));
+    CHECK(gnss_parse("+CGNSSINFO: ,,,,,,,,", &f) && f.fix == GNSS_FIX_NONE);  /* no fix, the short form */
+    CHECK(gnss_parse("+CGNSSINFO:,,,,,,,,,,,,,,,", &f) && f.fix == GNSS_FIX_NONE); /* no space after the colon */
+    CHECK(gnss_parse("+CGNSSINFO: 3,05,00,00,0.000000,N,0.000000,E,010126,000000.0,0.0,0.0,0.0,99.,99.,99.", &f));
+    CHECK(f.fix == GNSS_FIX_NONE && f.lat == LOCATOR_UNKNOWN_I32); /* a "fix" at 0, 0 */
+    CHECK(gnss_parse("+CGNSSINFO: 3,08,,,,530.500000,N,2859.259258,E,010126,000000.0,11.0,0.0,0.0,1.0,1.0,1.0", &f));
+    CHECK(f.lat == 55083333 && f.lon == 289876543); /* degrees and minutes without the leading zero */
+
+    /* a longitude west of Greenwich by less than a degree, in NMEA form (leading zeros) */
+    CHECK(gnss_parse("+CGNSSINFO: 3,08,,,5130.000000,N,00007.500000,W,010126,000000.0,11.0,0.0,0.0,1.0,1.0,1.0", &f));
+    CHECK(f.lat == 515000000 && f.lon == -1250000);
+
+    /* no fix yet: the fields are empty, or only the satellites are known */
+    CHECK(gnss_parse("+CGNSSINFO: ,,,,,,,,,,,,,,,\r\nOK", &f));
+    CHECK(f.fix == GNSS_FIX_NONE && f.sats == 0 && f.lat == LOCATOR_UNKNOWN_I32);
+    CHECK(gnss_parse("+CGNSSINFO: 1,03,00,01,,,,,,,,,,,,", &f));
+    CHECK(f.fix == GNSS_FIX_NONE && f.sats == 4);
+
+    /* not an answer, or garbage where the position should be */
+    CHECK(!gnss_parse("ERROR", &f));
+    CHECK(!gnss_parse("", &f));
+    CHECK(gnss_parse("+CGNSSINFO: 3,12,05,06,99xx.1,N,12121.234064,E,131124,091747.0,32.9,0.0,255.0,1.1,0.8,0.7", &f));
+    CHECK(f.fix == GNSS_FIX_NONE && f.lat == LOCATOR_UNKNOWN_I32);
+    CHECK(gnss_parse("+CGNSSINFO: 3,12,05,06,3175.0,N,12121.234064,E,131124,091747.0,32.9,0.0,255.0", &f));
+    CHECK(f.fix == GNSS_FIX_NONE); /* 75 minutes */
+    CHECK(gnss_parse("+CGNSSINFO: 3,12,05,06,95.5,N,121.2,E,131124,091747.0,,,,,", &f));
+    CHECK(f.fix == GNSS_FIX_NONE); /* 95.5 degrees north */
+    CHECK(gnss_parse("+CGNSSINFO: 3,12,05,06,41.1,N,28.9,E", &f)); /* cut short: a position, nothing more */
+    CHECK(f.fix == GNSS_FIX_3D && f.lat == 411000000 && f.time == 0 && f.alt_mm == LOCATOR_UNKNOWN_I32);
+
+    CHECK(gnss_unix_time(2020, 1, 1, 0, 0, 0) == 1577836800u);
+    CHECK(gnss_unix_time(2028, 2, 29, 23, 59, 59) == 1835481599u);
+    CHECK(gnss_unix_time(1999, 12, 31, 0, 0, 0) == 0 && gnss_unix_time(2026, 13, 1, 0, 0, 0) == 0);
+}
+
+static void test_locator_packet(void)
+{
+    /* the same bytes as mavrelay.Position(...).pack() in relay/mavrelay.py */
+    uint8_t body[LOCATOR_BODY_LEN], expect[LOCATOR_BODY_LEN];
+    gnss_fix_t f = {.time = 1790841600u, .lat = 411234567, .lon = -289876543, .alt_mm = 150500, .speed = 632,
+                    .course = 4560, .hdop = 90, .sats = 14, .fix = GNSS_FIX_3D};
+    locator_pack(body, &f, LOCATOR_FC_SILENT, 42, 3950, 78);
+    CHECK(unhex("0013be6a07f18218c1d5b8eee44b02007802d0115a000e03012a006e0f4e00000000", expect) == sizeof(expect));
+    CHECK(memcmp(body, expect, sizeof(body)) == 0);
+    locator_pack(body, NULL, LOCATOR_NO_GNSS, LOCATOR_U16_UNKNOWN, LOCATOR_U16_UNKNOWN, LOCATOR_BATTERY_UNKNOWN);
+    unhex("00000000000000800000008000000080ffffffffffff000002ffffffffff00000000", expect);
+    CHECK(memcmp(body, expect, sizeof(body)) == 0);
+}
+
 int main(void)
 {
     test_sha256();
@@ -898,6 +985,8 @@ int main(void)
     test_snapshot();
     test_snapshot_rate();
     test_position();
+    test_gnss_parse();
+    test_locator_packet();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
