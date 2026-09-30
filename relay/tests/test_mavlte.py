@@ -201,7 +201,7 @@ class GuiTest(unittest.TestCase):
         self.pump(lambda: self.text(self.app.relay_text).startswith("Connected to the relay"), what="initial state")
         self.assertFalse(self.app.tcp_card.switch.on or self.app.udp_card.switch.on)
         self.assertTrue(self.app.runner.agent.watching)
-        self.assertEqual(self.app.root.title(), "MavLTE")
+        self.assertEqual(self.app.root.title(), f"MavLTE V{mr.__version__}")
 
     def test_available_led_follows_the_aircraft(self):
         app = self.app

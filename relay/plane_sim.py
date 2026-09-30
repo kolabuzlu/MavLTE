@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Plane simulator: the aircraft end of MavLTE on this PC, until the board arrives.
+"""MavLTE Plane Simulator: the aircraft end of MavLTE on this PC, until the board arrives.
 
-The plane's two power switches, in a window beside the MavLTE app:
+The plane's two power switches, in a window beside the MavLTE app (both start off):
 
 - Battery: the whole plane. On starts ArduPlane SITL as the flight controller; off stops it at
   once, like pulling the battery plug.
@@ -42,8 +42,10 @@ import mavlte as ui
 import mavrelay as mr
 import sitl_demo
 
-APP = "Plane simulator"
+APP = "MavLTE Plane Simulator"
+TITLE = f"{APP} V{mr.__version__}"
 CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mavrelay.ini")
+ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "planesim.png")
 FC_PORT = 5762  # SITL SERIAL1: the TELEM port the ESP32 is wired to
 RAT_LTE = 7
 LOGGERS = ("mavrelay", "4g-link")
@@ -189,7 +191,7 @@ class Plane:
         self.start_fc = start_fc  # starts the flight controller (SITL); None: it runs by itself
         # the switches
         self.battery = False
-        self.lte = True  # the module is fitted and switched on: it runs whenever the battery is on
+        self.lte = False  # switched on, the module runs whenever the battery is on
         self.quick = False
         self.coverage = len(COVERAGE) - 1
         # flight controller
@@ -475,9 +477,12 @@ class SimWindow:
         self.font_small = (family, 9)
         self.font_bold = (family, 10, "bold")
         self.font_title = (family, 15, "bold")
-        if os.path.exists(ui.ICON):
-            self.icon = tk.PhotoImage(file=ui.ICON)
-            root.iconphoto(True, self.icon)
+        self.icon: Optional[tk.PhotoImage] = None
+        for path in (ICON, ui.ICON):
+            if os.path.exists(path):
+                self.icon = tk.PhotoImage(file=path)
+                root.iconphoto(True, self.icon)
+                break
         ui.setup_style(root)
         self._build()
         ui.dark_title_bar(root)
@@ -489,16 +494,18 @@ class SimWindow:
 
     def _build(self) -> None:
         root, s, pad = self.root, self.scale, self.pad
-        root.title(APP)
+        root.title(TITLE)
         root.configure(bg=ui.BG)
         header = tk.Frame(root, bg=ui.SURFACE)
         header.pack(fill="x")
         who = tk.Frame(header, bg=ui.SURFACE)
         who.pack(fill="x", padx=round(16 * s), pady=round(10 * s))
-        tk.Label(who, text="✈", bg=ui.SURFACE, fg=ui.ACCENT, font=(self.font[0], 24)).pack(side="left")
+        if self.icon is not None:
+            self.badge = self.icon.subsample(4 if s < 1.5 else 2)  # as in MavLTE's header
+            tk.Label(who, image=self.badge, bg=ui.SURFACE).pack(side="left")
         names = tk.Frame(who, bg=ui.SURFACE)
         names.pack(side="left", padx=round(12 * s))
-        tk.Label(names, text=APP, bg=ui.SURFACE, fg=ui.TEXT, font=self.font_title).pack(anchor="w")
+        tk.Label(names, text=TITLE, bg=ui.SURFACE, fg=ui.TEXT, font=self.font_title).pack(anchor="w")
         tk.Label(names, text=f"ArduPlane SITL · relay {self.plane.server_text}", bg=ui.SURFACE, fg=ui.MUTED,
                  font=self.font).pack(anchor="w")
         tk.Frame(root, bg=ui.ACCENT, height=max(2, round(2 * s))).pack(fill="x")

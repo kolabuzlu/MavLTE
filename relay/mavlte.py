@@ -482,7 +482,7 @@ class App:
 
     def _build(self) -> None:
         root, s = self.root, self.scale
-        root.title(APP)
+        root.title(f"{APP} V{mr.__version__}")
         root.configure(bg=BG)
         root.minsize(round(360 * s), round(420 * s))
 

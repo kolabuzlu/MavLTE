@@ -144,6 +144,7 @@ class PlaneTest(unittest.TestCase):
 
     def test_battery_lte_module_and_coverage(self):
         p, g = self.plane, self.ground
+        p.call(p.set_lte, True)
         p.call(p.set_battery, True)
         wait_for(self, lambda: p.fc.mode == "FBWA", "heartbeat from the flight controller")
         self.assertTrue(p.fc.armed)
@@ -190,6 +191,7 @@ class PlaneTest(unittest.TestCase):
     def test_no_signal_no_registration(self):
         p = self.plane
         p.call(p.set_coverage, 0)
+        p.call(p.set_lte, True)
         p.call(p.set_battery, True)
         wait_for(self, lambda: p.modem is not None and p.modem.stage == "searching", "searching")
         time.sleep(0.4)
@@ -202,13 +204,14 @@ class PlaneTest(unittest.TestCase):
         plane.quick = True
         self.addCleanup(plane.close)
         with self.assertLogs("mavrelay.plane", "WARNING") as logs:
+            plane.call(plane.set_lte, True)
             plane.call(plane.set_battery, True)
             wait_for(self, lambda: any("cannot look up" in line for line in logs.output), "lookup retried")
         self.assertFalse(plane.modem_task.done())  # an empty label raises UnicodeError, not OSError
 
-    def test_module_switched_off_stays_off_with_the_battery(self):
+    def test_module_starts_switched_off(self):
         p = self.plane
-        p.call(p.set_lte, False)
+        self.assertFalse(p.lte)
         p.call(p.set_battery, True)
         wait_for(self, lambda: p.fc.mode == "FBWA", "flight controller up")
         time.sleep(0.3)
@@ -226,13 +229,15 @@ class WindowTest(unittest.TestCase):
         win = plane_sim.SimWindow(root, plane)
         try:
             text = lambda label: label.cget("text")  # noqa: E731
-            self.assertEqual(root.title(), "Plane simulator")
+            self.assertEqual(root.title(), f"MavLTE Plane Simulator V{mr.__version__}")
             root.update()
+            self.assertFalse(win.lte_switch.on)  # both switches start off
             self.assertEqual(text(win.lte_values["State"]), "No power: the battery is off")
             self.assertEqual(win.lte_led.color, ui.LED_OFF)
             win.quick.set(True)
             win.toggle_quick()
             with mock.patch.object(plane_sim, "STARTUP_QUICK", (0.05, 0.05, 0.05)):
+                win.toggle_lte(True)
                 win.toggle_battery(True)
                 wait_for(self, lambda: text(win.fc_values["Flight controller"]) == "FBWA, ARMED",
                          "flight controller shown", pump=root.update)

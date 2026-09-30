@@ -293,8 +293,9 @@ python sitl_demo.py --server your-server:14650 --no-agent
 It takes the vehicle key from the `[vehicle]` section of `mavrelay.ini` (`key = <vehicle key>`)
 or from `--vehicle-key`. Give the MavLTE app the server and the GCS key.
 
-**Plane simulator.** The same, as a window with the plane's power switches: double-click
-`PlaneSim.pyw` (or run `python plane_sim.py`). It uses the `[vehicle]` section of `mavrelay.ini`.
+**MavLTE Plane Simulator.** The same, as a window with the plane's power switches, both off at
+the start: double-click `PlaneSim.pyw` (or run `python plane_sim.py`). It uses the `[vehicle]`
+section of `mavrelay.ini`.
 
 - **Battery** powers the whole plane: on starts SITL, off stops it at once.
 - **LTE module** is the modem. On, it starts up like the real one (about 16 s, or a couple of
