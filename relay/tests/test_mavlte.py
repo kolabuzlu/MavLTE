@@ -215,6 +215,11 @@ class GuiTest(unittest.TestCase):
         self.pump(lambda: app.udp_card.available.color == mavlte.LED_OFF, what="dark once the aircraft is quiet")
         self.assertEqual(app.tcp_card.available.color, mavlte.LED_OFF)
         self.pump(lambda: self.text(app.craft_state).startswith("Offline"), what="aircraft offline")
+        app.toggle(app.udp_card, True)  # allowed without the aircraft: its telemetry comes when it does
+        self.assertTrue(app.udp_card.switch.on)
+        self.pump(lambda: self.text(app.udp_card.status).startswith("Waiting for the aircraft\nMission Planner: UDP"),
+                  what="waiting for the aircraft")
+        self.assertEqual(app.udp_card.led.color, mavlte.LED_OFF)
 
     def test_close_keeps_what_others_wrote_meanwhile(self):
         # sitl_demo.py --no-agent writes its relay and key while the app is open

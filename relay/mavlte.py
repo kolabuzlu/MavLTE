@@ -690,17 +690,23 @@ class App:
         if agent is not None:
             if self.tcp_card.switch.on and agent.tcp is not None:
                 n = len(agent.tcp.clients)
-                self.tcp_card.show(f"{n} GCS connected" if n else
-                                   f"Waiting for Mission Planner: TCP, {self.tcp_card.text().replace(':', ', port ')}",
-                                   GREEN if n else DIM)
+                where = f"TCP, {self.tcp_card.text().replace(':', ', port ')}"
+                self.tcp_card.show(*self._port_status(online, f"{n} GCS connected" if n else "", where))
             if self.udp_card.switch.on and agent.udp is not None:
                 heard = now - agent.udp.last_rx < 3.0
                 host, port = agent.udp.target
                 where = f"UDP, port {port}" if mr.is_loopback(host) else f"UDP {host}, port {port}"
-                self.udp_card.show("Mission Planner connected" if heard else f"Waiting for Mission Planner: {where}",
-                                   GREEN if heard else DIM)
+                self.udp_card.show(*self._port_status(online, "Mission Planner connected" if heard else "", where))
         self._show_aircraft(agent, status, now)
         self.poll_job = self.root.after(self.POLL_MS, self.poll)
+
+    @staticmethod
+    def _port_status(online: bool, gcs: str, where: str) -> Tuple[str, str]:
+        """A switched-on port's status line and its colour. gcs: what is connected to it, or ''.
+        The switch stays on while the aircraft is away, so that the telemetry comes back by itself."""
+        if not online:
+            return f"Waiting for the aircraft\n{gcs or 'Mission Planner: ' + where}", DIM
+        return (gcs, GREEN) if gcs else (f"Waiting for Mission Planner: {where}", DIM)
 
     @staticmethod
     def _bars(status: mr.LinkStatus) -> int:
