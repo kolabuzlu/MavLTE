@@ -1,0 +1,105 @@
+menu "MavLTE"
+
+    config BRIDGE_SERVER_HOST
+        string "Relay server (host name or IP address)"
+        default "relay.example.com"
+        help
+            The public server that runs "mavrelay.py server".
+
+    config BRIDGE_SERVER_PORT
+        int "Relay server UDP port"
+        range 1 65535
+        default 14650
+
+    config BRIDGE_VEHICLE_KEY
+        string "Vehicle key (64 hex characters)"
+        default ""
+        help
+            The vehicle_key from the relay's /etc/mavrelay/mavrelay.ini.
+            Create one with: python3 mavrelay.py genkey
+
+    config BRIDGE_APN
+        string "APN of the SIM card"
+        default "internet"
+        help
+            Turkcell, Vodafone TR and Turk Telekom all use "internet".
+
+    config BRIDGE_SIM_PIN
+        string "SIM PIN (empty if the SIM has no PIN)"
+        default ""
+
+    choice BRIDGE_NETWORK_MODE
+        prompt "Mobile network technology"
+        default BRIDGE_NETWORK_AUTO
+
+        config BRIDGE_NETWORK_AUTO
+            bool "Automatic (LTE, falls back to 2G)"
+
+        config BRIDGE_NETWORK_LTE_ONLY
+            bool "LTE only"
+            help
+                2G is slow and draws the largest current peaks. LTE only avoids it, at the
+                cost of no service where there is only 2G coverage.
+    endchoice
+
+    choice BRIDGE_BOARD
+        prompt "Board version"
+        default BRIDGE_BOARD_AUTO
+        help
+            V1 boards (sold until about December 2025) have an ESP32-S3R2; V2 boards have an
+            ESP32-S3R8 and "VER 2.0" printed on the back. The firmware can tell them apart.
+
+        config BRIDGE_BOARD_AUTO
+            bool "Detect from the chip"
+        config BRIDGE_BOARD_V1
+            bool "V1 (ESP32-S3R2)"
+        config BRIDGE_BOARD_V2
+            bool "V2 (ESP32-S3R8)"
+    endchoice
+
+    config BRIDGE_FC_TX_GPIO
+        int "GPIO: ESP32 TX, wire to the flight controller's RX (-1: board default)"
+        range -1 48
+        default -1
+        help
+            -1 picks a pin that is free on your board version: GPIO41 on V1, GPIO2 on V2.
+
+    config BRIDGE_FC_RX_GPIO
+        int "GPIO: ESP32 RX, wire to the flight controller's TX (-1: board default)"
+        range -1 48
+        default -1
+        help
+            -1 picks a pin that is free on your board version: GPIO42 on V1, GPIO3 on V2.
+
+    config BRIDGE_FC_BAUD
+        int "Flight controller baud rate"
+        default 115200
+        help
+            Must match SERIALn_BAUD on the flight controller (115 means 115200).
+
+    config BRIDGE_MODEM_BAUD
+        int "Modem UART baud rate"
+        default 921600
+        help
+            The modem starts at 115200 baud after power-up; the firmware then switches it to
+            this rate (AT+IPR, not saved in the modem). PPP needs more than the flight
+            controller's 115200 baud to keep up with it. Use 115200 to stay at the default.
+
+    config BRIDGE_BATCH_MS
+        int "Collect telemetry for this long before sending (ms)"
+        range 0 500
+        default 50
+        help
+            Fewer, larger packets use less mobile data: every packet costs 56 bytes of
+            IP, UDP and tunnel headers. Adds up to this much delay to telemetry.
+            Commands from the GCS to the aircraft are not delayed.
+
+    config BRIDGE_ALWAYS_SEND
+        bool "Send telemetry even when no GCS is connected"
+        default n
+        help
+            By default telemetry is held back while no GCS is connected to the relay, which
+            saves mobile data. The bridge keeps its session with the relay alive either way and
+            resumes within about a second after a GCS connects.
+
+endmenu

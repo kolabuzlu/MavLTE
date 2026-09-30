@@ -1,0 +1,13 @@
+# firmware build output and local settings (sdkconfig.* holds your vehicle key)
+firmware/.pio/
+firmware/build/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.*
+!firmware/sdkconfig.defaults
+firmware/test/host/test_core
+firmware/test/host/tunnel_harness
+
+# relay config with keys
+relay/mavrelay.ini
+__pycache__/
