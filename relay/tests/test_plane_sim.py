@@ -4,6 +4,7 @@ flight controller in place of SITL, and its window. Skipped where tkinter is mis
 import asyncio
 import gc
 import os
+import random
 import struct
 import subprocess
 import sys
@@ -129,7 +130,8 @@ def wait_for(test, cond, what, timeout=8.0, pump=None):
 @unittest.skipUnless(plane_sim, "needs tkinter")
 class PlaneTest(unittest.TestCase):
     def setUp(self):
-        for name, value in (("STARTUP_QUICK", (0.05, 0.05, 0.05)), ("REGISTER_AGAIN_S", 0.2), ("RAT_SWITCH_S", 0.2)):
+        for name, value in (("STARTUP_QUICK", (0.05, 0.05, 0.05)), ("REGISTER_AGAIN_S", 0.2), ("RAT_SWITCH_S", 0.2),
+                            ("EVENTS", {})):  # the link's random troubles have tests of their own
             patcher = mock.patch.object(plane_sim, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -156,7 +158,8 @@ class PlaneTest(unittest.TestCase):
         wait_for(self, self.session, "relay session")
         first = self.session()
         wait_for(self, g.telemetry_at_gcs, "telemetry at the GCS")
-        wait_for(self, lambda: g.relay.vehicle.rssi_dbm == -65, "signal reported to the relay")
+        good_dbm = plane_sim.SIGNALS[plane_sim.GOOD_SIGNAL][1]
+        wait_for(self, lambda: g.relay.vehicle.rssi_dbm == good_dbm, "signal reported to the relay")
         command = v2_frame(76, bytes(33), 9)
         g.loop.call_soon_threadsafe(g.gcs.send_data, command)
         wait_for(self, lambda: command in bytes(g.fc_inbox), "command at the flight controller")
@@ -176,13 +179,13 @@ class PlaneTest(unittest.TestCase):
         # the network and signal the module reports reach the relay (and MavLTE)
         self.assertEqual(g.relay.vehicle.rat, 7)  # LTE
         p.call(p.set_signal, 0)
-        wait_for(self, lambda: g.relay.vehicle.rssi_dbm == -101, "weak signal at the relay")
+        wait_for(self, lambda: g.relay.vehicle.rssi_dbm == plane_sim.SIGNALS[0][1], "weak signal at the relay")
         p.call(p.set_network, plane_sim.NET_2G)
         wait_for(self, lambda: g.relay.vehicle.rat == 3, "EDGE at the relay")
         p.call(p.set_signal, 3)
-        # no coverage: nothing gets through
+        # no coverage: nothing gets through (once what was sent before has arrived: up to 0.53 s on weak 2G)
         p.call(p.set_network, plane_sim.NO_CONNECTION)
-        time.sleep(0.4)
+        time.sleep(1.0)
         heard = g.relay.vehicle.last_rx
         time.sleep(0.6)
         self.assertEqual(g.relay.vehicle.last_rx, heard)
@@ -228,6 +231,11 @@ class PlaneTest(unittest.TestCase):
 class NetworkTest(unittest.TestCase):
     """The mobile network model on its own, with exact figures."""
 
+    def setUp(self):
+        patcher = mock.patch.object(plane_sim, "EVENTS", {})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_speed_queue_and_order(self):
         net = plane_sim.Network(("127.0.0.1", 9), plane_sim.NET_LTE, 3)
         net.figures = (1000.0, 1000.0, 0.1, 0.05, 0.0)  # 1000 bytes/s each way, 100 ms ± 50, no loss
@@ -271,14 +279,58 @@ class NetworkTest(unittest.TestCase):
 
     def test_figures(self):
         up, down, delay, jitter, loss = plane_sim.link_figures(plane_sim.NET_2G, 0)  # weak 2G
-        self.assertAlmostEqual(up * 8 / 1000, 18)  # kbit/s: slower than the telemetry (about 22)
-        self.assertAlmostEqual(delay, 0.21)
+        self.assertAlmostEqual(up * 8 / 1000, 10)  # kbit/s: far slower than the telemetry (about 22)
+        self.assertAlmostEqual(delay, 0.38)
+        fair_2g = plane_sim.link_figures(plane_sim.NET_2G, 1)[0] * 8 / 1000
+        self.assertLess(fair_2g, 22)  # from a fair signal down, 2G cannot carry the telemetry
         self.assertIsNone(plane_sim.link_figures(plane_sim.NO_CONNECTION, 3))
-        self.assertEqual(plane_sim.speed_text(plane_sim.link_figures(plane_sim.NET_LTE, 3)[0]), "5 Mbit/s")
+        self.assertEqual(plane_sim.speed_text(plane_sim.link_figures(plane_sim.NET_LTE, 3)[0]), "2 Mbit/s")
+
+
+@unittest.skipUnless(plane_sim, "needs tkinter")
+class EventsTest(unittest.TestCase):
+    """The link's random troubles, with a fixed random seed."""
+
+    def run_events(self, table, signal, seconds, seed=1):
+        with mock.patch.object(plane_sim, "EVENTS", {plane_sim.NET_LTE: table}):
+            events = plane_sim.Events(random.Random(seed))
+            events.configure(plane_sim.NET_LTE, signal, 0.0)
+        started = []
+        events.on_start = lambda kind, start, length, loss: started.append((start, length))
+        losses = [events.now(t / 20) for t in range(int(seconds * 20))]  # 20 packets a second
+        return started, losses
+
+    def test_troubles_come_and_go(self):
+        started, losses = self.run_events((("dropout", 10, (2, 2), (0, 0), 1.0),), plane_sim.GOOD_SIGNAL, 600)
+        self.assertTrue(40 <= len(started) <= 60, len(started))  # about one per 10 s + 2 s
+        self.assertTrue(all(length == 2 for _, length in started))
+        lost = sum(1 for _, loss in losses if loss == 1.0) / 20
+        self.assertAlmostEqual(lost, 2 * len(started), delta=2 * 2)  # seconds without data
+
+    def test_weaker_signal_more_trouble(self):
+        table = (("latency spike", 20, (1, 3), (200, 800), 0.0),)
+        weak, _ = self.run_events(table, 0, 2000)
+        excellent, _ = self.run_events(table, 3, 2000)
+        self.assertGreater(len(weak), 4 * len(excellent))  # 4 times as often vs half as often
+
+    def test_dropout_loses_the_queue(self):
+        with mock.patch.object(plane_sim, "EVENTS", {plane_sim.NET_LTE: (("dropout", 1e-6, (3, 3), (0, 0), 1.0),)}):
+            net = plane_sim.Network(("127.0.0.1", 9), plane_sim.NET_LTE, plane_sim.GOOD_SIGNAL, random.Random(2))
+        now = time.monotonic()
+        with self.assertLogs("mavrelay.plane", "INFO") as logs:
+            self.assertIsNone(net.schedule(True, 100, now + 0.01))  # the dropout has begun: nothing gets through
+        self.assertIn("dropout, no data for 3.0 s", logs.output[0])
+        self.assertTrue(net.cuts)  # and what waited in the queue is lost
+        self.assertEqual(net.condition(now + 0.02), "dropout")
 
 
 @unittest.skipUnless(HAVE_DISPLAY, "needs Tk and a display")
 class WindowTest(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(plane_sim, "EVENTS", {})  # the link's random troubles: see EventsTest
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_window_follows_the_plane(self):
         ground = Ground()
         self.addCleanup(ground.close)

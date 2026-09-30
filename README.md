@@ -302,19 +302,32 @@ section of `mavrelay.ini`.
 - **LTE module** is the modem. On, it starts up like the real one (about 16 s, or a couple of
   seconds with *Quick start*); off cuts it without a goodbye, as a power cut would. Its LED
   shows what the board's RGB LED shows.
-- **Network** is what the plane flies through, with typical figures. The A7670E falls back to 2G
-  where there is no LTE; it has no 3G. Changing between 2G and LTE costs a few seconds without
-  data, as it does on a real modem.
+- **Network** is what the plane flies through. The A7670E falls back to 2G where there is no LTE;
+  it has no 3G, so where an operator offers only 3G it is on 2G. The figures are for an aircraft,
+  which fares worse than a phone on the ground: above the rooftops it sees many cells at once, so
+  interference is high and handovers frequent (3GPP TR 36.777). With an excellent signal:
 
   | Network | Upload | Delay added each way | Loss | MavLTE shows |
   |---|---|---|---|---|
   | No connection | none | | all | no signal |
-  | 2G (EDGE) | 60 kbit/s | 150 ms ± 60 | 1% | EDGE |
-  | LTE (4G) | 5 Mbit/s | 15 ms ± 8 | 0.1% | LTE |
+  | 2G (EDGE) | 40 kbit/s | 300 ms ± 150 | 2% | EDGE |
+  | LTE (4G) | 2 Mbit/s | 30 ms ± 20 | 0.5% | LTE |
 
-- **Signal**, from *Weak* to *Excellent*, is the level the module reports (the bars in MavLTE).
-  A weaker signal also slows the link and adds delay and loss. On weak 2G the upload (18 kbit/s)
-  is slower than the telemetry, so it queues up and the *Data* line shows packets being lost.
+  On top of that come the troubles that make a real link patchy, at random. With a good signal:
+
+  | | 2G (EDGE) | LTE (4G) |
+  |---|---|---|
+  | Latency spike | every ~20 s, 1–4 s, +0.5–2 s | every ~30 s, 1–3 s, +0.2–1 s |
+  | Fade (packets lost) | every ~45 s, 0.5–2 s, half | every ~60 s, 0.3–1.5 s, 40% |
+  | Cell change | every ~60 s, 1.5–4 s without data | handover every ~30 s, 50–150 ms held back |
+  | Dropout | every ~5 min, 5–15 s | every ~5 min, 2–8 s |
+
+  Changing between 2G and LTE costs a few seconds without data, as on a real modem.
+- **Signal**, from *Weak* to *Excellent* (default *Good*), is the level the module reports (the
+  bars in MavLTE). A weaker signal slows the link and adds delay and loss, and makes the troubles
+  more frequent and longer: twice with *Fair*, four times with *Weak*, half with *Excellent*. From
+  *Fair* down, 2G is slower than the telemetry, so it queues up and the *Data* line shows packets
+  being lost.
 
 Put the MavLTE app beside it and watch its LEDs follow: they go dark about 3 s after the plane
 goes quiet.

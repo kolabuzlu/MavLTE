@@ -11,10 +11,12 @@ The plane's two power switches, in a window beside the MavLTE app (both start of
   silence, as it would in the air.
 
 The module's LED shows what the RGB LED on the board shows. Network picks what the plane flies
-through: no coverage, 2G (EDGE) or LTE, each with typical speed, delay and loss; the A7670E falls
-back to 2G where there is no LTE. Signal, weak to excellent, sets the level the module reports (the
-bars in the MavLTE app) and slows the link down as a weak signal does. On weak 2G the uplink is
-slower than the telemetry, so it queues up and packets are lost, as they would be in the air.
+through: no coverage, 2G (EDGE) or LTE, with figures for an aircraft (worse than for a phone on the
+ground) and the troubles that make a real link patchy: latency spikes, fades, cell changes and
+dropouts, at random. The A7670E falls back to 2G where there is no LTE. Signal, weak to excellent,
+sets the level the module reports (the bars in the MavLTE app), slows the link, and makes the
+troubles more frequent and longer. From a fair signal down, 2G is slower than the telemetry, so it
+queues up and packets are lost, as they would be in the air.
 
     python plane_sim.py            (or double-click PlaneSim.pyw)
 
@@ -54,23 +56,45 @@ FC_PORT = 5762  # SITL SERIAL1: the TELEM port the ESP32 is wired to
 LOGGERS = ("mavrelay", "4g-link")
 
 # The A7670E is an LTE Cat-1 modem that falls back to 2G (GSM with EDGE) where there is no LTE; it
-# has no 3G. Typical figures with an excellent signal: name, access technology reported to the relay
-# (3GPP AcT: 3 = GSM with EDGE, 7 = LTE), uplink and downlink (kbit/s), delay added each way on top of
-# this PC's own path to the relay, and its jitter (ms), packet loss (%).
+# has no 3G, so where a Turkish operator offers only 3G it is on 2G. Figures for an aircraft, which
+# fares worse than a phone on the ground: from above the rooftops it sees many cells at once, so
+# interference is high and handovers frequent (3GPP TR 36.777). With an excellent signal: name,
+# access technology reported to the relay (3GPP AcT: 3 = GSM with EDGE, 7 = LTE), uplink and
+# downlink (kbit/s), delay added each way on top of this PC's own path to the relay, and its jitter
+# (ms), packet loss (%).
 NETWORKS = (
     ("No connection", None, 0, 0, 0, 0, 100.0),
-    ("2G (EDGE)", 3, 60, 120, 150, 60, 1.0),
-    ("LTE (4G)", 7, 5000, 10000, 15, 8, 0.1),
+    ("2G (EDGE)", 3, 40, 80, 300, 150, 2.0),
+    ("LTE (4G)", 7, 2000, 5000, 30, 20, 0.5),
 )
 NO_CONNECTION, NET_2G, NET_LTE = range(3)
-# Signal, weak to excellent: the level the module reports (dBm), and what it does to the link, as radio
-# link adaptation and retransmissions do: share of the speed left, delay added each way (ms), loss added (%).
+# What makes a mobile link falter, each kind at random, with a good signal: kind, mean seconds between
+# two, how long it lasts (s, from-to), delay it adds (ms, from-to), share of packets it loses. It is
+# these, more than the averages, that make telemetry over a mobile network patchy.
+EVENTS = {
+    NET_2G: (
+        ("latency spike", 20, (1, 4), (500, 2000), 0.0),  # radio retransmissions, uplink set up again
+        ("fade", 45, (0.5, 2), (0, 0), 0.5),  # interference
+        ("cell change", 60, (1.5, 4), (0, 0), 1.0),  # 2G data has no handover: no data meanwhile
+        ("dropout", 300, (5, 15), (0, 0), 1.0),  # the network lost for a while
+    ),
+    NET_LTE: (
+        ("handover", 30, (0.05, 0.15), (50, 150), 0.0),  # data held back meanwhile, not lost
+        ("latency spike", 30, (1, 3), (200, 1000), 0.0),
+        ("fade", 60, (0.3, 1.5), (0, 0), 0.4),
+        ("dropout", 300, (2, 8), (0, 0), 1.0),  # radio link failure, then connecting again
+    ),
+}
+# Signal, weak to excellent: the level the module reports (dBm), and what it does to the link: share
+# of the speed left (radio link adaptation), delay (ms) and loss (%) added, and how many times more
+# often and how much longer the link falters than with a good signal.
 SIGNALS = (
-    ("Weak", -101, 0.3, 60, 2.0),
-    ("Fair", -91, 0.6, 25, 0.5),
-    ("Good", -81, 0.85, 8, 0.1),
-    ("Excellent", -65, 1.0, 0, 0.0),
+    ("Weak", -103, 0.25, 80, 3.0, 4.0, 1.6),
+    ("Fair", -93, 0.45, 30, 1.0, 2.0, 1.3),
+    ("Good", -83, 0.7, 10, 0.2, 1.0, 1.0),
+    ("Excellent", -70, 1.0, 0, 0.0, 0.5, 0.8),
 )
+GOOD_SIGNAL = 2
 RAT_SWITCH_S = 3.0  # no data while the modem moves between 2G and LTE
 REGISTER_AGAIN_S = 4.0  # no data while it registers again after having no coverage
 MAX_BACKLOG_S = 2.0  # data queued in the network beyond this much sending time is dropped (full buffer)
@@ -87,9 +111,47 @@ def link_figures(network: int, signal: int) -> Optional[Tuple[float, float, floa
     _, rat, up, down, delay, jitter, loss = NETWORKS[network]
     if rat is None:
         return None
-    _, _, share, extra_delay, extra_loss = SIGNALS[signal]
+    _, _, share, extra_delay, extra_loss, _, _ = SIGNALS[signal]
     return (up * 125 * share, down * 125 * share, (delay + extra_delay) / 1000, jitter / 1000,
             min(1.0, (loss + extra_loss) / 100))
+
+
+class Events:
+    """The link's random troubles (EVENTS): each kind comes at random times, on average once per its
+    interval, and lasts a random while. Worked out lazily, as packets pass."""
+
+    def __init__(self, rng: random.Random) -> None:
+        self.rng = rng
+        self.kinds: tuple = ()
+        self.rate = self.length = 1.0
+        self.next_at: Dict[str, float] = {}
+        self.active: Dict[str, Tuple[float, float, float]] = {}  # kind: until, delay added (s), loss
+        self.on_start: Callable[[str, float, float, float], None] = lambda kind, start, length, loss: None
+
+    def configure(self, network: int, signal: int, now: float) -> None:
+        self.kinds = EVENTS.get(network, ())
+        self.rate, self.length = SIGNALS[signal][5:7]
+        self.active = {kind: a for kind, a in self.active.items() if any(k[0] == kind for k in self.kinds)}
+        # random times without memory: drawing them again from now changes nothing but the rate
+        self.next_at = {kind: now + self.rng.expovariate(self.rate / mean) for kind, mean, *_ in self.kinds}
+
+    def now(self, now: float) -> Tuple[float, float]:
+        """The delay added (s) and the share of packets lost at this moment."""
+        delay = loss = 0.0
+        for kind, mean, (d0, d1), (x0, x1), share in self.kinds:
+            start = self.next_at[kind]
+            if now >= start and kind not in self.active:
+                length = self.rng.uniform(d0, d1) * self.length
+                self.active[kind] = (start + length, self.rng.uniform(x0, x1) / 1000, share)
+                self.next_at[kind] = start + length + self.rng.expovariate(self.rate / mean)
+                self.on_start(kind, start, length, share)
+            if kind in self.active:
+                until, extra, lost = self.active[kind]
+                if now >= until:
+                    del self.active[kind]
+                else:
+                    delay, loss = delay + extra, max(loss, lost)
+        return delay, loss
 # seconds the modem spends starting, registering, and bringing mobile data up: as in the boot log
 # of a real board (README, "A healthy start"), and shortened for Quick start
 STARTUP_REAL = (9.3, 4.3, 1.9)
@@ -168,40 +230,61 @@ class FcState:
 
 class Network(sitl_demo.LinkEmulator):
     """The mobile network between the module and the relay: in each direction a speed limit with a
-    queue in front of it, then delay, jitter and loss, and packets arrive in order as on a real mobile
-    network. close() is the module losing power: nothing more leaves it, not even packets on their way."""
+    queue in front of it, then delay, jitter and loss, and the link's random troubles (Events); packets
+    arrive in order as on a real mobile network. close() is the module losing power: nothing more
+    leaves it, not even packets on their way."""
 
-    def __init__(self, relay_addr, network: int, signal: int) -> None:
+    def __init__(self, relay_addr, network: int, signal: int, rng: Optional[random.Random] = None) -> None:
         super().__init__(relay_addr, 0, 0, 0)
         self.closed = False
-        self.figures = link_figures(network, signal)
+        self.rng = rng or random.Random()
+        self.events = Events(self.rng)
+        self.events.on_start = self._event_started
+        self.figures = None
         self.gap_until = 0.0  # no data at all before this time (the modem changing networks)
         self.busy_until = {True: 0.0, False: 0.0}  # per direction (True: uplink): its queue is sent by then
         self.last_arrival = {True: 0.0, False: 0.0}
         self.cuts: list = []  # when coverage went, or the modem changed networks
         self.packets = 0  # both directions, offered and dropped
         self.lost = 0
+        self.set_network(network, signal)
 
     def set_network(self, network: int, signal: int, gap: float = 0.0, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else now
         self.figures = link_figures(network, signal)
+        self.events.configure(network, signal, now)
         if self.figures is None or gap:
-            # What still waits in the queue is lost with the coverage; what was sent already arrives.
-            self.cuts = [t for t in self.cuts if now - t < 10.0] + [now]
-            self.busy_until = {True: now, False: now}
+            self._cut(now)
             self.gap_until = max(self.gap_until, now + gap)
+
+    def _cut(self, now: float) -> None:
+        """What still waits in the queue is lost with the coverage; what was sent already arrives."""
+        self.cuts = [t for t in self.cuts if now - t < 30.0] + [now]
+        self.busy_until = {True: now, False: now}
+
+    def _event_started(self, kind: str, start: float, length: float, loss: float) -> None:
+        if loss >= 1.0:  # no data at all for a while
+            self._cut(start)
+            log.info("LTE module: %s, no data for %.1f s", kind, length)
+
+    def condition(self, now: float) -> str:
+        """What troubles the link right now, for the window."""
+        return ", ".join(kind for kind, (until, _, _) in self.events.active.items() if now < until)
 
     def schedule(self, uplink: bool, size: int, now: float) -> Optional[Tuple[float, float]]:
         """When a packet of this many bytes, handed over now, is sent and when it arrives; None if the
         network drops it."""
         f = self.figures
-        if f is None or now < self.gap_until or random.random() < f[4]:
+        if f is None or now < self.gap_until:
+            return None
+        extra, burst = self.events.now(now)
+        if self.rng.random() < max(f[4], burst):
             return None
         start = max(now, self.busy_until[uplink])
         if start - now > MAX_BACKLOG_S:  # the queue is full
             return None
         sent = self.busy_until[uplink] = start + (size + sitl_demo.IP_UDP_HEADERS) / (f[0] if uplink else f[1])
-        arrival = sent + max(0.0, f[2] + random.uniform(-f[3], f[3]))
+        arrival = sent + max(0.0, f[2] + extra + self.rng.uniform(-f[3], f[3]))
         arrival = max(arrival, self.last_arrival[uplink])  # no overtaking
         self.last_arrival[uplink] = arrival
         return sent, arrival
@@ -258,7 +341,7 @@ class Plane:
         self.lte = False  # switched on, the module runs whenever the battery is on
         self.quick = False
         self.network = NET_LTE
-        self.signal = len(SIGNALS) - 1
+        self.signal = GOOD_SIGNAL
         # flight controller
         self.fc = FcState()
         self.fc_error = ""
@@ -797,6 +880,9 @@ class SimWindow:
                 state = f"Moving to {NETWORKS[p.network][0]}: no data for a moment"
             elif session:
                 state = f"Connected to the relay over {NETWORKS[p.network][0].split(' (')[0]}"
+                trouble = m.net.condition(now) if m.net is not None else ""
+                if trouble:
+                    state += f" · {trouble}"
             elif client.hellos >= 5:
                 state = "Mobile data up, but no answer from the relay"
             else:
