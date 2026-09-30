@@ -10,8 +10,11 @@ The plane's two power switches, in a window beside the MavLTE app (both start of
   as the ESP32 firmware does. Off cuts it without a goodbye, so the relay only notices the
   silence, as it would in the air.
 
-The module's LED shows what the RGB LED on the board shows. Coverage sets the signal the module
-reports (the bars in the MavLTE app) and the delay and loss on its link.
+The module's LED shows what the RGB LED on the board shows. Network picks what the plane flies
+through: no coverage, 2G (EDGE) or LTE, each with typical speed, delay and loss; the A7670E falls
+back to 2G where there is no LTE. Signal, weak to excellent, sets the level the module reports (the
+bars in the MavLTE app) and slows the link down as a weak signal does. On weak 2G the uplink is
+slower than the telemetry, so it queues up and packets are lost, as they would be in the air.
 
     python plane_sim.py            (or double-click PlaneSim.pyw)
 
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import logging
 import os
 import queue
@@ -47,17 +51,45 @@ TITLE = f"{APP} V{mr.__version__}"
 CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mavrelay.ini")
 ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "planesim.png")
 FC_PORT = 5762  # SITL SERIAL1: the TELEM port the ESP32 is wired to
-RAT_LTE = 7
 LOGGERS = ("mavrelay", "4g-link")
 
-# name, signal the module reports (dBm), added delay and jitter each way (ms), packet loss (%)
-COVERAGE = (
-    ("No signal", None, 0, 0, 100.0),
-    ("Weak", -101, 120, 60, 5.0),
-    ("Fair", -91, 40, 20, 1.0),
-    ("Good", -81, 10, 5, 0.2),
-    ("Excellent", -65, 0, 0, 0.0),
+# The A7670E is an LTE Cat-1 modem that falls back to 2G (GSM with EDGE) where there is no LTE; it
+# has no 3G. Typical figures with an excellent signal: name, access technology reported to the relay
+# (3GPP AcT: 3 = GSM with EDGE, 7 = LTE), uplink and downlink (kbit/s), delay added each way on top of
+# this PC's own path to the relay, and its jitter (ms), packet loss (%).
+NETWORKS = (
+    ("No connection", None, 0, 0, 0, 0, 100.0),
+    ("2G (EDGE)", 3, 60, 120, 150, 60, 1.0),
+    ("LTE (4G)", 7, 5000, 10000, 15, 8, 0.1),
 )
+NO_CONNECTION, NET_2G, NET_LTE = range(3)
+# Signal, weak to excellent: the level the module reports (dBm), and what it does to the link, as radio
+# link adaptation and retransmissions do: share of the speed left, delay added each way (ms), loss added (%).
+SIGNALS = (
+    ("Weak", -101, 0.3, 60, 2.0),
+    ("Fair", -91, 0.6, 25, 0.5),
+    ("Good", -81, 0.85, 8, 0.1),
+    ("Excellent", -65, 1.0, 0, 0.0),
+)
+RAT_SWITCH_S = 3.0  # no data while the modem moves between 2G and LTE
+REGISTER_AGAIN_S = 4.0  # no data while it registers again after having no coverage
+MAX_BACKLOG_S = 2.0  # data queued in the network beyond this much sending time is dropped (full buffer)
+
+
+def speed_text(bytes_per_s: float) -> str:
+    kbit = bytes_per_s * 8 / 1000
+    return f"{kbit / 1000:g} Mbit/s" if kbit >= 1000 else f"{kbit:.0f} kbit/s"
+
+
+def link_figures(network: int, signal: int) -> Optional[Tuple[float, float, float, float, float]]:
+    """Uplink and downlink (bytes/s), delay and jitter each way (s) and loss (0-1) of a network at a
+    signal level; None where there is no coverage."""
+    _, rat, up, down, delay, jitter, loss = NETWORKS[network]
+    if rat is None:
+        return None
+    _, _, share, extra_delay, extra_loss = SIGNALS[signal]
+    return (up * 125 * share, down * 125 * share, (delay + extra_delay) / 1000, jitter / 1000,
+            min(1.0, (loss + extra_loss) / 100))
 # seconds the modem spends starting, registering, and bringing mobile data up: as in the boot log
 # of a real board (README, "A healthy start"), and shortened for Quick start
 STARTUP_REAL = (9.3, 4.3, 1.9)
@@ -135,27 +167,59 @@ class FcState:
 
 
 class Network(sitl_demo.LinkEmulator):
-    """The mobile network between the module and the relay. close() is the module losing power:
-    nothing more leaves it, not even packets still on their way."""
+    """The mobile network between the module and the relay: in each direction a speed limit with a
+    queue in front of it, then delay, jitter and loss, and packets arrive in order as on a real mobile
+    network. close() is the module losing power: nothing more leaves it, not even packets on their way."""
 
-    def __init__(self, relay_addr, level: int) -> None:
+    def __init__(self, relay_addr, network: int, signal: int) -> None:
         super().__init__(relay_addr, 0, 0, 0)
         self.closed = False
-        self.set_level(level)
+        self.figures = link_figures(network, signal)
+        self.gap_until = 0.0  # no data at all before this time (the modem changing networks)
+        self.busy_until = {True: 0.0, False: 0.0}  # per direction (True: uplink): its queue is sent by then
+        self.last_arrival = {True: 0.0, False: 0.0}
+        self.cuts: list = []  # when coverage went, or the modem changed networks
+        self.packets = 0  # both directions, offered and dropped
+        self.lost = 0
 
-    def set_level(self, level: int) -> None:
-        _, _, delay, jitter, loss = COVERAGE[level]
-        self.delay, self.jitter, self.loss = delay / 1000, jitter / 1000, loss / 100
+    def set_network(self, network: int, signal: int, gap: float = 0.0, now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
+        self.figures = link_figures(network, signal)
+        if self.figures is None or gap:
+            # What still waits in the queue is lost with the coverage; what was sent already arrives.
+            self.cuts = [t for t in self.cuts if now - t < 10.0] + [now]
+            self.busy_until = {True: now, False: now}
+            self.gap_until = max(self.gap_until, now + gap)
+
+    def schedule(self, uplink: bool, size: int, now: float) -> Optional[Tuple[float, float]]:
+        """When a packet of this many bytes, handed over now, is sent and when it arrives; None if the
+        network drops it."""
+        f = self.figures
+        if f is None or now < self.gap_until or random.random() < f[4]:
+            return None
+        start = max(now, self.busy_until[uplink])
+        if start - now > MAX_BACKLOG_S:  # the queue is full
+            return None
+        sent = self.busy_until[uplink] = start + (size + sitl_demo.IP_UDP_HEADERS) / (f[0] if uplink else f[1])
+        arrival = sent + max(0.0, f[2] + random.uniform(-f[3], f[3]))
+        arrival = max(arrival, self.last_arrival[uplink])  # no overtaking
+        self.last_arrival[uplink] = arrival
+        return sent, arrival
 
     def _forward(self, transport, data: bytes, addr) -> None:
-        if self.loss and random.random() < self.loss:
-            self.dropped += 1
+        now = time.monotonic()
+        self.packets += 1
+        timing = self.schedule(transport is self.back, len(data), now)
+        if timing is None:
+            self.lost += 1
             return
-        delay = max(0.0, self.delay + random.uniform(-self.jitter, self.jitter))
-        asyncio.get_running_loop().call_later(delay, self._send, transport, data, addr)
+        sent, arrival = timing
+        asyncio.get_running_loop().call_later(arrival - now, self._send, transport, data, addr, now, sent)
 
-    def _send(self, transport, data: bytes, addr) -> None:
-        if not self.closed:
+    def _send(self, transport, data: bytes, addr, queued: float, sent: float) -> None:
+        if any(queued <= cut < sent for cut in self.cuts):  # still queued when the coverage went
+            self.lost += 1
+        elif not self.closed:
             transport.sendto(data, addr)
 
     def close(self) -> None:
@@ -193,7 +257,8 @@ class Plane:
         self.battery = False
         self.lte = False  # switched on, the module runs whenever the battery is on
         self.quick = False
-        self.coverage = len(COVERAGE) - 1
+        self.network = NET_LTE
+        self.signal = len(SIGNALS) - 1
         # flight controller
         self.fc = FcState()
         self.fc_error = ""
@@ -240,11 +305,20 @@ class Plane:
         elif not on:
             self._modem_off()
 
-    def set_coverage(self, level: int) -> None:
-        self.coverage = level
+    def set_network(self, network: int) -> None:
+        old, self.network = self.network, network
+        m = self.modem
+        if m is not None and m.net is not None and network != old:
+            # a real modem needs a moment to move between networks, or to register again
+            gap = 0.0 if network == NO_CONNECTION else REGISTER_AGAIN_S if old == NO_CONNECTION else RAT_SWITCH_S
+            m.net.set_network(network, self.signal, gap)
+            log.info("LTE module: %s", "no coverage" if network == NO_CONNECTION else f"now on {NETWORKS[network][0]}")
+
+    def set_signal(self, signal: int) -> None:
+        self.signal = signal
         m = self.modem
         if m is not None and m.net is not None:
-            m.net.set_level(level)
+            m.net.set_network(self.network, signal)
 
     # -- flight controller
 
@@ -338,14 +412,14 @@ class Plane:
         try:
             await asyncio.sleep(start)
             m.stage = "searching"
-            while COVERAGE[self.coverage][1] is None:  # no signal: no network to register with
+            while self.network == NO_CONNECTION:  # no coverage: no network to register with
                 await asyncio.sleep(0.2)
             await asyncio.sleep(register)
             m.stage = "registered"
-            log.info("LTE module: registered, LTE, signal %d dBm", COVERAGE[self.coverage][1] or 0)
+            log.info("LTE module: registered on %s, signal %d dBm", NETWORKS[self.network][0], SIGNALS[self.signal][1])
             await asyncio.sleep(data)
             relay = await self._lookup()
-            m.net = Network(relay, self.coverage)
+            m.net = Network(relay, self.network, self.signal)
             await m.net.start()
             m.batcher = mr.Batcher()
             m.client = mr.TunnelClient(mr.ROLE_VEHICLE, self.key, *m.net.address, on_data=self._to_fc,
@@ -384,8 +458,10 @@ class Plane:
                     log.warning("LTE module: lost the relay session")
 
     def _radio(self) -> Tuple[int, int]:
-        rssi = COVERAGE[self.coverage][1]
-        return (mr.RSSI_UNKNOWN if rssi is None else rssi), RAT_LTE
+        rat = NETWORKS[self.network][1]
+        if rat is None:
+            return mr.RSSI_UNKNOWN, mr.RAT_UNKNOWN
+        return SIGNALS[self.signal][1], rat
 
     # -- from the window's thread
 
@@ -461,8 +537,10 @@ class SimWindow:
     def __init__(self, root: tk.Tk, plane: Plane) -> None:
         self.root, self.plane = root, plane
         self.tick = 0
-        self.rate_mark: tuple = (time.monotonic(), None, 0, 0)
+        self.rate_mark: tuple = (time.monotonic(), None, 0, 0, 0, 0)
         self.rates = (0.0, 0.0)
+        self.lost_share = 0.0
+        self.loss_window: "collections.deque[Tuple[int, int]]" = collections.deque(maxlen=5)
         self.log_lines: "queue.Queue[str]" = queue.Queue()
         self.log_handler = ui.LogHandler(self.log_lines)
         for name in LOGGERS:
@@ -534,8 +612,8 @@ class SimWindow:
         tk.Label(top, text="LTE module", bg=ui.SURFACE, fg=ui.TEXT, font=self.font_bold).pack(side="left")
         self.lte_bars = ui.Bars(top, s, ui.SURFACE)
         self.lte_bars.pack(side="right")
-        self.lte_values = self._grid(card, ("State", "Coverage", "Round trip", "GCS", "Data"),
-                                     {"Coverage": self._coverage})
+        self.lte_values = self._grid(card, ("State", "Network", "Signal", "Link", "Round trip", "GCS", "Data"),
+                                     {"Network": self._network, "Signal": self._signal})
         self.quick = tk.BooleanVar(value=self.plane.quick)
         tk.Checkbutton(card, text="Quick start (the real modem takes about 16 s)", variable=self.quick,
                        command=self.toggle_quick, bg=ui.SURFACE, fg=ui.TEXT, selectcolor=ui.FIELD,
@@ -585,19 +663,37 @@ class SimWindow:
             value.grid(row=row, column=1, sticky="w", padx=(12, 0), pady=1)
         return values
 
-    def _coverage(self, parent) -> tk.Frame:
+    def _network(self, parent) -> tk.Frame:
+        """No connection · 2G · LTE: a row of buttons, the chosen one lit."""
         s = self.scale
         frame = tk.Frame(parent, bg=ui.SURFACE)
-        self.coverage = tk.Scale(frame, from_=0, to=len(COVERAGE) - 1, orient="horizontal", resolution=1,
-                                 showvalue=False, length=round(110 * s), width=round(12 * s),
-                                 sliderlength=round(18 * s), bd=0, highlightthickness=0, bg=ui.MUTED,
-                                 activebackground=ui.TEXT, troughcolor=ui.FIELD, sliderrelief="flat",
-                                 command=self.set_coverage)
-        self.coverage.set(self.plane.coverage)
-        self.coverage.pack(side="left")
-        self.coverage_text = tk.Label(frame, text="", bg=ui.SURFACE, fg=ui.TEXT, font=self.font)
-        self.coverage_text.pack(side="left", padx=(round(8 * s), 0))
-        self.set_coverage(str(self.plane.coverage))
+        self.network_buttons = []
+        for i, network in enumerate(NETWORKS):
+            button = tk.Label(frame, text=network[0].split(" (")[0], font=self.font_small, cursor="hand2",
+                              padx=round(8 * s), pady=round(2 * s))
+            button.pack(side="left", padx=(0, round(3 * s)))
+            button.bind("<Button-1>", lambda _e, i=i: self.set_network(i))
+            self.network_buttons.append(button)
+        self._light_network(self.plane.network)
+        return frame
+
+    def _light_network(self, network: int) -> None:
+        for i, button in enumerate(self.network_buttons):
+            button.configure(bg=ui.ACCENT if i == network else ui.FIELD, fg=ui.ON_ACCENT if i == network else ui.TEXT)
+
+    def _signal(self, parent) -> tk.Frame:
+        s = self.scale
+        frame = tk.Frame(parent, bg=ui.SURFACE)
+        self.signal = tk.Scale(frame, from_=0, to=len(SIGNALS) - 1, orient="horizontal", resolution=1,
+                               showvalue=False, length=round(110 * s), width=round(12 * s),
+                               sliderlength=round(18 * s), bd=0, highlightthickness=0, bg=ui.MUTED,
+                               activebackground=ui.TEXT, troughcolor=ui.FIELD, sliderrelief="flat",
+                               command=self.set_signal)
+        self.signal.set(self.plane.signal)
+        self.signal.pack(side="left")
+        self.signal_text = tk.Label(frame, text="", bg=ui.SURFACE, fg=ui.TEXT, font=self.font)
+        self.signal_text.pack(side="left", padx=(round(8 * s), 0))
+        self.set_signal(str(self.plane.signal))
         return frame
 
     # -- actions
@@ -613,11 +709,15 @@ class SimWindow:
     def toggle_quick(self) -> None:
         self.plane.quick = self.quick.get()
 
-    def set_coverage(self, value: str) -> None:
+    def set_network(self, network: int) -> None:
+        self.plane.call(self.plane.set_network, network)
+        self._light_network(network)
+
+    def set_signal(self, value: str) -> None:
         level = int(float(value))
-        self.plane.call(self.plane.set_coverage, level)
-        name, rssi = COVERAGE[level][:2]
-        self.coverage_text.configure(text=name if rssi is None else f"{name} ({rssi} dBm)")
+        self.plane.call(self.plane.set_signal, level)
+        name, dbm = SIGNALS[level][:2]
+        self.signal_text.configure(text=f"{name} ({dbm} dBm)")
 
     def close(self) -> None:
         self.root.after_cancel(self.poll_job)
@@ -665,9 +765,10 @@ class SimWindow:
         # the LED, as on the board (README: "The RGB LED"), from worst to best: red without mobile data
         # (blinking while it starts and searches), yellow while the relay does not answer, green when
         # connected but no GCS is (telemetry held back), blue when a GCS is and the telemetry flows
+        no_coverage = p.network == NO_CONNECTION
         if m is None:
             color = ui.LED_OFF
-        elif m.stage != "data" or p.coverage == 0:
+        elif m.stage != "data" or no_coverage:
             color = ui.RED if blink else ui.LED_OFF
         elif not session:
             color = YELLOW
@@ -686,20 +787,26 @@ class SimWindow:
             if m.stage == "starting":
                 state = "Starting the modem…" + since
             elif m.stage == "searching":
-                state = ("No signal: searching for the network…" if p.coverage == 0
+                state = ("No coverage: searching for a network…" if no_coverage
                          else "Searching for the network…") + since
             elif m.stage == "registered":
-                state = "Registered (LTE), starting mobile data…" + since
-            elif p.coverage == 0:
-                state = "No signal: nothing gets through"
+                state = f"Registered on {NETWORKS[p.network][0]}, starting mobile data…" + since
+            elif no_coverage:
+                state = "No coverage: nothing gets through"
+            elif m.net is not None and now < m.net.gap_until:
+                state = f"Moving to {NETWORKS[p.network][0]}: no data for a moment"
             elif session:
-                state = "Connected to the relay"
+                state = f"Connected to the relay over {NETWORKS[p.network][0].split(' (')[0]}"
             elif client.hellos >= 5:
                 state = "Mobile data up, but no answer from the relay"
             else:
                 state = "Mobile data up, connecting to the relay…" + since
         self._set(v["State"], state)
-        self.lte_bars.set(p.coverage if m is not None and m.stage in ("registered", "data") else None)
+        registered = m is not None and m.stage in ("registered", "data") and not no_coverage
+        self.lte_bars.set(p.signal + 1 if registered else None)
+        f = link_figures(p.network, p.signal)
+        self._set(v["Link"], "No coverage: nothing gets through" if f is None else
+                  f"{speed_text(f[0])} up · +{f[2] * 1000:.0f} ms each way · {f[4] * 100:g}% loss")
         self._set(v["Round trip"], f"{client.rtt_ms} ms, plane ↔ relay"
                   if session and client.rtt_ms != mr.U16_UNKNOWN else "-")
         if session:
@@ -710,16 +817,27 @@ class SimWindow:
         net = m.net if m is not None else None
         self._rate(net, now)
         up, down = self.rates
-        self._set(v["Data"], f"↑ {up / 1000:.1f} KB/s   ↓ {down / 1000:.1f} KB/s" if net is not None else "-")
+        data = f"↑ {up / 1000:.1f} KB/s   ↓ {down / 1000:.1f} KB/s"
+        if self.lost_share >= 0.005:
+            data += f" · {self.lost_share:.0%} of packets lost"
+        self._set(v["Data"], data if net is not None else "-")
 
     def _rate(self, net: Optional[Network], now: float) -> None:
-        t, mark, up, down = self.rate_mark
+        """Traffic offered to the network over the last second, and the share of packets it lost over
+        the last five (a full queue drops in bursts)."""
+        t, mark, *before = self.rate_mark
+        counts = (net.up_bytes, net.down_bytes, net.packets, net.lost) if net is not None else (0, 0, 0, 0)
         if net is not mark:
-            self.rate_mark = (now, net, net.up_bytes if net else 0, net.down_bytes if net else 0)
-            self.rates = (0.0, 0.0)
+            self.rate_mark = (now, net, *counts)
+            self.rates, self.lost_share = (0.0, 0.0), 0.0
+            self.loss_window.clear()
         elif net is not None and now - t >= 1.0:
-            self.rates = ((net.up_bytes - up) / (now - t), (net.down_bytes - down) / (now - t))
-            self.rate_mark = (now, net, net.up_bytes, net.down_bytes)
+            up, down, packets, lost = (c - b for c, b in zip(counts, before))
+            self.rates = (up / (now - t), down / (now - t))
+            self.loss_window.append((packets, lost))
+            sent = sum(p for p, _ in self.loss_window)
+            self.lost_share = sum(lost for _, lost in self.loss_window) / sent if sent else 0.0
+            self.rate_mark = (now, net, *counts)
 
     @staticmethod
     def _set(label: tk.Label, text: str) -> None:

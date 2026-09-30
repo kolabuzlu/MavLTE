@@ -1,4 +1,4 @@
-"""The plane simulator: its aircraft (battery, LTE module, coverage) against a real relay, with a fake
+"""The plane simulator: its aircraft (battery, LTE module, network) against a real relay, with a fake
 flight controller in place of SITL, and its window. Skipped where tkinter is missing."""
 
 import asyncio
@@ -129,9 +129,10 @@ def wait_for(test, cond, what, timeout=8.0, pump=None):
 @unittest.skipUnless(plane_sim, "needs tkinter")
 class PlaneTest(unittest.TestCase):
     def setUp(self):
-        patcher = mock.patch.object(plane_sim, "STARTUP_QUICK", (0.05, 0.05, 0.05))
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for name, value in (("STARTUP_QUICK", (0.05, 0.05, 0.05)), ("REGISTER_AGAIN_S", 0.2), ("RAT_SWITCH_S", 0.2)):
+            patcher = mock.patch.object(plane_sim, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.ground = Ground()
         self.addCleanup(self.ground.close)
         self.plane = plane_sim.Plane(("127.0.0.1", self.ground.relay_port), KEY_V, fc_port=self.ground.fc_port)
@@ -142,7 +143,7 @@ class PlaneTest(unittest.TestCase):
         m = self.plane.modem
         return m.client.session if m is not None and m.client is not None else 0
 
-    def test_battery_lte_module_and_coverage(self):
+    def test_battery_lte_module_and_network(self):
         p, g = self.plane, self.ground
         p.call(p.set_lte, True)
         p.call(p.set_battery, True)
@@ -172,16 +173,21 @@ class PlaneTest(unittest.TestCase):
         p.call(p.set_lte, True)
         wait_for(self, lambda: self.session() not in (0, first), "new relay session")
 
-        # coverage: the signal the module reports, and no signal gets nothing through
-        p.call(p.set_coverage, 1)
+        # the network and signal the module reports reach the relay (and MavLTE)
+        self.assertEqual(g.relay.vehicle.rat, 7)  # LTE
+        p.call(p.set_signal, 0)
         wait_for(self, lambda: g.relay.vehicle.rssi_dbm == -101, "weak signal at the relay")
-        p.call(p.set_coverage, 0)
+        p.call(p.set_network, plane_sim.NET_2G)
+        wait_for(self, lambda: g.relay.vehicle.rat == 3, "EDGE at the relay")
+        p.call(p.set_signal, 3)
+        # no coverage: nothing gets through
+        p.call(p.set_network, plane_sim.NO_CONNECTION)
         time.sleep(0.4)
         heard = g.relay.vehicle.last_rx
         time.sleep(0.6)
         self.assertEqual(g.relay.vehicle.last_rx, heard)
-        p.call(p.set_coverage, 4)
-        wait_for(self, lambda: g.relay.vehicle.last_rx > heard, "heard again with a signal")
+        p.call(p.set_network, plane_sim.NET_LTE)
+        wait_for(self, lambda: g.relay.vehicle.last_rx > heard, "heard again with coverage")
 
         # battery off: flight controller and module lose power together
         p.call(p.set_battery, False)
@@ -190,14 +196,14 @@ class PlaneTest(unittest.TestCase):
 
     def test_no_signal_no_registration(self):
         p = self.plane
-        p.call(p.set_coverage, 0)
+        p.call(p.set_network, plane_sim.NO_CONNECTION)
         p.call(p.set_lte, True)
         p.call(p.set_battery, True)
         wait_for(self, lambda: p.modem is not None and p.modem.stage == "searching", "searching")
         time.sleep(0.4)
         self.assertEqual(p.modem.stage, "searching")  # nothing to register with
-        p.call(p.set_coverage, 3)
-        wait_for(self, self.session, "relay session once there is a signal")
+        p.call(p.set_network, plane_sim.NET_2G)
+        wait_for(self, self.session, "relay session once there is coverage")
 
     def test_mistyped_relay_host_keeps_the_module_trying(self):
         plane = plane_sim.Plane(("10.0.0..1", self.ground.relay_port), KEY_V, fc_port=self.ground.fc_port)
@@ -216,6 +222,59 @@ class PlaneTest(unittest.TestCase):
         wait_for(self, lambda: p.fc.mode == "FBWA", "flight controller up")
         time.sleep(0.3)
         self.assertIsNone(p.modem)
+
+
+@unittest.skipUnless(plane_sim, "needs tkinter")
+class NetworkTest(unittest.TestCase):
+    """The mobile network model on its own, with exact figures."""
+
+    def test_speed_queue_and_order(self):
+        net = plane_sim.Network(("127.0.0.1", 9), plane_sim.NET_LTE, 3)
+        net.figures = (1000.0, 1000.0, 0.1, 0.05, 0.0)  # 1000 bytes/s each way, 100 ms ± 50, no loss
+        size = 500 - 28  # 500 bytes on the air with the IP and UDP headers
+        timings = [net.schedule(True, size, 0.0) for _ in range(6)]
+        self.assertIsNone(timings[5])  # 2.5 s of queue: more than the network holds
+        for k, (sent, arrival) in enumerate(timings[:5]):  # each waits for those before it, then travels
+            self.assertAlmostEqual(sent, 0.5 * (k + 1))
+            self.assertAlmostEqual(arrival, sent + 0.1, delta=0.05 + 1e-9)
+        arrivals = [arrival for _, arrival in timings[:5]]
+        self.assertEqual(arrivals, sorted(arrivals))  # in order despite the jitter
+        self.assertAlmostEqual(net.schedule(False, size, 0.0)[1], 0.6, delta=0.05 + 1e-9)  # downlink: own queue
+
+    def test_queue_is_lost_with_the_coverage(self):
+        net = plane_sim.Network(("127.0.0.1", 9), plane_sim.NET_LTE, 3)
+        net.figures = (1000.0, 1000.0, 0.1, 0.0, 0.0)
+        first, _ = net.schedule(True, 472, 0.0)  # on the air until 0.5 s
+        second, _ = net.schedule(True, 472, 0.0)  # waits its turn, sent at 1.0 s
+        net.set_network(plane_sim.NO_CONNECTION, 3, now=0.7)  # the coverage goes in between
+
+        class Transport:
+            out = []
+
+            def sendto(self, data, addr):
+                self.out.append(data)
+
+        transport = Transport()
+        net._send(transport, b"first", ("relay", 1), 0.0, first)
+        net._send(transport, b"second", ("relay", 1), 0.0, second)
+        self.assertEqual(transport.out, [b"first"])  # sent before: arrives; still queued: lost
+        self.assertEqual(net.lost, 1)
+
+    def test_no_coverage_and_network_change(self):
+        net = plane_sim.Network(("127.0.0.1", 9), plane_sim.NET_2G, 3)
+        self.assertIsNotNone(net.schedule(True, 100, time.monotonic()))
+        net.set_network(plane_sim.NET_LTE, 3, gap=0.5)  # moving from 2G to LTE
+        self.assertIsNone(net.schedule(True, 100, time.monotonic()))
+        self.assertIsNotNone(net.schedule(True, 100, time.monotonic() + 0.6))
+        net.set_network(plane_sim.NO_CONNECTION, 3)
+        self.assertIsNone(net.schedule(True, 100, time.monotonic() + 1.0))
+
+    def test_figures(self):
+        up, down, delay, jitter, loss = plane_sim.link_figures(plane_sim.NET_2G, 0)  # weak 2G
+        self.assertAlmostEqual(up * 8 / 1000, 18)  # kbit/s: slower than the telemetry (about 22)
+        self.assertAlmostEqual(delay, 0.21)
+        self.assertIsNone(plane_sim.link_figures(plane_sim.NO_CONNECTION, 3))
+        self.assertEqual(plane_sim.speed_text(plane_sim.link_figures(plane_sim.NET_LTE, 3)[0]), "5 Mbit/s")
 
 
 @unittest.skipUnless(HAVE_DISPLAY, "needs Tk and a display")
@@ -243,7 +302,8 @@ class WindowTest(unittest.TestCase):
                          "flight controller shown", pump=root.update)
                 self.assertEqual(win.fc_led.color, ui.GREEN)
                 self.assertEqual(text(win.volts), "12.6 V")
-                wait_for(self, lambda: text(win.lte_values["State"]) == "Connected to the relay", "module connected",
+                wait_for(self, lambda: text(win.lte_values["State"]) == "Connected to the relay over LTE",
+                         "module connected",
                          pump=root.update)
                 wait_for(self, lambda: win.lte_led.color == ui.BLUE, "steady blue: a GCS is there",
                          pump=root.update)

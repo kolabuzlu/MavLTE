@@ -302,8 +302,19 @@ section of `mavrelay.ini`.
 - **LTE module** is the modem. On, it starts up like the real one (about 16 s, or a couple of
   seconds with *Quick start*); off cuts it without a goodbye, as a power cut would. Its LED
   shows what the board's RGB LED shows.
-- **Coverage** sets the signal it reports and the delay and loss of its link, from *Excellent* to
-  *No signal*.
+- **Network** is what the plane flies through, with typical figures. The A7670E falls back to 2G
+  where there is no LTE; it has no 3G. Changing between 2G and LTE costs a few seconds without
+  data, as it does on a real modem.
+
+  | Network | Upload | Delay added each way | Loss | MavLTE shows |
+  |---|---|---|---|---|
+  | No connection | none | | all | no signal |
+  | 2G (EDGE) | 60 kbit/s | 150 ms ± 60 | 1% | EDGE |
+  | LTE (4G) | 5 Mbit/s | 15 ms ± 8 | 0.1% | LTE |
+
+- **Signal**, from *Weak* to *Excellent*, is the level the module reports (the bars in MavLTE).
+  A weaker signal also slows the link and adds delay and loss. On weak 2G the upload (18 kbit/s)
+  is slower than the telemetry, so it queues up and the *Data* line shows packets being lost.
 
 Put the MavLTE app beside it and watch its LEDs follow: they go dark about 3 s after the plane
 goes quiet.
