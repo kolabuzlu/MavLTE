@@ -361,7 +361,7 @@ class Plane:
             try:
                 infos = await loop.getaddrinfo(self.server[0], self.server[1], type=socket.SOCK_DGRAM)
                 return infos[0][4][:2]
-            except OSError as exc:
+            except (OSError, UnicodeError) as exc:  # UnicodeError: a name with an empty or overlong label
                 log.warning("LTE module: cannot look up %s (%s); trying again", self.server[0], exc)
                 await asyncio.sleep(5.0)
 

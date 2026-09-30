@@ -17,6 +17,10 @@ void bridge_set_radio(int16_t rssi_dbm, uint8_t rat);
 /* Milliseconds since the relay was last heard from, or since mobile data came up if later. */
 uint32_t bridge_relay_silence_ms(void);
 
+/* Valid packets received from the relay since boot: compare two readings to tell whether the relay
+ * answered in between (bridge_relay_silence_ms() restarts when mobile data comes up). */
+uint32_t bridge_relay_packets(void);
+
 typedef struct {
     bool relay; /* session with the relay */
     bool gcs;   /* the relay says a GCS is connected */

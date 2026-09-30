@@ -197,6 +197,15 @@ class PlaneTest(unittest.TestCase):
         p.call(p.set_coverage, 3)
         wait_for(self, self.session, "relay session once there is a signal")
 
+    def test_mistyped_relay_host_keeps_the_module_trying(self):
+        plane = plane_sim.Plane(("10.0.0..1", self.ground.relay_port), KEY_V, fc_port=self.ground.fc_port)
+        plane.quick = True
+        self.addCleanup(plane.close)
+        with self.assertLogs("mavrelay.plane", "WARNING") as logs:
+            plane.call(plane.set_battery, True)
+            wait_for(self, lambda: any("cannot look up" in line for line in logs.output), "lookup retried")
+        self.assertFalse(plane.modem_task.done())  # an empty label raises UnicodeError, not OSError
+
     def test_module_switched_off_stays_off_with_the_battery(self):
         p = self.plane
         p.call(p.set_lte, False)

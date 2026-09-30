@@ -19,6 +19,7 @@ import asyncio
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -100,11 +101,18 @@ class Settings:
                 setattr(s, kind, value)
         return s
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, fields: Tuple[str, ...] = ("name", "server", "key", "tcp", "udp")) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)  # first save of MavLTE.exe
-        mr.update_config(path, "gcs", {"name": self.name, "server": self.server, "key": self.key,
-                                       "tcp": self.tcp, "udp": self.udp},
+        mr.update_config(path, "gcs", {field: getattr(self, field) for field in fields},
                          remove=("tcp_on", "udp_on"))  # switch states of earlier versions
+
+
+def name_problem(name: str) -> Optional[str]:
+    """Why a vehicle name cannot be kept in mavrelay.ini as it is, or None."""
+    if re.search(r"(^|\s)[#;]", name):
+        return ("The vehicle name cannot have a # or ; at the start or after a space: mavrelay.ini "
+                "would read the rest as a comment. Leave out the space, as in UAV#2.")
+    return None
 
 
 def parse_address(host: str, port: str) -> Tuple[str, int]:
@@ -162,6 +170,8 @@ class AgentRunner:
                     await self.task
                 except BaseException:
                     pass
+            if self.agent is not None:
+                self.agent.close_ports()  # also any opened after the agent's task had ended
             self.agent = self.task = None
 
         self._call(go())
@@ -384,6 +394,7 @@ class SettingsDialog(tk.Toplevel):
         key = self.key.get().strip()
         try:
             host, port = mr.parse_hostport(server)
+            host.encode("idna")  # a UnicodeError (a ValueError) for a typo like 10.0.0..1: no host name at all
             if not host or not 1 <= port <= 65535:
                 raise ValueError
         except ValueError:
@@ -395,8 +406,13 @@ class SettingsDialog(tk.Toplevel):
         except ValueError as exc:
             messagebox.showerror(APP, f"GCS key: {exc}.", parent=self)
             return
+        name = self.name.get().strip() or "My UAV"
+        problem = name_problem(name)
+        if problem:
+            messagebox.showerror(APP, problem, parent=self)
+            return
         self.destroy()
-        self.app.apply_settings(self.name.get().strip() or "My UAV", server, key)
+        self.app.apply_settings(name, server, key)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -593,10 +609,12 @@ class App:
         card.set_on(True)
         self._remember()
 
-    def _remember(self) -> None:
+    def _remember(self, *fields: str) -> None:
+        """Saves the port addresses and the given settings: only what this window changes, so that
+        what other programs write to mavrelay.ini meanwhile (sitl_demo.py's key, say) stays."""
         self.settings.tcp, self.settings.udp = self.tcp_card.text(), self.udp_card.text()
         try:
-            self.settings.save(self.config_path)
+            self.settings.save(self.config_path, ("tcp", "udp") + fields)
         except OSError as exc:
             log.warning("cannot save settings: %s", exc)
 
@@ -604,7 +622,7 @@ class App:
         changed = (server, key) != (self.settings.server, self.settings.key)
         self.settings.name, self.settings.server, self.settings.key = name, server, key
         self._update_server_label()
-        self._remember()
+        self._remember("name", "server", "key")
         if changed:  # reconnect with the new server or key
             cards = [card for card in (self.tcp_card, self.udp_card) if card.switch.on]
             if self.runner.running:

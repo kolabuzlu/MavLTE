@@ -80,9 +80,14 @@ the highest seen are dropped. The window is only updated after the tag has been 
 Sessions are chosen by the server at random, so old packets from earlier sessions are
 rejected as unknown sessions.
 
-HELLO carries no sequence number: replaying one only makes the server create a pending
-session that nobody can use, and the number of pending sessions is capped. WELCOME is bound
-to the client's current nonce and REJECT to the client's current session.
+HELLO carries no sequence number, so a captured HELLO can be replayed. Clients use a new
+random nonce for every attempt, and the server gives one nonce at most one session: a HELLO
+whose nonce belongs to a pending session gets that session's WELCOME again (a client
+retrying), and one whose nonce belongs to an active session is ignored (a replay). When the
+capped pool of pending sessions is full, the server first drops the oldest pending session
+from the new HELLO's own IP address, so replayed HELLOs from one address cannot push out other
+clients' sessions before they can answer. WELCOME is bound to the client's current nonce and
+REJECT to the client's current session.
 
 ## Link state hints
 

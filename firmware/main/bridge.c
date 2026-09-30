@@ -33,6 +33,7 @@ static SemaphoreHandle_t lock; /* guards tun, batcher and sock */
 static EventGroupHandle_t net_events;
 static volatile uint32_t net_generation; /* incremented each time PPP gets an address */
 static volatile uint32_t relay_contact_ms; /* last valid packet from the relay, or PPP up */
+static volatile uint32_t relay_packets;    /* valid packets from the relay since boot */
 static tun_client_t tun;
 static mav_batcher_t batcher;
 static uint8_t batch_buf[TUN_MAX_PAYLOAD];
@@ -228,6 +229,7 @@ static void net_task(void *arg)
                     tun_input(&tun, rx, (size_t)n, now);
                     if (tun_connected(&tun) && tun.last_rx == now) { /* it was a valid packet */
                         relay_contact_ms = now;
+                        relay_packets++;
                     }
                     size_t out_len = downlink_len; /* points into rx, which only this task uses */
                     xSemaphoreGive(lock);
@@ -273,6 +275,11 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
 uint32_t bridge_relay_silence_ms(void)
 {
     return now_ms() - relay_contact_ms;
+}
+
+uint32_t bridge_relay_packets(void)
+{
+    return relay_packets;
 }
 
 bridge_state_t bridge_state(void)

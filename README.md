@@ -342,7 +342,8 @@ bytes at the cost of telemetry delay; commands from the GCS are never delayed.
 | MavLTE says the aircraft is not connected to the relay | The ESP32 log (`pio device monitor`): SIM, network registration, APN, relay address and key. |
 | ESP32 log shows `Vehicle key is not set` | Set it in menuconfig, rebuild and flash. |
 | `the modem does not answer on its UART` | Modem power: the 5 V supply, and whether the DIP switch or firmware turns the modem on. |
-| `no usable SIM card` / `needs a PIN` / `locked (PUK needed)` | SIM seated contacts-down; remove the PIN with a phone. The firmware tries a configured PIN only once per start, so it can never lock your SIM. |
+| `the modem does not answer at 921600 baud` | The board's modem link cannot carry the fast rate; the firmware stays at 115200 from then on, which is enough for telemetry. With DIP switch "4G" on, power the board off and on once. To try the fast rate again, erase the flash (`pio run -t erase`) and upload. |
+| `no usable SIM card` / `needs a PIN` / `locked (PUK needed)` / `rejected the PIN` | SIM seated contacts-down; remove the PIN with a phone. If the SIM rejects the PIN from menuconfig, the firmware remembers that and does not send it again, not even after a restart, so it cannot lock your SIM. It tries again once the PIN in menuconfig changes or the SIM has been unlocked in a phone. |
 | `searching for the network (no signal yet ...)` | LTE antenna on the main connector; coverage. |
 | `the network refused registration` | The SIM is not activated or has no data plan. |
 | `no IP address from the network` | Wrong APN. |

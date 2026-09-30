@@ -32,7 +32,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -348,12 +348,13 @@ class LinkStatus(NamedTuple):
 
 
 class Session:
-    def __init__(self, sid: int, role: int, key: bytes, addr, info: str, now: float) -> None:
+    def __init__(self, sid: int, role: int, key: bytes, addr, info: str, now: float, nonce: bytes = b"") -> None:
         self.sid = sid
         self.role = role
         self.key = key
         self.addr = addr
         self.info = info
+        self.nonce = nonce  # from the HELLO that asked for this session
         self.active = False
         self.watching = False  # a GCS agent with no GCS software attached (PING_FLAG_WATCHING)
         self.created = now
@@ -487,16 +488,27 @@ class RelayServer(asyncio.DatagramProtocol):
     def _on_hello(self, pkt: Packet, key: bytes, addr, now: float) -> None:
         if len(pkt.body) < NONCE_LEN:
             return
+        nonce = pkt.body[:NONCE_LEN]
+        # A HELLO carries no sequence number, so a captured one can be replayed at will. Clients use a
+        # new nonce for every attempt: one nonce never gets a second session.
+        known = next((s for s in self.sessions.values() if s.role == pkt.role and s.nonce == nonce), None)
+        if known is not None:
+            if not known.active:  # the client retrying before our WELCOME reached it
+                self.transport.sendto(encode(key, WELCOME, ROLE_SERVER, known.sid, 0, nonce), addr)
+            return  # else a replay of the HELLO that started an active session
         pending = [s for s in self.sessions.values() if not s.active]
         if len(pending) >= self.MAX_PENDING:
-            del self.sessions[min(pending, key=lambda s: s.created).sid]
+            # make room among this address's own attempts first, so that one sender cannot push out
+            # everyone else's before they can answer
+            own = [s for s in pending if s.addr[0] == addr[0]]
+            del self.sessions[min(own or pending, key=lambda s: s.created).sid]
         sid = 0
         while sid == 0 or sid in self.sessions:
             sid = secrets.randbits(32)
         info = pkt.body[NONCE_LEN:NONCE_LEN + INFO_MAX].decode("utf-8", "replace")
         info = "".join(c for c in info if c.isprintable())
-        self.sessions[sid] = Session(sid, pkt.role, key, addr, info, now)
-        self.transport.sendto(encode(key, WELCOME, ROLE_SERVER, sid, 0, pkt.body[:NONCE_LEN]), addr)
+        self.sessions[sid] = Session(sid, pkt.role, key, addr, info, now, nonce)
+        self.transport.sendto(encode(key, WELCOME, ROLE_SERVER, sid, 0, nonce), addr)
         slog.debug("HELLO from %s %s -> session %08x", ROLE_NAMES.get(pkt.role), fmt_addr(addr), sid)
 
     def _activate(self, sess: Session) -> None:
@@ -738,7 +750,7 @@ class TunnelClient(asyncio.DatagramProtocol):
                     self.transport.close()
                 local = ("::", 0) if family == socket.AF_INET6 else ("0.0.0.0", 0)
                 self.transport, _ = await loop.create_datagram_endpoint(lambda: self, local_addr=local)
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:  # UnicodeError: a name with an empty or overlong label
             self.log.warning("cannot reach %s: %s; retrying in 5 s", self.host, exc)
             self.next_resolve = time.monotonic() + 5.0
             return
@@ -1194,13 +1206,17 @@ class GcsAgent:
         glog.info("TCP port off")
         return True
 
+    def close_ports(self) -> None:
+        """Closes the UDP and TCP ports, without telling the relay (the agent is going away)."""
+        self._close_udp()
+        self._close_tcp()
+
     async def run(self) -> None:
         glog.info("connecting to relay %s:%d", self.client.host, self.client.port)
         try:
             await self.client.run()
         finally:
-            self._close_udp()
-            self._close_tcp()
+            self.close_ports()
 
 
 async def run_gcs(opts) -> None:
@@ -1255,7 +1271,8 @@ async def run_vehicle(opts) -> None:
 def load_config(path: Optional[str], section: str) -> Dict[str, str]:
     if not path:
         return {}
-    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    # interpolation=None: values are read as written, so a '%' (in a vehicle name, say) is just a '%'
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None)
     if not parser.read(path, encoding="utf-8"):
         raise SystemExit(f"cannot read config file {path}")
     return dict(parser[section]) if parser.has_section(section) else {}
@@ -1398,9 +1415,10 @@ def resolve_options(args: argparse.Namespace) -> argparse.Namespace:
         if out.server is None:
             raise SystemExit("missing --server host:port")
         out.key = key("key")
-        out.serial = o.get("serial")
-        out.tcp = o.get("tcp")
-        out.udp = o.get("udp")
+        if args.serial or args.tcp or args.udp:  # one source: the command line's, if it names one
+            out.serial, out.tcp, out.udp = args.serial, args.tcp, args.udp
+        else:
+            out.serial, out.tcp, out.udp = o.get("serial"), o.get("tcp"), o.get("udp")
         if not (out.serial or out.tcp or out.udp):
             raise SystemExit("give one of --serial, --tcp or --udp")
         out.batch_ms = float(o.get("batch_ms", 50))

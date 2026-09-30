@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 #include "board.h"
 #include "bridge.h"
@@ -26,6 +27,9 @@
 #define PPP_UP BIT0
 #define PPP_DOWN BIT1
 #define RELAY_SILENCE_LIMIT_MS (3 * 60 * 1000)
+#define NVS_NAMESPACE "modem"
+#define NVS_BAD_PIN "bad_pin"     /* the menuconfig SIM PIN that the SIM card rejected */
+#define NVS_SLOW_UART "slow_uart" /* 1: the modem did not answer at CONFIG_BRIDGE_MODEM_BAUD */
 
 #if CONFIG_BRIDGE_NETWORK_LTE_ONLY
 #define NETWORK_MODE 38 /* AT+CNMP: LTE only */
@@ -41,6 +45,7 @@ static esp_modem_dce_t *dce;
 static EventGroupHandle_t events;
 static bool power_switchable; /* DIP switch "4G" is off, so the firmware controls the modem's power */
 static bool pin_rejected;     /* never retry a wrong SIM PIN: three tries lock the SIM */
+static bool fast_baud_failed; /* the modem took AT+IPR but did not answer at that rate: stay at BOOT_BAUD */
 static int baud = BOOT_BAUD;
 
 static uint32_t now_ms(void)
@@ -157,25 +162,78 @@ static bool sync_modem(uint32_t timeout_ms)
 }
 
 /* PPP on a 115200 baud link tops out below the flight controller's 115200 baud telemetry, so the
- * modem UART runs faster. AT+IPR only lasts until the modem restarts. */
-static void set_fast_baud(void)
+ * modem UART runs faster. AT+IPR only lasts until the modem restarts. Returns false if the modem
+ * is left at a rate it cannot be reached at, so that only a reset brings it back. */
+static bool set_fast_baud(void)
 {
-    if (baud == CONFIG_BRIDGE_MODEM_BAUD) {
-        return;
+    if (baud == CONFIG_BRIDGE_MODEM_BAUD || fast_baud_failed) {
+        return true;
     }
-    if (esp_modem_set_baud(dce, CONFIG_BRIDGE_MODEM_BAUD) == ESP_OK) {
-        uart_set_baudrate(MODEM_UART, CONFIG_BRIDGE_MODEM_BAUD);
-        baud = CONFIG_BRIDGE_MODEM_BAUD;
-        vTaskDelay(pdMS_TO_TICKS(100));
+    if (esp_modem_set_baud(dce, CONFIG_BRIDGE_MODEM_BAUD) != ESP_OK) {
+        /* No OK, so it did not switch. Had it switched anyway, sync_modem() finds it at either rate. */
+        ESP_LOGW(TAG, "modem did not switch to %d baud; staying at %d", CONFIG_BRIDGE_MODEM_BAUD, BOOT_BAUD);
+        return true;
+    }
+    /* It said OK and switched: from here on the ESP32 may only change rate together with the modem */
+    uart_set_baudrate(MODEM_UART, CONFIG_BRIDGE_MODEM_BAUD);
+    baud = CONFIG_BRIDGE_MODEM_BAUD;
+    vTaskDelay(pdMS_TO_TICKS(100));
+    for (int i = 0; i < 5; i++) {
         if (esp_modem_sync(dce) == ESP_OK) {
             ESP_LOGI(TAG, "modem UART at %d baud", baud);
-            return;
+            return true;
         }
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
-    ESP_LOGW(TAG, "modem did not switch to %d baud; staying at %d", CONFIG_BRIDGE_MODEM_BAUD, BOOT_BAUD);
+    /* Remembered in flash: with DIP "4G" on, a modem stuck at a rate the link cannot carry only
+     * comes back with a power cycle of the whole board, after which it must not happen again. */
+    fast_baud_failed = true;
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u8(nvs, NVS_SLOW_UART, 1);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    ESP_LOGW(TAG, "the modem does not answer at %d baud; using %d from now on (erase the flash to try again)",
+             CONFIG_BRIDGE_MODEM_BAUD, BOOT_BAUD);
+    esp_modem_set_baud(dce, BOOT_BAUD); /* reaches it if only its answers get lost at the fast rate */
     uart_set_baudrate(MODEM_UART, BOOT_BAUD);
     baud = BOOT_BAUD;
-    esp_modem_sync(dce);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    return esp_modem_sync(dce) == ESP_OK;
+}
+
+/* A wrong PIN counts on the SIM card across restarts, and three lock it: once the SIM rejects the
+ * PIN from menuconfig, it is remembered in flash and not sent again, not even after a restart. */
+static bool pin_known_bad(void)
+{
+    char stored[32];
+    size_t len = sizeof(stored);
+    nvs_handle_t nvs;
+    if (pin_rejected) {
+        return true;
+    }
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return false; /* nothing stored yet */
+    }
+    bool bad = nvs_get_str(nvs, NVS_BAD_PIN, stored, &len) == ESP_OK && strcmp(stored, CONFIG_BRIDGE_SIM_PIN) == 0;
+    nvs_close(nvs);
+    return bad;
+}
+
+static void remember_bad_pin(bool bad)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+        return;
+    }
+    if (bad) {
+        nvs_set_str(nvs, NVS_BAD_PIN, CONFIG_BRIDGE_SIM_PIN);
+        nvs_commit(nvs);
+    } else if (nvs_erase_key(nvs, NVS_BAD_PIN) == ESP_OK) { /* the SIM was unlocked: start afresh */
+        nvs_commit(nvs);
+    }
+    nvs_close(nvs);
 }
 
 static bool check_sim(void)
@@ -189,23 +247,32 @@ static bool check_sim(void)
     }
     switch (state) {
     case ESP_MODEM_SIM_PIN_STATE_READY:
+        remember_bad_pin(false);
         return true;
-    case ESP_MODEM_SIM_PIN_STATE_NEED_PIN:
+    case ESP_MODEM_SIM_PIN_STATE_NEED_PIN: {
         if (CONFIG_BRIDGE_SIM_PIN[0] == '\0') {
             ESP_LOGE(TAG, "the SIM card needs a PIN: set it in menuconfig, or remove the PIN with a phone");
             return false;
         }
-        if (pin_rejected) {
-            ESP_LOGE(TAG, "the SIM PIN in menuconfig was rejected earlier; not trying it again");
+        if (pin_known_bad()) {
+            ESP_LOGE(TAG, "the SIM card rejected the PIN in menuconfig earlier; not trying it again, so that it "
+                          "cannot lock itself. Set the right PIN, or remove the PIN with a phone.");
             return false;
         }
-        if (esp_modem_set_pin(dce, CONFIG_BRIDGE_SIM_PIN) != ESP_OK) {
-            pin_rejected = true;
-            ESP_LOGE(TAG, "the SIM card rejected the PIN from menuconfig");
+        esp_err_t err = esp_modem_set_pin(dce, CONFIG_BRIDGE_SIM_PIN);
+        if (err != ESP_OK) {
+            pin_rejected = true; /* not again in this start either way */
+            if (err == ESP_FAIL) { /* the SIM answered with an error: a wrong PIN, which it counts */
+                remember_bad_pin(true);
+                ESP_LOGE(TAG, "the SIM card rejected the PIN from menuconfig");
+            } else {
+                ESP_LOGE(TAG, "no answer to the SIM PIN; not trying it again until the next start");
+            }
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(3000));
         return true;
+    }
     case ESP_MODEM_SIM_PIN_STATE_NEED_PUK:
         ESP_LOGE(TAG, "the SIM card is locked (PUK needed): unlock it in a phone");
         return false;
@@ -367,22 +434,17 @@ static void hard_reset(void)
 
 typedef enum { LINK_PPP_LOST, LINK_RELAY_SILENT } link_end_t;
 
-/* Watches the connection until it ends. *heard tells whether the relay answered meanwhile. */
-static link_end_t stay_online(bool *heard)
+/* Watches the connection until it ends. */
+static link_end_t stay_online(void)
 {
-    *heard = false;
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(events, PPP_DOWN, pdFALSE, pdFALSE, pdMS_TO_TICKS(1000));
         if (bits & PPP_DOWN) {
             ESP_LOGW(TAG, "mobile data connection lost");
             return LINK_PPP_LOST;
         }
-        uint32_t silence = bridge_relay_silence_ms();
-        if (silence < 5000) {
-            *heard = true;
-        }
         /* PPP can stay up while nothing gets through any more; redialling usually cures it */
-        if (silence > RELAY_SILENCE_LIMIT_MS) {
+        if (bridge_relay_silence_ms() > RELAY_SILENCE_LIMIT_MS) {
             ESP_LOGW(TAG, "nothing from the relay for %d minutes; redialling", RELAY_SILENCE_LIMIT_MS / 60000);
             return LINK_RELAY_SILENT;
         }
@@ -410,7 +472,11 @@ static void modem_task(void *arg)
             hard_reset();
             continue;
         }
-        set_fast_baud();
+        if (!set_fast_baud()) {
+            failures++;
+            hard_reset();
+            continue;
+        }
         if (!configure() || !wait_registration(180000)) {
             if (++failures % 3 == 0) {
                 hard_reset();
@@ -418,6 +484,7 @@ static void modem_task(void *arg)
             continue;
         }
         report_radio();
+        uint32_t relay_packets = bridge_relay_packets();
         if (!dial()) {
             hang_up();
             if (++failures % 3 == 0) {
@@ -427,9 +494,11 @@ static void modem_task(void *arg)
         }
         failures = 0;
         status_set_modem(STATUS_MODEM_ONLINE);
-        bool heard;
-        link_end_t end = stay_online(&heard);
+        link_end_t end = stay_online();
         hang_up();
+        /* whether the relay answered during this connection: count its packets, as the silence clock
+         * restarts when mobile data comes up */
+        bool heard = bridge_relay_packets() != relay_packets;
         if (heard || end == LINK_PPP_LOST) {
             silent = 0;
         } else if (++silent >= 2) { /* redialling did not help: reset the modem */
@@ -448,6 +517,17 @@ void modem_start(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, on_ip_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_LOST_IP, on_ip_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, on_ppp_status, NULL));
+    nvs_handle_t nvs;
+    uint8_t slow = 0;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+        nvs_get_u8(nvs, NVS_SLOW_UART, &slow);
+        nvs_close(nvs);
+    }
+    if (slow) {
+        fast_baud_failed = true;
+        ESP_LOGW(TAG, "modem UART stays at %d baud: it did not work at %d before (erase the flash to try again)",
+                 BOOT_BAUD, CONFIG_BRIDGE_MODEM_BAUD);
+    }
     power_init();
     xTaskCreate(modem_task, "modem", 6144, NULL, 10, NULL);
 }

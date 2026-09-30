@@ -213,6 +213,14 @@ class GuiTest(unittest.TestCase):
         self.assertEqual(app.tcp_card.available.color, mavlte.LED_OFF)
         self.pump(lambda: self.text(app.craft_state).startswith("Offline"), what="aircraft offline")
 
+    def test_close_keeps_what_others_wrote_meanwhile(self):
+        # sitl_demo.py --no-agent writes its relay and key while the app is open
+        mr.update_config(self.config, "gcs", {"server": "127.0.0.1:14650", "key": KEY_V.hex()})
+        self.app.close()  # as the user closing the window
+        saved = mavlte.Settings.load(self.config)
+        self.assertEqual((saved.server, saved.key), ("127.0.0.1:14650", KEY_V.hex()))
+        self.assertEqual(saved.name, "Test UAV")
+
     def test_wrong_key_says_no_answer(self):
         app = self.app
         app.apply_settings(app.settings.name, app.settings.server, KEY_V.hex())  # not the GCS key: no answer
@@ -241,6 +249,17 @@ class SettingsFileTest(unittest.TestCase):
             open(beside, "w").close()
             self.assertEqual(mavlte.settings_file(), beside)  # a file next to the exe wins
         self.assertEqual(mavlte.settings_file(), os.path.join(mavlte.HERE, "mavrelay.ini"))  # from source
+
+    def test_vehicle_names(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "mavrelay.ini")
+        mavlte.Settings(name="33% Cub", server="relay.example.com:14650", key=KEY_G.hex()).save(path)
+        self.assertEqual(mavlte.Settings.load(path).name, "33% Cub")  # a % once stopped the app from starting
+        for fine in ("33% Cub", "UAV#2", "Talon; blue"):
+            self.assertIsNone(mavlte.name_problem(fine), fine)
+        for cut_short in ("UAV #2", "#1 UAV", "Plane ;blue"):  # the INI file would read a comment there
+            self.assertIsNotNone(mavlte.name_problem(cut_short), cut_short)
 
 
 if __name__ == "__main__":

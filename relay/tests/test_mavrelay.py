@@ -288,6 +288,24 @@ class ConfigTest(unittest.TestCase):
                                "server = new:2\nudp = off\nkey = k1\n\n[vehicle]\nkey = abc\n")
         self.assertEqual(fresh, "[gcs]\nkey = k2\n")
 
+    def test_values_are_read_as_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mavrelay.ini")
+            mr.update_config(path, "gcs", {"name": "33% Cub", "udp": "[fe80::1%12]:14550"})
+            conf = mr.load_config(path, "gcs")
+        self.assertEqual((conf["name"], conf["udp"]), ("33% Cub", "[fe80::1%12]:14550"))  # no % interpolation
+
+    def test_vehicle_source_on_the_command_line_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mavrelay.ini")
+            with open(path, "w") as f:
+                f.write("[vehicle]\nserver = relay.example.com:14650\nkey = %s\ntcp = 127.0.0.1:5762\n" % KEY_V.hex())
+            given = mr.resolve_options(mr.build_parser().parse_args(["vehicle", "--config", path,
+                                                                     "--udp", "0.0.0.0:14560"]))
+            from_file = mr.resolve_options(mr.build_parser().parse_args(["vehicle", "--config", path]))
+        self.assertEqual((given.serial, given.tcp, given.udp), (None, None, "0.0.0.0:14560"))
+        self.assertEqual((from_file.tcp, from_file.udp), ("127.0.0.1:5762", None))
+
     def test_tcp_allow_default_is_loopback(self):
         args = mr.build_parser().parse_args(["server", "--vehicle-key", KEY_V.hex(), "--gcs-key", KEY_G.hex()])
         port = mr.TcpGcsPort(None, mr.resolve_options(args).tcp_allow)
@@ -295,6 +313,54 @@ class ConfigTest(unittest.TestCase):
         self.assertTrue(port.allowed("::1"))
         self.assertTrue(port.allowed("::ffff:127.0.0.1"))
         self.assertFalse(port.allowed("203.0.113.9"))
+
+
+class HelloReplayTest(unittest.TestCase):
+    """A HELLO carries no sequence number: captured ones replayed or flooded from one address must
+    not keep anyone else from getting a session (driven packet by packet, no timing involved)."""
+
+    PLANE = ("203.0.113.5", 5000)
+    ATTACKER = ("198.51.100.7", 4000)
+
+    def setUp(self):
+        self.relay = mr.RelayServer({mr.ROLE_VEHICLE: KEY_V, mr.ROLE_GCS: KEY_G})
+        self.sent = []
+        sent = self.sent
+
+        class Transport:
+            def sendto(self, data, addr):
+                sent.append((mr.decode(data), addr))
+
+        self.relay.connection_made(Transport())
+
+    def hello(self, key, role, nonce, addr):
+        self.relay.datagram_received(mr.encode(key, mr.HELLO, role, 0, 0, nonce + b"test"), addr)
+
+    def welcomes_to(self, addr):
+        return [p.session for p, a in self.sent if a == addr and p.type == mr.WELCOME]
+
+    def test_replays_and_floods_do_not_block_a_new_session(self):
+        self.hello(KEY_V, mr.ROLE_VEHICLE, b"plane-01", self.PLANE)
+        [sid] = self.welcomes_to(self.PLANE)
+        self.hello(KEY_V, mr.ROLE_VEHICLE, b"plane-01", self.PLANE)  # a retry gets the same session
+        self.assertEqual(self.welcomes_to(self.PLANE), [sid, sid])
+
+        captured = mr.encode(KEY_G, mr.HELLO, mr.ROLE_GCS, 0, 0, b"laptop01" + b"agent")
+        for _ in range(100):
+            self.relay.datagram_received(captured, self.ATTACKER)
+        self.assertEqual(sum(s.nonce == b"laptop01" for s in self.relay.sessions.values()), 1)
+        for i in range(100):  # many different captured HELLOs, all from one address
+            self.hello(KEY_G, mr.ROLE_GCS, i.to_bytes(8, "big"), self.ATTACKER)
+        self.assertIn(sid, self.relay.sessions)  # they only pushed out each other
+        self.assertLessEqual(sum(not s.active for s in self.relay.sessions.values()), self.relay.MAX_PENDING)
+
+        body = mr.PING_BODY.pack(0, mr.U16_UNKNOWN, mr.U16_UNKNOWN, mr.RSSI_UNKNOWN, mr.RAT_UNKNOWN, 0)
+        self.relay.datagram_received(mr.encode(KEY_V, mr.PING, mr.ROLE_VEHICLE, sid, 1, body), self.PLANE)
+        self.assertIs(self.relay.vehicle, self.relay.sessions[sid])
+
+        before = (len(self.sent), len(self.relay.sessions))
+        self.hello(KEY_V, mr.ROLE_VEHICLE, b"plane-01", self.ATTACKER)  # the plane's HELLO, replayed
+        self.assertEqual((len(self.sent), len(self.relay.sessions)), before)  # no answer, no new session
 
 
 class LiveTest(unittest.IsolatedAsyncioTestCase):
@@ -406,6 +472,15 @@ class LiveTest(unittest.IsolatedAsyncioTestCase):
         agent.stop_udp()
         self.assertTrue(agent.watching)
         await self.until(lambda: not vehicle.gcs_present)
+
+    async def test_mistyped_host_keeps_the_client_retrying(self):
+        # an empty label makes getaddrinfo raise UnicodeError, not OSError
+        client = mr.TunnelClient(mr.ROLE_GCS, KEY_G, "10.0.0..1", self.port, on_data=lambda data: None)
+        task = asyncio.ensure_future(client.run())
+        self.tasks.append(task)
+        await asyncio.sleep(0.3)
+        self.assertFalse(task.done())  # still running, and will look the name up again in 5 s
+        self.assertIsNone(client.server_addr)
 
     async def test_forged_and_replayed_packets_are_ignored(self):
         vehicle, gcs = await self.connected_pair()

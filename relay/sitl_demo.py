@@ -74,7 +74,8 @@ def find_sitl() -> Optional[Path]:
 
 def start_sitl(args, console: bool = True) -> subprocess.Popen:
     """console=False for window apps: on Windows SITL then gets no console window of its own."""
-    exe = Path(args.sitl) if args.sitl else find_sitl()
+    # absolute: SITL runs in its own folder, where a relative path would point somewhere else
+    exe = Path(args.sitl).resolve() if args.sitl else find_sitl()
     if exe is None or not exe.is_file():
         raise SystemExit("ArduPlane SITL not found. Start a plane simulation in Mission Planner once (it downloads "
                          "SITL), or give its path with --sitl.")
