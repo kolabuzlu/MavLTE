@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
@@ -197,6 +198,29 @@ class GuiTest(unittest.TestCase):
         app.toggle(app.udp_card, True)
         self.pump(lambda: self.text(app.relay_text).startswith("No answer from the relay"), timeout=10,
                   what="no-answer message")
+
+
+@unittest.skipUnless("mavlte" in sys.modules, "needs tkinter")
+class SettingsFileTest(unittest.TestCase):
+    """Where MavLTE.exe keeps its settings (sys.frozen and sys.executable as PyInstaller sets them)."""
+
+    def test_exe_settings(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        exe = os.path.join(tmp.name, "MavLTE", "MavLTE.exe")
+        os.makedirs(os.path.dirname(exe))
+        local = os.path.join(tmp.name, "AppData", "Local")
+        with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(sys, "executable", exe), \
+                mock.patch.dict(os.environ, {"LOCALAPPDATA": local}):
+            path = mavlte.settings_file()
+            self.assertEqual(path, os.path.join(local, "MavLTE", "mavrelay.ini"))
+            mavlte.Settings(server="relay.example.com:14650", key=KEY_G.hex()).save(path)  # makes the folder
+            self.assertEqual(mavlte.Settings.load(path).server, "relay.example.com:14650")
+
+            beside = os.path.join(os.path.dirname(exe), "mavrelay.ini")
+            open(beside, "w").close()
+            self.assertEqual(mavlte.settings_file(), beside)  # a file next to the exe wins
+        self.assertEqual(mavlte.settings_file(), os.path.join(mavlte.HERE, "mavrelay.ini"))  # from source
 
 
 if __name__ == "__main__":

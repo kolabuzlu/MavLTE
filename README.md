@@ -33,7 +33,7 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
 | Folder | What |
 |---|---|
 | [firmware/](firmware) | ESP-IDF firmware for the ESP32-S3 (PlatformIO or `idf.py`) |
-| [relay/](relay) | `mavrelay.py`: the relay server, the GCS agent and a Python vehicle for bench tests; `MavLTE.pyw` / `mavlte.py`: the MavLTE app (the GCS agent as a window); `sitl_demo.py`: the whole link with ArduPilot SITL on one PC |
+| [relay/](relay) | `mavrelay.py`: the relay server, the GCS agent and a Python vehicle for bench tests; `MavLTE.pyw` / `mavlte.py`: the MavLTE app (the GCS agent as a window), `build_release.py` makes it into `MavLTE.exe`; `sitl_demo.py`: the whole link with ArduPilot SITL on one PC |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | Tunnel protocol |
 
 ## Setup, in order
@@ -214,10 +214,10 @@ and signs everything it sends. The flight controller then ignores unsigned comma
 
 ## 5. MavLTE app and Mission Planner
 
-On the laptop, install Python 3 (python.org) and copy the `relay` folder.
-
-**The MavLTE app.** Double-click **`MavLTE.pyw`** (or run `python mavlte.py`). The first time it
-asks for the relay server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
+**The MavLTE app.** On Windows, run **`MavLTE.exe`**: one file, no Python needed (to make it, see
+[Development](#development)). With Python 3 (python.org) it also runs from the `relay` folder:
+double-click **`MavLTE.pyw`** or run `python mavlte.py`. The first time it asks for the relay
+server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
 
 - Switch **UDP** on to send to Mission Planner on 127.0.0.1:14550, and/or **TCP** to listen on
   127.0.0.1:5760. Change a port while its switch is off.
@@ -228,10 +228,12 @@ asks for the relay server and the GCS key (later: ☰ → Settings). Both switch
   QGroundControl finds UDP 14550 by itself.
 - Switching both off also disconnects from the relay, so the aircraft stops sending telemetry.
 
-The app keeps its settings in the `[gcs]` section of `mavrelay.ini` next to it.
+The app keeps its settings in the `[gcs]` section of `mavrelay.ini`: `MavLTE.exe` in
+`%LOCALAPPDATA%\MavLTE\mavrelay.ini` (or in a `mavrelay.ini` next to the exe, if you put one
+there, to carry it on a USB stick); from source, the one next to `mavlte.py`.
 
-**Without the window**, the same agent runs on the command line with the same file: double-click
-`start-gcs.bat`, or run
+**Without the window**, the same agent runs on the command line (Python 3 and the `relay` folder)
+with the same file: double-click `start-gcs.bat`, or run
 
 ```bash
 python mavrelay.py gcs --server your-server.example.com:14650 --key <GCS key>
@@ -335,6 +337,15 @@ cd firmware/test/host && make test                      # C core: SHA-256/HMAC, 
 
 On Linux, macOS or WSL the relay tests also build `firmware/test/host/tunnel_harness` and run the
 firmware's C tunnel code against the Python relay, including a relay restart.
+
+**MavLTE.exe** (on Windows, with `pip install pyinstaller`):
+
+```bash
+cd relay && python build_release.py
+```
+
+makes `relay/dist/MavLTE/MavLTE.exe` (one file, with the icon; LICENSE beside it) and
+`relay/dist/MavLTE-<version>-windows.zip` to attach to a GitHub release.
 
 ## License
 

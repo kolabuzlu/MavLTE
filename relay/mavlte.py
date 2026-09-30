@@ -5,10 +5,11 @@ Gives Mission Planner (or QGroundControl) a TCP and a UDP port, each with its ow
 next to a switch lights up while the aircraft is online. Both switches start off. Switching
 both off again also disconnects from the relay, so the aircraft stops sending telemetry.
 
-    python mavlte.py            (or double-click MavLTE.pyw)
+    python mavlte.py            (or double-click MavLTE.pyw, or run MavLTE.exe: build_release.py)
 
 Settings live in the [gcs] section of mavrelay.ini next to this file, the same file that
-start-gcs.bat and `mavrelay.py gcs --config mavrelay.ini` use. Standard library only (Tkinter).
+start-gcs.bat and `mavrelay.py gcs --config mavrelay.ini` use; MavLTE.exe keeps its own (see
+settings_file). Standard library only (Tkinter).
 """
 
 from __future__ import annotations
@@ -29,9 +30,25 @@ from typing import Callable, Optional, Tuple
 import mavrelay as mr
 
 APP = "MavLTE"
-HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG = os.path.join(HERE, "mavrelay.ini")
+# MavLTE.exe unpacks its files (the icon) into a temporary folder: sys._MEIPASS
+HERE = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 ICON = os.path.join(HERE, "mavlte.png")
+
+
+def settings_file() -> str:
+    """mavrelay.ini next to this file. MavLTE.exe uses one next to the exe if there is one (to carry
+    the app around on a USB stick), otherwise its own in %LOCALAPPDATA%\\MavLTE: a newer exe finds
+    it there again, and the key does not travel with a copy of the exe."""
+    if not getattr(sys, "frozen", False):
+        return os.path.join(HERE, "mavrelay.ini")
+    beside = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "mavrelay.ini")
+    if os.path.exists(beside):
+        return beside
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, APP, "mavrelay.ini")
+
+
+CONFIG = settings_file()
 
 # the MavGCS dark palette
 BG = "#1e1e1e"
@@ -82,6 +99,7 @@ class Settings:
         return s
 
     def save(self, path: str) -> None:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)  # first save of MavLTE.exe
         mr.update_config(path, "gcs", {"name": self.name, "server": self.server, "key": self.key,
                                        "tcp": self.tcp, "udp": self.udp},
                          remove=("tcp_on", "udp_on"))  # switch states of earlier versions

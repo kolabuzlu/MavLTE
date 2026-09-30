@@ -11,3 +11,7 @@ firmware/test/host/tunnel_harness
 # relay config with keys
 relay/mavrelay.ini
 __pycache__/
+
+# MavLTE.exe build output (relay/build_release.py)
+relay/build/
+relay/dist/
