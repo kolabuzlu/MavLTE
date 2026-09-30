@@ -727,8 +727,8 @@ class App:
         if status is None:
             self.craft_led.set(LED_OFF)
             self._set(self.craft_state, "Waiting for news from the relay…")
-        elif status.online:
-            self.craft_led.set(GREEN)
+        elif status.online:  # green when available, blue when connected, as the LEDs on the cards
+            self.craft_led.set(GREEN if agent.watching else BLUE)
             self._set(self.craft_state, "Available: switch TCP or UDP on" if agent.watching else "Online")
         elif status.idle_ms == mr.U16_UNKNOWN:
             self.craft_led.set(LED_OFF)

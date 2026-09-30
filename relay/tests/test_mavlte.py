@@ -130,6 +130,7 @@ class GuiTest(unittest.TestCase):
         self.assertEqual(app.tcp_card.available.color, mavlte.GREEN)
         self.assertEqual(app.udp_card.led.color, mavlte.LED_OFF)
         self.pump(lambda: self.text(app.craft_state) == "Available: switch TCP or UDP on", what="aircraft available")
+        self.assertEqual(app.craft_led.color, mavlte.GREEN)
         self.pump(lambda: not self.vehicle.gcs_present, what="aircraft told there is no GCS")
         self.assertEqual(app.runner.agent.to_gcs_bytes, 0)  # the relay sends a watcher no telemetry
 
@@ -143,6 +144,7 @@ class GuiTest(unittest.TestCase):
         self.assertEqual(str(app.udp_card.entries[1].cget("state")), "disabled")  # no editing while on
         self.pump(lambda: app.udp_card.led.color == mavlte.BLUE, what="UDP Connected LED blue")
         self.assertEqual(self.text(app.craft_state), "Online")
+        self.assertEqual(app.craft_led.color, mavlte.BLUE)  # as the Connected LED
         self.pump(lambda: self.vehicle.gcs_present, what="aircraft told a GCS is there")
         self.assertEqual(app.tcp_card.led.color, mavlte.LED_OFF)  # switched off: stays dark
 
@@ -169,6 +171,7 @@ class GuiTest(unittest.TestCase):
         app.toggle(app.tcp_card, False)  # both off: only watching again
         self.assertTrue(app.runner.agent.watching)
         self.pump(lambda: self.text(app.craft_state) == "Available: switch TCP or UDP on", what="watching again")
+        self.assertEqual(app.craft_led.color, mavlte.GREEN)
         self.pump(lambda: not self.vehicle.gcs_present, what="aircraft holds its telemetry back again")
         self.assertEqual(app.tcp_card.led.color, mavlte.LED_OFF)
         self.assertEqual(app.tcp_card.available.color, mavlte.GREEN)
