@@ -13,19 +13,29 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
 
 #include "board.h"
+#include "camera.h"
 #include "mavframe.h"
+#include "mavpos.h"
+#include "snapshot.h"
 #include "tunnel.h"
 #include "version.h"
 
 #define FC_UART UART_NUM_2 /* UART0 is the USB console, UART1 the modem */
 #define NET_UP BIT0
 #define STATS_INTERVAL_MS 60000
+#define RAT_LTE 7
+/* the most of the uplink a photo may take (bytes/s): the rest stays for the telemetry, and less when
+ * the round trip shows the link filling up */
+#define PHOTO_CAP_LTE 32768.0f
+#define PHOTO_CAP_2G 2048.0f
+#define POSITION_FRESH_MS 5000
 
 static const char *TAG = "bridge";
 
@@ -43,6 +53,16 @@ static bool reopen_socket; /* look the relay up again (its address may have chan
 static struct sockaddr_in server;
 static const uint8_t *downlink; /* set by the tunnel's data callback while tun_input runs */
 static size_t downlink_len;
+static snap_outbox_t snap;       /* snapshots: photos from the camera on request (guarded by lock) */
+static mav_position_t position;  /* where the flight controller says the aircraft is (guarded by lock) */
+#if CONFIG_BRIDGE_CAMERA
+static QueueHandle_t camera_jobs; /* for the camera task, which may take a second or two per photo */
+typedef struct {
+    bool release; /* else take */
+    uint32_t photo_id;
+    uint16_t width, height;
+} camera_job_t;
+#endif
 
 static struct {
     uint32_t fc_rx_bytes;
@@ -76,6 +96,7 @@ static void tun_event_cb(void *ctx, tun_event_t event, uint32_t session)
     switch (event) {
     case TUN_EVENT_CONNECTED:
         ESP_LOGI(TAG, "connected to the relay (session %08" PRIx32 ")", session);
+        snap_restart(&snap, now_ms()); /* perhaps a new relay, that knows nothing of a photo on its way */
         break;
     case TUN_EVENT_TIMEOUT:
         ESP_LOGW(TAG, "no answer from the relay; reconnecting");
@@ -91,6 +112,69 @@ static void tun_random_cb(void *ctx, uint8_t *buf, size_t len)
 {
     esp_fill_random(buf, len);
 }
+
+static void tun_packet_cb(void *ctx, uint8_t type, const uint8_t *body, size_t len)
+{
+    snap_input(&snap, type, body, len, now_ms());
+}
+
+/* ---- snapshots (callbacks called with lock held) */
+
+#if CONFIG_BRIDGE_CAMERA
+static void snap_take_cb(void *ctx, uint32_t photo_id, uint16_t width, uint16_t height)
+{
+    ESP_LOGI(TAG, "photo %" PRIu32 " asked for (%ux%u)", photo_id, width, height);
+    const camera_job_t job = {.release = false, .photo_id = photo_id, .width = width, .height = height};
+    if (xQueueSend(camera_jobs, &job, 0) != pdTRUE) {
+        snap_photo_taken(&snap, photo_id, SNAP_FAILED, NULL, 0, NULL, now_ms());
+    }
+}
+#endif
+
+static void snap_release_cb(void *ctx, uint32_t photo_id, bool sent)
+{
+    if (sent) {
+        ESP_LOGI(TAG, "photo %" PRIu32 " sent in %" PRIu32 ".%" PRIu32 " s", photo_id, snap.last_ms / 1000,
+                 snap.last_ms % 1000 / 100);
+    } else if (snap.last_id == photo_id) {
+        ESP_LOGW(TAG, "photo %" PRIu32 ": no word from the relay for a minute; given up", photo_id);
+    }
+#if CONFIG_BRIDGE_CAMERA
+    /* no waiting here, with the lock held: if the queue were full, the next photo frees this one */
+    const camera_job_t job = {.release = true, .photo_id = photo_id};
+    xQueueSend(camera_jobs, &job, 0);
+#endif
+}
+
+static float photo_cap(void)
+{
+    return tun.rat == RAT_LTE ? PHOTO_CAP_LTE : PHOTO_CAP_2G;
+}
+
+#if CONFIG_BRIDGE_CAMERA
+static void camera_task(void *arg)
+{
+    camera_job_t job;
+    for (;;) {
+        xQueueReceive(camera_jobs, &job, portMAX_DELAY);
+        if (job.release) {
+            camera_release();
+            continue;
+        }
+        const uint8_t *jpeg = NULL;
+        size_t len = 0;
+        uint8_t status = camera_take(job.width, job.height, &jpeg, &len);
+        uint32_t now = now_ms();
+        xSemaphoreTake(lock, portMAX_DELAY);
+        snap_where_t where = {SNAP_UNKNOWN_I32, SNAP_UNKNOWN_I32, SNAP_UNKNOWN_I32, SNAP_UNKNOWN_HEADING};
+        if (position.valid && (uint32_t)(now - position.when_ms) < POSITION_FRESH_MS) {
+            where = (snap_where_t){position.lat, position.lon, position.alt_mm, position.heading};
+        }
+        snap_photo_taken(&snap, job.photo_id, status, status == SNAP_OK ? jpeg : NULL, len, &where, now);
+        xSemaphoreGive(lock);
+    }
+}
+#endif
 
 static void batch_emit(void *ctx, const uint8_t *data, size_t len)
 {
@@ -130,6 +214,7 @@ static void uart_task(void *arg)
         if (n > 0) {
             stats.fc_rx_bytes += (uint32_t)n;
             mav_batcher_feed(&batcher, buf, (size_t)n, now, batch_emit, NULL);
+            mav_position_feed(&position, buf, (size_t)n, now); /* for the notes on a photo */
         }
         mav_batcher_poll(&batcher, now, CONFIG_BRIDGE_BATCH_MS, batch_emit, NULL);
         xSemaphoreGive(lock);
@@ -218,7 +303,10 @@ static void net_task(void *arg)
             fd_set fds;
             FD_ZERO(&fds);
             FD_SET(sock, &fds);
-            struct timeval tv = {.tv_sec = 0, .tv_usec = 50 * 1000};
+            xSemaphoreTake(lock, portMAX_DELAY);
+            bool photo = snap_busy(&snap); /* a photo goes out in small steps */
+            xSemaphoreGive(lock);
+            struct timeval tv = {.tv_sec = 0, .tv_usec = (photo ? 10 : 50) * 1000};
             int r = select(sock + 1, &fds, NULL, NULL, &tv);
             if (r > 0) {
                 int n = recv(sock, rx, sizeof(rx), 0);
@@ -245,6 +333,7 @@ static void net_task(void *arg)
         }
         xSemaphoreTake(lock, portMAX_DELAY);
         tun_poll(&tun, now_ms());
+        snap_poll(&snap, now_ms(), photo_cap());
         bool reopen = reopen_socket;
         reopen_socket = false;
         xSemaphoreGive(lock);
@@ -354,9 +443,18 @@ void bridge_start(void)
         .on_data = tun_data_cb,
         .on_event = tun_event_cb,
         .random = tun_random_cb,
+        .on_packet = tun_packet_cb,
     };
     tun_init(&tun, &tun_config, now_ms());
     mav_batcher_init(&batcher, batch_buf, sizeof(batch_buf), 500);
+    mav_position_init(&position);
+    snap_config_t snap_config = {.release = snap_release_cb}; /* without take(): "no camera" */
+#if CONFIG_BRIDGE_CAMERA
+    camera_jobs = xQueueCreate(4, sizeof(camera_job_t));
+    snap_config.take = snap_take_cb;
+    xTaskCreate(camera_task, "camera", 5120, NULL, 5, NULL);
+#endif
+    snap_init(&snap, &tun, &snap_config);
 
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, on_ip_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_LOST_IP, on_ip_event, NULL));

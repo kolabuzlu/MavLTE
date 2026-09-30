@@ -22,7 +22,9 @@ import configparser
 import hashlib
 import hmac
 import ipaddress
+import json
 import logging
+import os
 import secrets
 import socket
 import struct
@@ -32,7 +34,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.1.7"
+__version__ = "1.2.0"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -344,6 +346,242 @@ class LinkStatus(NamedTuple):
 
 
 # ---------------------------------------------------------------------------------------------
+# Snapshots: a photo from the aircraft's camera on request (docs/PROTOCOL.md, "Snapshots")
+
+SNAP_REQ, SNAP_INFO, SNAP_DATA, SNAP_ACK, SNAP_SYNC = range(8, 13)
+SNAP_REQ_BODY = struct.Struct("<IB")  # photo id (0 from a GCS agent: the relay picks it), size
+# photo id, bytes, width, height, latitude and longitude (1e-7 degrees), altitude above home (mm),
+# heading (centidegrees), status, time (unix seconds, filled in by the relay)
+SNAP_INFO_BODY = struct.Struct("<IIHHiiiHBI")
+SNAP_DATA_HEAD = struct.Struct("<IH")  # photo id, chunk number; then the chunk
+SNAP_ACK_HEAD = struct.Struct("<IB")  # photo id, flags; then a bitmap of the chunks received (bit i: chunk i)
+SNAP_SYNC_BODY = struct.Struct("<I")  # the newest photo id the agent has; also asks for photos from now on
+SNAP_CHUNK = 1024
+SNAP_SIZES = ((320, 240), (640, 480), (1024, 768))  # small, medium, large
+SNAP_MAX_BYTES = 1024 * SNAP_CHUNK
+SNAP_OK, SNAP_NO_AIRCRAFT, SNAP_NO_CAMERA, SNAP_FAILED, SNAP_BUSY, SNAP_NO_ANSWER = range(6)
+SNAP_PROBLEMS = {
+    SNAP_NO_AIRCRAFT: "the aircraft is not connected",
+    SNAP_NO_CAMERA: "the aircraft has no camera (or its CAM switch is off)",
+    SNAP_FAILED: "the camera could not take the photo",
+    SNAP_BUSY: "the aircraft is still sending another photo",
+    SNAP_NO_ANSWER: "the aircraft did not answer",
+}
+ACK_DONE, ACK_HAVE_INFO = 0x01, 0x02
+UNKNOWN_I32 = -0x80000000
+UNKNOWN_HEADING = 0xFFFF
+
+
+class PhotoInfo(NamedTuple):
+    photo_id: int
+    size: int = 0  # bytes; 0 when there is no photo (see status)
+    width: int = 0
+    height: int = 0
+    lat: int = UNKNOWN_I32  # 1e-7 degrees
+    lon: int = UNKNOWN_I32
+    alt: int = UNKNOWN_I32  # mm above home
+    heading: int = UNKNOWN_HEADING  # centidegrees
+    status: int = SNAP_OK
+    time: int = 0  # unix seconds
+
+    def pack(self) -> bytes:
+        return SNAP_INFO_BODY.pack(*self)
+
+    @classmethod
+    def unpack(cls, body: bytes) -> "PhotoInfo":
+        return cls(*SNAP_INFO_BODY.unpack_from(body))
+
+    @property
+    def chunks(self) -> int:
+        return (self.size + SNAP_CHUNK - 1) // SNAP_CHUNK
+
+
+class RateControl:
+    """How fast a photo may go: as fast as the link carries it without delaying the telemetry. The
+    rate backs off when the round trip rises above its recent minimum, meaning a queue is building
+    up in the network, and creeps back up while it does not (as LEDBAT does, RFC 6817). A token
+    bucket spends it."""
+
+    FLOOR = 256.0  # bytes/s
+
+    def __init__(self, cap: float, start: float = 4096.0) -> None:
+        self.cap = cap
+        self.rate = min(cap, start)
+        self.tokens = 0.0
+        self.last: Optional[float] = None
+        self.rtts: deque = deque()  # (time, round trip), the last minute's
+        self.backed_off = -1e9
+
+    def set_cap(self, cap: float) -> None:
+        self.cap = cap
+        self.rate = min(self.rate, cap)
+
+    def rtt_sample(self, rtt: float, now: float) -> None:
+        self.rtts.append((now, rtt))
+        while now - self.rtts[0][0] > 60.0:
+            self.rtts.popleft()
+        base = min(r for _, r in self.rtts)
+        if rtt > base + max(0.15, 0.5 * base):
+            if now - self.backed_off >= 1.0:
+                self.rate = max(self.FLOOR, self.rate / 2)
+                self.backed_off = now
+        else:
+            self.rate = min(self.cap, self.rate + self.cap / 10)
+
+    def budget(self, now: float) -> float:
+        if self.last is not None:
+            self.tokens = min(self.tokens + (now - self.last) * self.rate, max(2 * SNAP_CHUNK, 0.2 * self.rate))
+        self.last = now
+        return self.tokens
+
+    def spend(self, n: int) -> None:
+        self.tokens -= n
+
+
+class PhotoReceiver:
+    """Collects one photo from its SNAP_INFO and SNAP_DATA, in any order, and says what it has."""
+
+    def __init__(self, photo_id: int) -> None:
+        self.photo_id = photo_id
+        self.info: Optional[PhotoInfo] = None
+        self.parts: Dict[int, bytes] = {}
+        self.news = False  # something arrived since the last ACK
+        self.last_rx = 0.0
+        self.acked_at = -1e9
+
+    def on_info(self, info: PhotoInfo, now: float) -> None:
+        self.last_rx, self.news = now, True
+        if self.info is None and (info.status != SNAP_OK or 0 < info.size <= SNAP_MAX_BYTES):
+            self.info = info
+            self.parts = {i: c for i, c in self.parts.items() if i < info.chunks and len(c) == self._length(i)}
+
+    def on_data(self, index: int, chunk: bytes, now: float) -> None:
+        self.last_rx, self.news = now, True
+        if index in self.parts or index >= SNAP_MAX_BYTES // SNAP_CHUNK:
+            return
+        if self.info is not None and (index >= self.info.chunks or len(chunk) != self._length(index)):
+            return
+        self.parts[index] = bytes(chunk)
+
+    def _length(self, index: int) -> int:
+        return min(SNAP_CHUNK, self.info.size - index * SNAP_CHUNK)
+
+    @property
+    def received(self) -> int:
+        return sum(map(len, list(self.parts.values())))  # list(): a copy in one step, for readers in other threads
+
+    @property
+    def complete(self) -> bool:
+        return self.info is not None and self.info.status == SNAP_OK and len(self.parts) == self.info.chunks
+
+    def chunk(self, index: int) -> Optional[bytes]:
+        return self.parts.get(index)
+
+    def data(self) -> bytes:
+        return b"".join(self.parts[i] for i in range(self.info.chunks))
+
+    def ack(self) -> bytes:
+        flags = (ACK_DONE if self.complete else 0) | (ACK_HAVE_INFO if self.info is not None else 0)
+        top = max(self.parts, default=-1)
+        bitmap = bytearray(top // 8 + 1)
+        for i in self.parts:
+            bitmap[i // 8] |= 1 << (i % 8)
+        return SNAP_ACK_HEAD.pack(self.photo_id, flags) + bytes(bitmap)
+
+
+class PhotoSender:
+    """Sends one photo: its SNAP_INFO until the receiver has it, then the chunks, and again whatever
+    the receiver's ACKs do not show after a while. `source` has chunk(i), which may return None for a
+    chunk it does not have yet (the relay passes a photo on while it is still arriving)."""
+
+    GIVE_UP = 60.0  # seconds without any ACK
+
+    def __init__(self, info: PhotoInfo, source, send: Callable[[int, bytes], None], now: float) -> None:
+        self.info, self.source, self.send = info, source, send
+        self.started = now
+        self.acked = set()
+        self.sent_at: Dict[int, float] = {}
+        self.info_acked = False
+        self.info_sent_at = -1e9
+        self.last_ack = now
+        self.done = self.failed = False
+
+    def restart(self, now: float) -> None:
+        """Sends it all again, as to a new receiver (after a relay restart, one that has none of it).
+        Whatever the receiver still has, its first ACK tells."""
+        self.acked.clear()
+        self.sent_at.clear()
+        self.info_acked = False
+        self.info_sent_at = -1e9
+        self.last_ack = now
+
+    def on_ack(self, flags: int, bitmap: bytes, now: float) -> None:
+        self.last_ack = now
+        self.info_acked = self.info_acked or bool(flags & ACK_HAVE_INFO)
+        for i in range(min(len(bitmap) * 8, self.info.chunks)):
+            if bitmap[i // 8] & (1 << (i % 8)):
+                self.acked.add(i)
+        if flags & ACK_DONE:
+            self.done = True
+
+    @property
+    def progress(self) -> float:
+        return len(self.acked) / self.info.chunks if self.info.chunks else 1.0
+
+    def pump(self, now: float, rate: RateControl, rto: float) -> None:
+        if self.done or self.failed:
+            return
+        if now - self.last_ack > self.GIVE_UP:
+            self.failed = True
+            return
+        if not self.info_acked and now - self.info_sent_at >= rto:
+            self.info_sent_at = now
+            self.send(SNAP_INFO, self.info.pack())
+        budget = rate.budget(now)
+        for i in range(self.info.chunks):
+            if i in self.acked or now - self.sent_at.get(i, -1e9) < rto:
+                continue
+            chunk = self.source.chunk(i)
+            if chunk is None:
+                continue
+            if budget < len(chunk):
+                break
+            budget -= len(chunk)
+            rate.spend(len(chunk))
+            self.sent_at[i] = now
+            self.send(SNAP_DATA, SNAP_DATA_HEAD.pack(self.info.photo_id, i) + chunk)
+
+
+class BytesSource:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def chunk(self, index: int) -> Optional[bytes]:
+        return self.data[index * SNAP_CHUNK:(index + 1) * SNAP_CHUNK]
+
+
+class FileSource:
+    """A kept photo, read a chunk at a time as it goes out: photos passed on to an agent that comes
+    back after a while need no memory."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def chunk(self, index: int) -> Optional[bytes]:
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(index * SNAP_CHUNK)
+                return f.read(SNAP_CHUNK) or None
+        except OSError:
+            return None
+
+
+def rto_for(rtt_ms: int) -> float:
+    """How long to wait for an ACK before sending a chunk again."""
+    return max(1.0, 2.5 * rtt_ms / 1000) if rtt_ms != U16_UNKNOWN else 2.0
+
+
+# ---------------------------------------------------------------------------------------------
 # Server
 
 
@@ -357,6 +595,9 @@ class Session:
         self.nonce = nonce  # from the HELLO that asked for this session
         self.active = False
         self.watching = False  # a GCS agent with no GCS software attached (PING_FLAG_WATCHING)
+        self.wants_photos = False  # a GCS agent that sent SNAP_SYNC or SNAP_REQ
+        self.deliveries: List[PhotoSender] = []  # photos on their way to this GCS agent
+        self.photo_rate = RateControl(PhotoStore.GCS_RATE, start=16 * 1024)
         self.created = now
         self.last_rx = now
         self.tx_seq = 0
@@ -375,6 +616,238 @@ class Session:
         return f"{ROLE_NAMES[self.role]} {fmt_addr(self.addr)}{info}"
 
 
+class PhotoStore:
+    """The relay's side of snapshots. Asks the aircraft for a photo when a GCS agent does, collects it,
+    keeps it (in `folder`, for `days`), and passes it on to every GCS agent that wants photos, while it
+    is still arriving and later to agents that come back (SNAP_SYNC names the newest one they have).
+    Photo ids are the unix time of the request, so they keep growing across relay restarts."""
+
+    REQUEST_EVERY = 2.0  # seconds, until the aircraft answers
+    REQUEST_FOR = 20.0
+    DROP_AFTER = 120.0  # an unfinished photo that nothing more arrived for
+    GCS_RATE = 64 * 1024  # bytes/s at most to each GCS agent
+    IN_MEMORY = 20  # photos whose bytes stay in memory as well as in the folder
+    MAX_PHOTOS = 2000  # kept at most (without a folder: IN_MEMORY)
+    RECENT = 600  # seconds: the aircraft may finish sending a photo asked for before a relay restart
+    MAX_INCOMING = 4  # photos arriving at once
+    SYNC_MOST = 50  # photos passed on at most to an agent that comes back: the newest
+
+    def __init__(self, relay: "RelayServer", folder: Optional[str], days: float) -> None:
+        self.relay = relay
+        self.folder = folder
+        self.days = days
+        self.stored: Dict[int, PhotoInfo] = {}
+        self.memory: Dict[int, bytes] = {}  # the newest photos' bytes, and all of them without a folder
+        self.incoming: Dict[int, PhotoReceiver] = {}
+        self.pending: Dict[int, list] = {}  # photo id: [size, asked at, last asked, GCS session id]
+        self.last_id = 0
+        self._load()
+
+    # -- keeping photos
+
+    def _load(self) -> None:
+        if not self.folder:
+            return
+        try:
+            os.makedirs(self.folder, exist_ok=True)
+            names = os.listdir(self.folder)
+        except OSError as exc:
+            slog.warning("cannot use the photo folder %s (%s): photos are kept in memory only", self.folder, exc)
+            self.folder = None
+            return
+        for name in names:
+            if name.endswith(".json") and os.path.exists(os.path.join(self.folder, name[:-5] + ".jpg")):
+                try:
+                    with open(os.path.join(self.folder, name), encoding="utf-8") as f:
+                        meta = json.load(f)
+                    info = PhotoInfo(*(int(meta[field]) for field in PhotoInfo._fields))
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+                self.stored[info.photo_id] = info
+        self.last_id = max(self.stored, default=0)
+        self.prune(time.time())
+        if self.stored:
+            slog.info("%d photo(s) kept in %s", len(self.stored), self.folder)
+
+    def _path(self, photo_id: int, ext: str) -> str:
+        return os.path.join(self.folder, f"{photo_id}.{ext}")
+
+    def new_id(self) -> int:
+        self.last_id = max(int(time.time()), self.last_id + 1)
+        return self.last_id
+
+    def _keep(self, info: PhotoInfo, data: bytes) -> None:
+        self.stored[info.photo_id] = info
+        self.memory[info.photo_id] = data
+        if self.folder:
+            meta = dict(info._asdict(), vehicle=self.relay.vehicle.info if self.relay.vehicle else "")
+            try:
+                for ext, blob in (("jpg", data), ("json", json.dumps(meta, indent=1).encode())):
+                    with open(self._path(info.photo_id, ext) + ".tmp", "wb") as f:
+                        f.write(blob)
+                    os.replace(self._path(info.photo_id, ext) + ".tmp", self._path(info.photo_id, ext))
+            except OSError as exc:
+                slog.warning("cannot save photo %d: %s", info.photo_id, exc)
+        self.prune(time.time())
+
+    def _forget(self, photo_id: int) -> None:
+        del self.stored[photo_id]
+        self.memory.pop(photo_id, None)
+        if self.folder:
+            for ext in ("jpg", "json"):
+                try:
+                    os.remove(self._path(photo_id, ext))
+                except OSError:
+                    pass
+
+    def source(self, photo_id: int):
+        if photo_id in self.incoming:
+            return self.incoming[photo_id]
+        if photo_id in self.memory:
+            return BytesSource(self.memory[photo_id])
+        if self.folder and photo_id in self.stored:
+            return FileSource(self._path(photo_id, "jpg"))
+        return None
+
+    def prune(self, now_unix: float) -> None:
+        """Forgets photos older than `days`, and the oldest beyond MAX_PHOTOS."""
+        ids = sorted(self.stored)
+        most = self.MAX_PHOTOS if self.folder else self.IN_MEMORY
+        for photo_id in ids[:max(0, len(ids) - most)]:
+            self._forget(photo_id)
+        for photo_id in [p for p, info in self.stored.items() if info.time < now_unix - self.days * 86400]:
+            self._forget(photo_id)
+        for photo_id in sorted(self.memory)[:-self.IN_MEMORY]:
+            del self.memory[photo_id]
+
+    # -- packets
+
+    def on_packet(self, sess: "Session", ptype: int, body: bytes, now: float) -> None:
+        if sess.role == ROLE_GCS:
+            if ptype == SNAP_REQ and len(body) >= SNAP_REQ_BODY.size:
+                self._request(sess, SNAP_REQ_BODY.unpack_from(body)[1], now)
+            elif ptype == SNAP_SYNC and len(body) >= SNAP_SYNC_BODY.size:
+                self._sync(sess, SNAP_SYNC_BODY.unpack_from(body)[0], now)
+            elif ptype == SNAP_ACK and len(body) >= SNAP_ACK_HEAD.size:
+                photo_id, flags = SNAP_ACK_HEAD.unpack_from(body)
+                for sender in sess.deliveries:
+                    if sender.info.photo_id == photo_id:
+                        sender.on_ack(flags, body[SNAP_ACK_HEAD.size:], now)
+        elif ptype == SNAP_INFO and len(body) >= SNAP_INFO_BODY.size:
+            self._aircraft_info(sess, PhotoInfo.unpack(body), now)
+        elif ptype == SNAP_DATA and len(body) > SNAP_DATA_HEAD.size:
+            photo_id, index = SNAP_DATA_HEAD.unpack_from(body)
+            receiver = self.incoming.get(photo_id)
+            if receiver is None and self._wanted(photo_id):  # its SNAP_INFO got lost, or comes later
+                self.pending.pop(photo_id, None)  # the aircraft has it: no need to ask again
+                receiver = self.incoming[photo_id] = PhotoReceiver(photo_id)
+            if receiver is not None:
+                receiver.on_data(index, body[SNAP_DATA_HEAD.size:], now)
+            elif photo_id in self.stored:  # it missed our last ACK: tell it we have it all
+                self.relay._send(sess, SNAP_ACK, SNAP_ACK_HEAD.pack(photo_id, ACK_DONE | ACK_HAVE_INFO))
+
+    def _wanted(self, photo_id: int) -> bool:
+        """A photo we asked for, and not yet have. After a restart, the relay no longer knows what it
+        asked for: then a recent one (ids are unix times) is taken as well."""
+        if photo_id in self.stored:
+            return False
+        if photo_id in self.pending:
+            return True
+        return len(self.incoming) < self.MAX_INCOMING and abs(photo_id - time.time()) < self.RECENT
+
+    def _tell(self, sess: "Session", info: PhotoInfo) -> None:
+        self.relay._send(sess, SNAP_INFO, info.pack())
+
+    def _request(self, gcs: "Session", size: int, now: float) -> None:
+        gcs.wants_photos = True
+        photo_id = self.new_id()
+        vehicle = self.relay.vehicle
+        if vehicle is None or now - vehicle.last_rx >= self.relay.ONLINE_TIMEOUT:
+            self._tell(gcs, PhotoInfo(photo_id, status=SNAP_NO_AIRCRAFT, time=int(time.time())))
+            return
+        size = min(size, len(SNAP_SIZES) - 1)
+        self.pending[photo_id] = [size, now, now, gcs.sid]
+        self.relay._send(vehicle, SNAP_REQ, SNAP_REQ_BODY.pack(photo_id, size))
+        slog.info("%s asks for a photo (%dx%d): photo %d", gcs.describe(), *SNAP_SIZES[size], photo_id)
+
+    def _sync(self, gcs: "Session", newest: int, now: float) -> None:
+        gcs.wants_photos = True
+        on_the_way = {sender.info.photo_id for sender in gcs.deliveries}
+        missed = sorted(p for p in set(self.stored) | {p for p, r in self.incoming.items() if r.info}
+                        if p > newest and p not in on_the_way)
+        for photo_id in missed[-self.SYNC_MOST:]:
+            self._deliver(gcs, photo_id, now)
+
+    def _deliver(self, gcs: "Session", photo_id: int, now: float) -> None:
+        info = self.incoming[photo_id].info if photo_id in self.incoming else self.stored.get(photo_id)
+        source = self.source(photo_id)
+        if info is not None and source is not None:
+            gcs.deliveries.append(PhotoSender(info, source, lambda t, b, s=gcs: self.relay._send(s, t, b), now))
+
+    def _aircraft_info(self, vehicle: "Session", info: PhotoInfo, now: float) -> None:
+        request = self.pending.pop(info.photo_id, None)
+        info = info._replace(time=int(time.time()))
+        if info.status != SNAP_OK:
+            if request is not None:  # the first answer (it answers every SNAP_REQ that reaches it)
+                slog.info("photo %d: %s", info.photo_id, SNAP_PROBLEMS.get(info.status, f"status {info.status}"))
+                gcs = self.relay.sessions.get(request[3])
+                if gcs is not None:
+                    self._tell(gcs, info)
+            return
+        receiver = self.incoming.get(info.photo_id)
+        if receiver is None:
+            if info.photo_id in self.stored:
+                self.relay._send(vehicle, SNAP_ACK, SNAP_ACK_HEAD.pack(info.photo_id, ACK_DONE | ACK_HAVE_INFO))
+                return
+            if request is None and not self._wanted(info.photo_id):
+                return  # not asked for by us
+            receiver = self.incoming[info.photo_id] = PhotoReceiver(info.photo_id)
+        if receiver.info is None:
+            receiver.on_info(info, now)
+            slog.info("photo %d from the aircraft: %d KB, %dx%d", info.photo_id, info.size // 1024, info.width,
+                      info.height)
+            for gcs in self.relay.gcs_sessions():
+                if gcs.wants_photos and all(s.info.photo_id != info.photo_id for s in gcs.deliveries):
+                    self._deliver(gcs, info.photo_id, now)
+        else:
+            receiver.on_info(info, now)
+
+    # -- ten or twenty times a second
+
+    def pump(self, now: float) -> None:
+        vehicle = self.relay.vehicle
+        for photo_id, request in list(self.pending.items()):
+            size, asked, last, gcs_id = request
+            if now - asked > self.REQUEST_FOR:
+                del self.pending[photo_id]
+                gcs = self.relay.sessions.get(gcs_id)
+                if gcs is not None:
+                    self._tell(gcs, PhotoInfo(photo_id, status=SNAP_NO_ANSWER, time=int(time.time())))
+            elif vehicle is not None and now - last >= self.REQUEST_EVERY:
+                request[2] = now
+                self.relay._send(vehicle, SNAP_REQ, SNAP_REQ_BODY.pack(photo_id, size))
+        for photo_id, receiver in list(self.incoming.items()):
+            if vehicle is not None and receiver.news and (receiver.complete or now - receiver.acked_at >= 0.5):
+                receiver.news, receiver.acked_at = False, now
+                self.relay._send(vehicle, SNAP_ACK, receiver.ack())
+            if receiver.complete:
+                del self.incoming[photo_id]
+                self._keep(receiver.info, receiver.data())
+                slog.info("photo %d complete: %d KB", photo_id, receiver.info.size // 1024)
+            elif now - receiver.last_rx > self.DROP_AFTER:
+                del self.incoming[photo_id]
+                slog.warning("photo %d: nothing more from the aircraft, dropped with %d of %s KB", photo_id,
+                             receiver.received // 1024, receiver.info.size // 1024 if receiver.info else "?")
+        for gcs in self.relay.gcs_sessions():
+            if gcs.deliveries:
+                for sender in gcs.deliveries:
+                    if now - gcs.last_rx < 5.0:  # else the agent is gone (or on a new session) or cut off
+                        sender.pump(now, gcs.photo_rate, rto_for(gcs.rtt_ms))
+                    elif now - sender.last_ack > sender.GIVE_UP:
+                        sender.failed = True
+                gcs.deliveries = [s for s in gcs.deliveries if not (s.done or s.failed)]
+
+
 class RelayServer(asyncio.DatagramProtocol):
     """Forwards MAVLink between the vehicle session and all GCS sessions (and plain TCP clients)."""
 
@@ -384,10 +857,12 @@ class RelayServer(asyncio.DatagramProtocol):
     GCS_PRESENT_TIMEOUT = 5.0
     SUMMARY_INTERVAL = 300.0
 
-    def __init__(self, keys: Dict[int, bytes], session_timeout: float = 120.0, max_gcs: int = 8) -> None:
+    def __init__(self, keys: Dict[int, bytes], session_timeout: float = 120.0, max_gcs: int = 8,
+                 photo_folder: Optional[str] = None, photo_days: float = 7.0) -> None:
         self.keys = keys
         self.session_timeout = session_timeout
         self.max_gcs = max_gcs
+        self.photos = PhotoStore(self, photo_folder, photo_days)
         self.sessions: Dict[int, Session] = {}
         self.vehicle: Optional[Session] = None
         self.tcp: Optional[TcpGcsPort] = None
@@ -448,6 +923,8 @@ class RelayServer(asyncio.DatagramProtocol):
                 self.to_vehicle(pkt.body)
         elif pkt.type == PING:
             self._on_ping(sess, pkt.body)
+        elif pkt.type >= SNAP_REQ:
+            self.photos.on_packet(sess, pkt.type, pkt.body, now)
 
     # -- forwarding
 
@@ -582,9 +1059,14 @@ class RelayServer(asyncio.DatagramProtocol):
         for sid in [s for s, t in self._last_reject.items() if now - t > 10.0]:
             del self._last_reject[sid]
 
+        for sess in self.gcs_sessions():  # photos to a GCS agent go only as fast as its link allows
+            if sess.deliveries and sess.rtt_ms != U16_UNKNOWN:
+                sess.photo_rate.rtt_sample(sess.rtt_ms / 1000, now)
+
         if now - self._last_summary >= self.SUMMARY_INTERVAL:
             self._last_summary = now
             slog.info("%s", self.summary(now))
+            self.photos.prune(time.time())
 
     def status_body(self, now: float) -> bytes:
         v = self.vehicle
@@ -722,6 +1204,8 @@ class TunnelClient(asyncio.DatagramProtocol):
         self.counters: Counter = Counter()
         self.connected = asyncio.Event()
         self.log = log.getChild(ROLE_NAMES[role])
+        self.on_packet: Optional[Callable[[int, bytes], None]] = None  # snapshot packets (SNAP_*)
+        self.on_session: Optional[Callable[[], None]] = None  # each time a new session starts
 
     @property
     def is_connected(self) -> bool:
@@ -780,6 +1264,13 @@ class TunnelClient(asyncio.DatagramProtocol):
         elif now - self.last_ping >= PING_INTERVAL:
             self.last_ping = now
             self._send_ping()
+
+    def send_packet(self, ptype: int, body: bytes) -> bool:
+        """Sends any packet type on the session (snapshots). False while there is none."""
+        if not self.session:
+            return False
+        self._send(ptype, body)
+        return True
 
     def send_data(self, payload: bytes) -> bool:
         if not self.session:
@@ -846,6 +1337,8 @@ class TunnelClient(asyncio.DatagramProtocol):
                 self._send_ping()  # activates the session on the server
                 self.connected.set()
                 self.log.info("connected to server %s (session %08x)", fmt_addr(self.server_addr), self.session)
+                if self.on_session is not None:
+                    self.on_session()
             return
         if not self.session or pkt.session != self.session:
             return
@@ -867,6 +1360,215 @@ class TunnelClient(asyncio.DatagramProtocol):
                 self.gcs_present = bool(flags & PONG_GCS_PRESENT)
         elif pkt.type == STATUS and self.on_status is not None:
             self.on_status(LinkStatus.unpack(pkt.body))
+        elif pkt.type >= SNAP_REQ and self.on_packet is not None:
+            self.on_packet(pkt.type, pkt.body)
+
+
+class PhotoInbox:
+    """The GCS agent's side of snapshots: asks for photos, collects them from the relay and saves them
+    in `folder`, each with a .json beside it (where and when it was taken). On every new session it
+    tells the relay the newest photo it has (SNAP_SYNC), so photos that arrived while it was away
+    come too."""
+
+    ANSWER_WITHIN = 45.0  # seconds for a photo asked for to start arriving
+    GIVE_UP = 120.0  # seconds without anything more of a photo
+
+    def __init__(self, client: TunnelClient, folder: str,
+                 on_photo: Optional[Callable[[str, PhotoInfo], None]] = None) -> None:
+        self.client = client
+        self.folder = folder
+        self.on_photo = on_photo
+        self.receivers: Dict[int, PhotoReceiver] = {}
+        self.finished: set = set()  # ids saved while this agent runs
+        self.asked_at: Optional[float] = None  # our request, until a photo starts arriving
+        self.problem = ""  # why the last request brought no photo
+        self.problem_at = 0.0
+        self.last_path: Optional[str] = None
+        self.last_info: Optional[PhotoInfo] = None
+
+    def newest(self) -> int:
+        try:
+            names = os.listdir(self.folder)
+        except OSError:
+            return 0
+        ids = [int(n.rsplit("_", 1)[-1][:-4]) for n in names
+               if n.startswith("MavLTE_") and n.endswith(".jpg") and n.rsplit("_", 1)[-1][:-4].isdigit()]
+        return max(ids + list(self.finished), default=0)
+
+    def sync(self) -> None:
+        self.client.send_packet(SNAP_SYNC, SNAP_SYNC_BODY.pack(self.newest()))
+
+    def request(self, size: int) -> bool:
+        """Asks for a photo (size: index into SNAP_SIZES). False while not connected to the relay."""
+        if not self.client.send_packet(SNAP_REQ, SNAP_REQ_BODY.pack(0, size)):
+            return False
+        self.asked_at, self.problem = time.monotonic(), ""
+        return True
+
+    def _fail(self, problem: str) -> None:
+        self.problem, self.problem_at = problem, time.monotonic()
+
+    @property
+    def arriving(self) -> Optional[Tuple[PhotoInfo, int]]:
+        """The photo coming in now, and how many of its bytes are here (safe to read from another
+        thread, like the MavLTE window's)."""
+        for receiver in list(self.receivers.values()):
+            info = receiver.info
+            if info is not None and info.status == SNAP_OK and len(receiver.parts) < info.chunks:
+                return info, receiver.received
+        return None
+
+    def on_packet(self, ptype: int, body: bytes) -> None:
+        now = time.monotonic()
+        if ptype == SNAP_INFO and len(body) >= SNAP_INFO_BODY.size:
+            info = PhotoInfo.unpack(body)
+            if info.status != SNAP_OK:
+                self._fail(SNAP_PROBLEMS.get(info.status, f"no photo (status {info.status})"))
+                self.asked_at = None
+                return
+            receiver = self._receiver(info.photo_id)
+            if receiver is not None:
+                receiver.on_info(info, now)
+                self.asked_at = None
+        elif ptype == SNAP_DATA and len(body) > SNAP_DATA_HEAD.size:
+            photo_id, index = SNAP_DATA_HEAD.unpack_from(body)
+            receiver = self._receiver(photo_id)
+            if receiver is not None:
+                receiver.on_data(index, body[SNAP_DATA_HEAD.size:], now)
+
+    def _receiver(self, photo_id: int) -> Optional[PhotoReceiver]:
+        if photo_id in self.finished:  # the relay missed our last ACK
+            self.client.send_packet(SNAP_ACK, SNAP_ACK_HEAD.pack(photo_id, ACK_DONE | ACK_HAVE_INFO))
+            return None
+        if photo_id not in self.receivers:
+            self.receivers[photo_id] = PhotoReceiver(photo_id)
+        return self.receivers[photo_id]
+
+    def pump(self, now: float) -> None:
+        for photo_id, receiver in list(self.receivers.items()):
+            if receiver.news and (receiver.complete or now - receiver.acked_at >= 0.5):
+                receiver.news, receiver.acked_at = False, now
+                self.client.send_packet(SNAP_ACK, receiver.ack())
+            if receiver.complete:
+                del self.receivers[photo_id]
+                self.finished.add(photo_id)
+                self._save(receiver.info, receiver.data())
+            elif now - receiver.last_rx > self.GIVE_UP:
+                del self.receivers[photo_id]
+                if receiver.info is not None:
+                    self._fail("the photo stopped arriving")
+        if self.asked_at is not None and now - self.asked_at > self.ANSWER_WITHIN:
+            self.asked_at = None
+            self._fail("no photo came")
+
+    def _save(self, info: PhotoInfo, data: bytes) -> None:
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(info.time or info.photo_id))
+        path = os.path.join(self.folder, f"MavLTE_{stamp}_{info.photo_id}.jpg")
+        meta = dict(info._asdict())
+        if info.lat != UNKNOWN_I32:
+            meta.update(latitude=info.lat / 1e7, longitude=info.lon / 1e7)
+        if info.alt != UNKNOWN_I32:
+            meta.update(altitude_m=round(info.alt / 1000, 1))
+        try:
+            os.makedirs(self.folder, exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+            with open(path[:-4] + ".json", "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=1)
+        except OSError as exc:
+            glog.warning("cannot save photo %d: %s", info.photo_id, exc)
+            self._fail(f"cannot save the photo: {exc.strerror or exc}")
+            return
+        glog.info("photo %d saved: %s (%d KB)", info.photo_id, path, len(data) // 1024)
+        self.last_path, self.last_info = path, info
+        if self.on_photo is not None:
+            self.on_photo(path, info)
+
+
+class PhotoOutbox:
+    """The aircraft's side of snapshots: takes the photo the relay asks for and sends it, no faster
+    than the link carries without delaying the telemetry. capture(width, height) returns the JPEG, or
+    None if that failed; without it, the aircraft answers that it has no camera. where() gives latitude,
+    longitude (1e-7 degrees), altitude above home (mm) and heading (centidegrees) at that moment; cap()
+    the highest photo rate for the network the aircraft is on (bytes/s)."""
+
+    def __init__(self, client: TunnelClient, capture: Optional[Callable[[int, int], Optional[bytes]]] = None,
+                 where: Optional[Callable[[], Tuple[int, int, int, int]]] = None,
+                 cap: Optional[Callable[[], float]] = None) -> None:
+        self.client = client
+        self.capture = capture
+        self.where = where
+        self.cap = cap or (lambda: 8192.0)
+        self.sender: Optional[PhotoSender] = None
+        self.rate = RateControl(self.cap())
+        self.rtt_at = 0.0
+        self.answers: Dict[int, int] = {}  # the last requests: photo id -> SNAP_OK (sending) or the problem
+        self.last: Optional[Tuple[PhotoInfo, bool, float]] = None  # the last photo: sent (or given up), seconds
+
+    @property
+    def busy(self) -> bool:
+        return self.sender is not None and not (self.sender.done or self.sender.failed)
+
+    def on_session(self) -> None:
+        """A new session: the relay may be a new one too, that knows nothing of the photo on its way."""
+        if self.busy:
+            self.sender.restart(time.monotonic())
+
+    def on_packet(self, ptype: int, body: bytes) -> None:
+        now = time.monotonic()
+        if ptype == SNAP_REQ and len(body) >= SNAP_REQ_BODY.size:
+            photo_id, size = SNAP_REQ_BODY.unpack_from(body)
+            if photo_id in self.answers:  # asked again: our answer has not reached the relay yet
+                if self.answers[photo_id] != SNAP_OK:  # (a photo's SNAP_INFO goes again by itself)
+                    self._answer(photo_id, self.answers[photo_id])
+            elif self.busy:
+                self._answer(photo_id, SNAP_BUSY)
+            else:
+                self.answers[photo_id] = self._take(photo_id, min(size, len(SNAP_SIZES) - 1), now)
+                while len(self.answers) > 16:
+                    del self.answers[next(iter(self.answers))]
+        elif ptype == SNAP_ACK and self.sender is not None and len(body) >= SNAP_ACK_HEAD.size:
+            photo_id, flags = SNAP_ACK_HEAD.unpack_from(body)
+            if photo_id == self.sender.info.photo_id:
+                self.sender.on_ack(flags, body[SNAP_ACK_HEAD.size:], now)
+
+    def _answer(self, photo_id: int, status: int) -> None:
+        self.client.send_packet(SNAP_INFO, PhotoInfo(photo_id, status=status).pack())
+
+    def _take(self, photo_id: int, size: int, now: float) -> int:
+        if self.capture is None:
+            self._answer(photo_id, SNAP_NO_CAMERA)
+            return SNAP_NO_CAMERA
+        width, height = SNAP_SIZES[size]
+        try:
+            jpeg = self.capture(width, height)
+        except Exception as exc:  # a camera fault must not take the link down with it
+            vlog.warning("camera: %s", exc)
+            jpeg = None
+        if not jpeg or len(jpeg) > SNAP_MAX_BYTES:
+            self._answer(photo_id, SNAP_FAILED)
+            return SNAP_FAILED
+        lat, lon, alt, heading = self.where() if self.where else (UNKNOWN_I32, UNKNOWN_I32, UNKNOWN_I32,
+                                                                  UNKNOWN_HEADING)
+        info = PhotoInfo(photo_id, len(jpeg), width, height, lat, lon, alt, heading)
+        self.sender = PhotoSender(info, BytesSource(jpeg), self.client.send_packet, now)
+        self.rate = RateControl(self.cap())
+        vlog.info("photo %d taken: %d KB, %dx%d", photo_id, len(jpeg) // 1024, width, height)
+        return SNAP_OK
+
+    def pump(self, now: float) -> None:
+        sender = self.sender
+        if sender is None or not self.busy:
+            if sender is not None:
+                vlog.info("photo %d %s", sender.info.photo_id, "sent" if sender.done else "given up")
+                self.last = (sender.info, sender.done, now - sender.started)
+                self.sender = None
+            return
+        if now - self.rtt_at >= 1.0 and self.client.rtt_ms != U16_UNKNOWN:
+            self.rtt_at = now
+            self.rate.set_cap(self.cap())
+            self.rate.rtt_sample(self.client.rtt_ms / 1000, now)
+        sender.pump(now, self.rate, rto_for(self.client.rtt_ms))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1064,7 +1766,8 @@ class UdpLink(asyncio.DatagramProtocol):
 
 async def run_server(opts) -> None:
     keys = {ROLE_VEHICLE: opts.vehicle_key, ROLE_GCS: opts.gcs_key}
-    relay = RelayServer(keys, session_timeout=opts.session_timeout)
+    relay = RelayServer(keys, session_timeout=opts.session_timeout, photo_folder=getattr(opts, "snapshot_dir", None),
+                        photo_days=getattr(opts, "snapshot_days", 7.0))
     loop = asyncio.get_running_loop()
     host, port = opts.listen
     await loop.create_datagram_endpoint(lambda: relay, local_addr=(host or "0.0.0.0", port))
@@ -1074,9 +1777,14 @@ async def run_server(opts) -> None:
         await relay.tcp.start(*opts.tcp_listen)
         allowed = ", ".join(str(n) for n in opts.tcp_allow)
         slog.info("plain TCP port for GCS software on %s, allowed: %s", fmt_addr(opts.tcp_listen), allowed)
+    last_tick = time.monotonic()
     while True:
-        await asyncio.sleep(1.0)
-        relay.tick(time.monotonic())
+        await asyncio.sleep(0.05)  # photos move in small steps; the rest once a second
+        now = time.monotonic()
+        relay.photos.pump(now)
+        if now - last_tick >= 1.0:
+            last_tick = now
+            relay.tick(now)
 
 
 class StatusPrinter:
@@ -1112,7 +1820,9 @@ class GcsAgent:
 
     STATUS_FRESH = 3.0  # seconds a STATUS from the relay stays valid
 
-    def __init__(self, server: Tuple[str, int], key: bytes, on_status=None, info: Optional[str] = None) -> None:
+    def __init__(self, server: Tuple[str, int], key: bytes, on_status=None, info: Optional[str] = None,
+                 photo_dir: Optional[str] = None,
+                 on_photo: Optional[Callable[[str, PhotoInfo], None]] = None) -> None:
         self.client = TunnelClient(ROLE_GCS, key, server[0], server[1], on_data=self._to_gcs,
                                    on_status=self._got_status, info=info or f"mavlte-agent/{__version__}")
         self.client.ping_flags = PING_FLAG_WATCHING  # until a port is on
@@ -1123,6 +1833,11 @@ class GcsAgent:
         self.tcp: Optional[LocalTcp] = None
         self.to_gcs_bytes = 0  # MAVLink from the aircraft, handed to GCS software
         self.from_gcs_bytes = 0  # MAVLink from GCS software, sent to the aircraft
+        # snapshots, for an agent that keeps photos (the MavLTE app)
+        self.photos = PhotoInbox(self.client, photo_dir, on_photo) if photo_dir else None
+        if self.photos is not None:
+            self.client.on_packet = self.photos.on_packet
+            self.client.on_session = self.photos.sync
 
     @property
     def watching(self) -> bool:
@@ -1213,10 +1928,18 @@ class GcsAgent:
 
     async def run(self) -> None:
         glog.info("connecting to relay %s:%d", self.client.host, self.client.port)
+        photos = asyncio.ensure_future(self._photo_loop()) if self.photos is not None else None
         try:
             await self.client.run()
         finally:
+            if photos is not None:
+                photos.cancel()
             self.close_ports()
+
+    async def _photo_loop(self) -> None:
+        while True:
+            await asyncio.sleep(0.1)
+            self.photos.pump(time.monotonic())
 
 
 async def run_gcs(opts) -> None:
@@ -1241,6 +1964,8 @@ async def run_vehicle(opts) -> None:
     batcher = Batcher()
     client = TunnelClient(ROLE_VEHICLE, opts.key, *opts.server, on_data=lambda data: link.send(data),
                           info=f"mavlte-pyvehicle/{__version__}")
+    photos = PhotoOutbox(client)  # no camera here: it says so when asked for a photo
+    client.on_packet, client.on_session = photos.on_packet, photos.on_session
 
     def send(chunk: bytes) -> None:
         if opts.always_send or client.gcs_present:
@@ -1331,6 +2056,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--tcp-listen", help="optional plain TCP port for GCS software, e.g. 127.0.0.1:5760")
     s.add_argument("--tcp-allow", help="comma separated networks allowed on the TCP port (default: loopback)")
     s.add_argument("--session-timeout", type=float, help="seconds of silence before a session is dropped (120)")
+    s.add_argument("--snapshot-dir", help="folder for the aircraft's photos, or 'off' (default: snapshots, in "
+                                          "the service's state directory or next to the config file)")
+    s.add_argument("--snapshot-days", type=float, help="days to keep photos (default 7)")
     s.add_argument("--log-level", help="debug, info, warning (default info)")
 
     g = sub.add_parser("gcs", help="run next to Mission Planner / QGroundControl")
@@ -1402,6 +2130,12 @@ def resolve_options(args: argparse.Namespace) -> argparse.Namespace:
         allow = o.get("tcp_allow", "127.0.0.1/32, ::1/128")
         out.tcp_allow = [ipaddress.ip_network(n.strip(), strict=False) for n in allow.split(",") if n.strip()]
         out.session_timeout = float(o.get("session_timeout", 120))
+        # photos: in systemd's StateDirectory (/var/lib/mavrelay) when run as the service
+        home = os.environ.get("STATE_DIRECTORY") or os.path.dirname(os.path.abspath(getattr(args, "config", None)
+                                                                                      or "mavrelay.ini"))
+        folder = str(o.get("snapshot_dir", os.path.join(home, "snapshots")))
+        out.snapshot_dir = None if folder.lower() in ("off", "no", "none", "") else folder
+        out.snapshot_days = float(o.get("snapshot_days", 7))
     elif args.role == "gcs":
         out.server = endpoint("server", None)
         if out.server is None:

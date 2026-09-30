@@ -5,7 +5,10 @@ The window stays hidden. Skipped where Tk cannot open a display.
 
 import asyncio
 import gc
+import io
+import json
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -33,6 +36,19 @@ except Exception:  # no tkinter, or no display
     HAVE_TK = False
 
 
+def jpeg():
+    try:
+        from PIL import Image
+    except ImportError:  # the app shows no thumbnail then, but keeps the bytes all the same
+        return b"\xff\xd8" + bytes(range(256)) * 20 + b"\xff\xd9"
+    out = io.BytesIO()
+    Image.new("RGB", (64, 48), (70, 120, 60)).save(out, "JPEG")
+    return out.getvalue()
+
+
+JPEG = jpeg()
+
+
 def free_port(kind=socket.SOCK_DGRAM):
     s = socket.socket(socket.AF_INET, kind)
     s.bind(("127.0.0.1", 0))
@@ -58,13 +74,21 @@ class GuiTest(unittest.TestCase):
             port = transport.get_extra_info("sockname")[1]
             self.vehicle = mr.TunnelClient(mr.ROLE_VEHICLE, KEY_V, "127.0.0.1", port,
                                            on_data=self.vehicle_inbox.append)
+            # its camera takes JPEG; the tests may take it away (capture None: "no camera")
+            self.outbox = outbox = mr.PhotoOutbox(self.vehicle, capture=lambda width, height: JPEG,
+                                                  where=lambda: (411234567, 289876543, 120_000, 4500),
+                                                  cap=lambda: 64 * 1024)
+            self.vehicle.on_packet, self.vehicle.on_session = outbox.on_packet, outbox.on_session
             self.vehicle_task = asyncio.ensure_future(self.vehicle.run())
 
             async def ticks():
                 seq = 0
                 while True:
                     await asyncio.sleep(0.1)
-                    self.relay.tick(time.monotonic())
+                    now = time.monotonic()
+                    self.relay.tick(now)
+                    self.relay.photos.pump(now)
+                    outbox.pump(now)
                     seq += 1
                     if not self.vehicle_quiet:
                         self.vehicle.send_data(v2_frame(0, bytes(9), seq))  # 10 heartbeats a second
@@ -76,10 +100,11 @@ class GuiTest(unittest.TestCase):
         self.udp_port, self.tcp_port = free_port(), free_port(socket.SOCK_STREAM)
         fd, self.config = tempfile.mkstemp(suffix=".ini")
         os.close(fd)
+        self.photos = tempfile.mkdtemp()  # never the user's Pictures folder
         with open(self.config, "w") as f:
             f.write("# my settings\n[gcs]\nname = Test UAV\nserver = 127.0.0.1:%d\nkey = %s\n"
                     "udp = 127.0.0.1:%d\ntcp = 127.0.0.1:%d\nudp_on = yes\ntcp_on = yes\n"  # older version
-                    % (relay_port, KEY_G.hex(), self.udp_port, self.tcp_port))
+                    "photo_dir = %s\n" % (relay_port, KEY_G.hex(), self.udp_port, self.tcp_port, self.photos))
         self.root = tk.Tk()
         self.root.withdraw()
         self.app = mavlte.App(self.root, config_path=self.config)
@@ -109,6 +134,7 @@ class GuiTest(unittest.TestCase):
         self.thread.join(5)
         self.loop.close()
         os.remove(self.config)
+        shutil.rmtree(self.photos, ignore_errors=True)
 
     def pump(self, cond, timeout=8.0, what="condition"):
         end = time.time() + timeout
@@ -229,6 +255,36 @@ class GuiTest(unittest.TestCase):
         self.assertEqual((saved.server, saved.key), ("127.0.0.1:14650", KEY_V.hex()))
         self.assertEqual(saved.name, "Test UAV")
 
+    def test_snapshot(self):
+        app = self.app
+        shown = []
+        app.show_photo = lambda path=None: shown.append(path)  # the viewer, without opening a window
+        self.pump(lambda: app.camera.enabled, what="Snapshot button ready")
+        self.assertEqual(self.text(app.camera.status), "640×480, about 10-30 KB")  # medium unless chosen
+        app.camera.size.select(0, clicked=True)
+        self.assertEqual(mavlte.Settings.load(self.config).photo_size, "small")  # remembered
+        app.snapshot()
+        self.pump(lambda: shown, what="the photo in the viewer")
+        [path] = shown
+        self.assertEqual(os.path.dirname(path), self.photos)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), JPEG)
+        with open(path[:-4] + ".json") as f:
+            self.assertEqual(json.load(f)["width"], 320)
+        self.assertEqual(app.camera.thumbnail.path, path)
+        self.assertTrue(self.text(app.camera.last).startswith("Last photo "))
+        self.assertIn("120 m", self.text(app.camera.last))
+        self.pump(lambda: app.camera.enabled, what="ready for the next")
+
+    def test_snapshot_without_a_camera(self):
+        app = self.app
+        self.outbox.capture = None
+        self.pump(lambda: app.camera.enabled, what="Snapshot button ready")
+        app.snapshot()
+        self.pump(lambda: self.text(app.camera.status).startswith("No photo"), what="the aircraft's answer")
+        self.assertEqual(self.text(app.camera.status), "No photo: " + mr.SNAP_PROBLEMS[mr.SNAP_NO_CAMERA])
+        self.assertEqual(app.camera.status.cget("fg"), mavlte.AMBER)
+
     def test_wrong_key_says_no_answer(self):
         app = self.app
         app.apply_settings(app.settings.name, app.settings.server, KEY_V.hex())  # not the GCS key: no answer
@@ -268,6 +324,44 @@ class SettingsFileTest(unittest.TestCase):
             self.assertIsNone(mavlte.name_problem(fine), fine)
         for cut_short in ("UAV #2", "#1 UAV", "Plane ;blue"):  # the INI file would read a comment there
             self.assertIsNotNone(mavlte.name_problem(cut_short), cut_short)
+
+
+@unittest.skipUnless("mavlte" in sys.modules, "needs tkinter")
+class PhotoFilesTest(unittest.TestCase):
+    def test_photos_in_the_folder_and_their_captions(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for name in ("MavLTE_2026-09-30_10-00-00_1790000000.jpg", "MavLTE_2026-09-29_23-59-59_990.jpg",
+                     "MavLTE_x.jpg", "other.jpg", "MavLTE_2026-09-30_10-00-00_1790000000.json"):
+            open(os.path.join(tmp.name, name), "w").close()
+        found = [os.path.basename(p) for p in mavlte.photo_files(tmp.name)]
+        self.assertEqual(found, ["MavLTE_2026-09-29_23-59-59_990.jpg", "MavLTE_2026-09-30_10-00-00_1790000000.jpg"])
+        self.assertEqual(mavlte.photo_files(os.path.join(tmp.name, "none")), [])
+
+        info = mr.PhotoInfo(1790000000, 20480, 640, 480, 411234567, 289876543, 120_000, 4500, mr.SNAP_OK, 1790000003)
+        meta = dict(info._asdict(), latitude=41.1234567, longitude=28.9876543, altitude_m=120.0)
+        caption = mavlte.photo_caption(meta)
+        self.assertIn("41.123457, 28.987654", caption)
+        self.assertIn("120 m above home", caption)
+        self.assertIn("heading 45°", caption)
+        self.assertIn("640×480, 20 KB", caption)
+        self.assertIn(time.strftime("%H:%M:%S", time.localtime(1790000003)), caption)
+        short = mavlte.photo_caption(dict(mr.PhotoInfo(1790000000, 100, 320, 240, time=1790000003)._asdict()),
+                                     short=True)
+        self.assertEqual(short, time.strftime("%H:%M:%S", time.localtime(1790000003)))  # nothing else known
+        self.assertEqual(mavlte.photo_meta(os.path.join(tmp.name, "other.jpg")), {})
+
+    def test_photo_folder_setting(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "mavrelay.ini")
+        settings = mavlte.Settings.load(path)
+        self.assertEqual((settings.photo_size, settings.photo_dir), ("medium", ""))
+        self.assertEqual(os.path.basename(settings.photo_folder()), "MavLTE")
+        with open(path, "w") as f:
+            f.write("[gcs]\nphoto_dir = %s\nphoto_size = LARGE\n" % tmp.name)
+        settings = mavlte.Settings.load(path)
+        self.assertEqual((settings.photo_folder(), settings.photo_size), (tmp.name, "large"))
 
 
 if __name__ == "__main__":

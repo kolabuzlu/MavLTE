@@ -20,6 +20,8 @@
 #define TUN_MAX_PAYLOAD (TUN_MAX_DATAGRAM - TUN_HEADER_LEN - TUN_TAG_LEN)
 
 enum { TUN_HELLO = 1, TUN_WELCOME, TUN_DATA, TUN_PING, TUN_PONG, TUN_REJECT, TUN_STATUS };
+/* snapshots (snapshot.h): photos from the aircraft's camera on request */
+enum { TUN_SNAP_REQ = 8, TUN_SNAP_INFO, TUN_SNAP_DATA, TUN_SNAP_ACK, TUN_SNAP_SYNC };
 enum { TUN_ROLE_SERVER = 0, TUN_ROLE_VEHICLE = 1, TUN_ROLE_GCS = 2 };
 
 #define TUN_U16_UNKNOWN 0xFFFF
@@ -46,6 +48,8 @@ typedef struct {
     void (*on_data)(void *ctx, const uint8_t *data, size_t len);
     void (*on_event)(void *ctx, tun_event_t event, uint32_t session); /* may be NULL */
     void (*random)(void *ctx, uint8_t *buf, size_t len);
+    /* packets of the snapshot types (TUN_SNAP_REQ and up) from the server; may be NULL */
+    void (*on_packet)(void *ctx, uint8_t type, const uint8_t *body, size_t len);
     void *ctx;
 } tun_config_t;
 
@@ -94,6 +98,9 @@ void tun_poll(tun_client_t *t, uint32_t now_ms);
 void tun_input(tun_client_t *t, const uint8_t *pkt, size_t len, uint32_t now_ms);
 /* Send MAVLink bytes (whole frames, at most TUN_MAX_PAYLOAD). False if there is no session. */
 bool tun_send_data(tun_client_t *t, const uint8_t *data, size_t len);
+/* Send a packet of another type on the session (snapshots), body at most TUN_MAX_PAYLOAD bytes.
+ * False if there is no session. */
+bool tun_send_packet(tun_client_t *t, uint8_t type, const uint8_t *body, size_t len);
 /* Radio state reported to the server in PINGs. */
 void tun_set_radio(tun_client_t *t, int16_t rssi_dbm, uint8_t rat);
 /* Downlink loss in per mille over the last seconds, or TUN_U16_UNKNOWN. */

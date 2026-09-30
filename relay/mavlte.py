@@ -5,31 +5,42 @@ Gives Mission Planner (or QGroundControl) a TCP and a UDP port, each with its ow
 on each: Available (green, left) while the aircraft's LTE module is online at the relay, whatever
 the switches; Connected (blue, next to the switch) while it is online and that port is on. Both
 switches start off. With both off the app only watches: the aircraft holds its telemetry back.
+Snapshot asks the aircraft for a photo from its camera, whatever the switches; photos are kept in
+Pictures\\MavLTE, each with a .json beside it saying when and where it was taken.
 
     python mavlte.py            (or double-click MavLTE.pyw, or run MavLTE.exe: build_release.py)
 
 Settings live in the [gcs] section of mavrelay.ini next to this file, the same file that
 start-gcs.bat and `mavrelay.py gcs --config mavrelay.ini` use; MavLTE.exe keeps its own (see
-settings_file). Standard library only (Tkinter).
+settings_file). Tkinter, and Pillow to show the photos (without it they open in the system's viewer).
 """
 
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import json
 import logging
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import uuid
 from dataclasses import dataclass
 from tkinter import messagebox, ttk
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import mavrelay as mr
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:  # photos then open in the system's viewer
+    Image = ImageTk = None
 
 APP = "MavLTE"
 # MavLTE.exe unpacks its files (the icon) into a temporary folder: sys._MEIPASS
@@ -77,6 +88,9 @@ log = logging.getLogger("mavrelay.app")
 # Settings
 
 
+SIZE_NAMES = ("small", "medium", "large")  # mr.SNAP_SIZES
+
+
 @dataclass
 class Settings:
     name: str = "My UAV"
@@ -84,6 +98,8 @@ class Settings:
     key: str = ""
     tcp: str = "127.0.0.1:5760"
     udp: str = "127.0.0.1:14550"
+    photo_dir: str = ""  # empty: Pictures\MavLTE
+    photo_size: str = "medium"
 
     @classmethod
     def load(cls, path: str) -> "Settings":
@@ -99,7 +115,13 @@ class Settings:
             value = conf.get(kind, "").strip()
             if value and value.lower() not in ("off", "no", "none"):
                 setattr(s, kind, value)
+        s.photo_dir = conf.get("photo_dir", "").strip()
+        size = conf.get("photo_size", "").strip().lower()
+        s.photo_size = size if size in SIZE_NAMES else s.photo_size
         return s
+
+    def photo_folder(self) -> str:
+        return os.path.expanduser(self.photo_dir) if self.photo_dir else os.path.join(pictures_folder(), APP)
 
     def save(self, path: str, fields: Tuple[str, ...] = ("name", "server", "key", "tcp", "udp")) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)  # first save of MavLTE.exe
@@ -127,6 +149,90 @@ def parse_address(host: str, port: str) -> Tuple[str, int]:
 
 
 # ---------------------------------------------------------------------------------------------
+# Photos
+
+
+def pictures_folder() -> str:
+    """The user's Pictures folder, where Windows keeps it (in OneDrive, say)."""
+    if sys.platform == "win32":
+        class GUID(ctypes.Structure):
+            _fields_ = [("a", ctypes.c_uint32), ("b", ctypes.c_uint16), ("c", ctypes.c_uint16),
+                        ("d", ctypes.c_ubyte * 8)]
+
+        u = uuid.UUID("33E28130-4E1E-4676-835A-98395C3BC3BB")  # FOLDERID_Pictures
+        guid = GUID(u.time_low, u.time_mid, u.time_hi_version, (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+        path = ctypes.c_wchar_p()
+        try:
+            if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(path)) == 0:
+                try:
+                    return path.value
+                finally:
+                    ctypes.windll.ole32.CoTaskMemFree(path)
+        except (AttributeError, OSError):
+            pass
+    return os.path.join(os.path.expanduser("~"), "Pictures")
+
+
+def photo_files(folder: str) -> List[str]:
+    """The photos in the folder, oldest first (by photo id: the relay's clock when it was asked for)."""
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    found = [(int(m.group(1)), os.path.join(folder, name)) for name in names
+             for m in [re.fullmatch(r"MavLTE_.*_(\d+)\.jpg", name)] if m]
+    return [path for _, path in sorted(found)]
+
+
+def photo_meta(path: str) -> dict:
+    try:
+        with open(path[:-4] + ".json", encoding="utf-8") as f:
+            meta = json.load(f)
+        return meta if isinstance(meta, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def photo_caption(meta: dict, short: bool = False) -> str:
+    """When and where the photo was taken, from the .json beside it."""
+    parts = []
+    when = meta.get("time") or meta.get("photo_id")
+    if isinstance(when, int) and when > 0:
+        parts.append(time.strftime("%H:%M:%S" if short else "%d %b %Y, %H:%M:%S", time.localtime(when)))
+    if not short and isinstance(meta.get("latitude"), (int, float)):
+        parts.append(f"{meta['latitude']:.6f}, {meta.get('longitude', 0):.6f}")
+    if isinstance(meta.get("altitude_m"), (int, float)):
+        parts.append(f"{meta['altitude_m']:.0f} m" + ("" if short else " above home"))
+    heading = meta.get("heading")
+    if isinstance(heading, int) and heading != mr.UNKNOWN_HEADING:
+        parts.append(f"heading {heading / 100:.0f}°")
+    if not short and meta.get("width"):
+        parts.append(f"{meta['width']}×{meta.get('height')}, {meta.get('size', 0) / 1024:.0f} KB")
+    return " · ".join(parts)
+
+
+def reveal(path: str) -> None:
+    """Shows the file in Explorer (or its folder in the system's file manager)."""
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", os.path.dirname(path)])
+    except OSError as exc:
+        log.warning("cannot open the folder: %s", exc)
+
+
+def open_file(path: str) -> None:
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
+    except OSError as exc:
+        log.warning("cannot open %s: %s", path, exc)
+
+
+# ---------------------------------------------------------------------------------------------
 # The agent, on its own asyncio loop in a background thread
 
 
@@ -149,13 +255,24 @@ class AgentRunner:
     def running(self) -> bool:
         return self.agent is not None
 
-    def start(self, server: Tuple[str, int], key: bytes) -> None:
+    def start(self, server: Tuple[str, int], key: bytes, photo_dir: Optional[str] = None,
+              on_photo: Optional[Callable[[str, mr.PhotoInfo], None]] = None) -> None:
+        """on_photo(path, info) is called on the agent's thread for each photo saved."""
         async def go() -> None:
-            self.agent = mr.GcsAgent(server, key, info=f"mavlte-app/{mr.__version__}")
+            self.agent = mr.GcsAgent(server, key, info=f"mavlte-app/{mr.__version__}", photo_dir=photo_dir,
+                                     on_photo=on_photo)
             self.task = asyncio.ensure_future(self.agent.run())
             self.task.add_done_callback(self._ended)
 
         self._call(go())
+
+    def snapshot(self, size: int) -> bool:
+        """Asks the aircraft for a photo. False while there is no session with the relay."""
+        async def go() -> bool:
+            agent = self.agent
+            return agent is not None and agent.photos is not None and agent.photos.request(size)
+
+        return self._call(go())
 
     @staticmethod
     def _ended(task: asyncio.Task) -> None:
@@ -343,6 +460,221 @@ class ChannelCard(tk.Frame):
             self.status.configure(text=text, fg=color)
 
 
+class Thumbnail(tk.Canvas):
+    """The last photo, small; a drawn camera until there is one."""
+
+    def __init__(self, master, scale: float, command: Callable[[], None]) -> None:
+        self.w, self.h = round(72 * scale), round(54 * scale)
+        super().__init__(master, width=self.w, height=self.h, bg=LOG_BG, highlightthickness=1,
+                         highlightbackground=BORDER, cursor="hand2")
+        self.image = None
+        self.path: Optional[str] = None
+        self.bind("<Button-1>", lambda _e: command())
+        self.show(None)
+
+    def show(self, path: Optional[str]) -> None:
+        self.path = path
+        self.delete("all")
+        self.image = None
+        if path and Image is not None:
+            try:
+                with Image.open(path) as img:
+                    img.thumbnail((self.w, self.h))
+                    self.image = ImageTk.PhotoImage(img)
+            except Exception as exc:  # a broken file must not break the window
+                log.warning("cannot show %s: %s", os.path.basename(path), exc)
+        if self.image is not None:
+            self.create_image(self.w // 2 + 1, self.h // 2 + 1, image=self.image)
+            return
+        cx, cy, u = self.w / 2, self.h / 2, self.h / 8
+        self.create_rectangle(cx - 2.3 * u, cy - 1.2 * u, cx + 2.3 * u, cy + 1.8 * u, outline=DIM, width=2)
+        self.create_rectangle(cx - 1.0 * u, cy - 1.8 * u, cx + 0.4 * u, cy - 1.2 * u, outline=DIM, fill=DIM)
+        self.create_oval(cx - 0.9 * u, cy - 0.6 * u, cx + 0.9 * u, cy + 1.2 * u, outline=DIM, width=2)
+
+
+class Segments(tk.Frame):
+    """One of a few choices, side by side."""
+
+    def __init__(self, master, app: "App", labels: Tuple[str, ...], selected: int,
+                 command: Callable[[int], None]) -> None:
+        super().__init__(master, bg=BORDER, padx=1, pady=1)
+        self.command = command
+        self.labels = []
+        for i, text in enumerate(labels):
+            label = tk.Label(self, text=text, font=app.font_small, padx=round(8 * app.scale), pady=round(3 * app.scale),
+                             cursor="hand2")
+            label.pack(side="left", padx=(1 if i else 0, 0))
+            label.bind("<Button-1>", lambda _e, i=i: self.select(i, True))
+            self.labels.append(label)
+        self.selected = -1
+        self.enabled = True
+        self.select(selected)
+
+    def select(self, index: int, clicked: bool = False) -> None:
+        if clicked and not self.enabled:
+            return
+        self.selected = index
+        self._paint()
+        if clicked:
+            self.command(index)
+
+    def set_enabled(self, enabled: bool) -> None:
+        if enabled != self.enabled:
+            self.enabled = enabled
+            self._paint()
+
+    def _paint(self) -> None:
+        for i, label in enumerate(self.labels):
+            on = i == self.selected
+            if self.enabled:
+                label.configure(bg=ACCENT if on else FIELD, fg=ON_ACCENT if on else TEXT)
+            else:
+                label.configure(bg=BORDER if on else FIELD, fg=MUTED if on else DIM)
+
+
+class CameraRow(tk.Frame):
+    """Snapshot, at the bottom of the Aircraft card: a photo from the aircraft's camera, by way of the
+    relay."""
+
+    SIZES = ("Small", "Medium", "Large")
+
+    def __init__(self, app: "App", master: tk.Misc) -> None:
+        super().__init__(master, bg=SURFACE)
+        s, pad = app.scale, round(8 * app.scale)
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+        inner = tk.Frame(self, bg=SURFACE)
+        inner.pack(fill="x", padx=pad, pady=pad)
+        self.thumbnail = Thumbnail(inner, s, app.show_photo)  # the last photo: click for the viewer
+        self.thumbnail.pack(side="right", anchor="n", padx=(pad, 0))
+        left = tk.Frame(inner, bg=SURFACE)
+        left.pack(side="left", fill="both", expand=True)
+        top = tk.Frame(left, bg=SURFACE)
+        top.pack(fill="x")
+        self.button = ttk.Button(top, text="Snapshot", style="Accent.TButton", command=app.snapshot)
+        self.button.pack(side="left")
+        self.size = Segments(top, app, self.SIZES, SIZE_NAMES.index(app.settings.photo_size), app.choose_size)
+        self.size.pack(side="left", padx=(pad, 0))
+        self.status = tk.Label(left, text="", bg=SURFACE, fg=DIM, font=app.font_small, anchor="w", justify="left")
+        self.status.pack(fill="x", pady=(round(5 * s), 0))
+        self.bar_h = max(3, round(3 * s))
+        # arriving: how much (width 1: a canvas asks for 10 cm unless told, and would widen the window)
+        self.bar = tk.Canvas(left, width=1, height=self.bar_h, bg=SURFACE, highlightthickness=0)
+        self.bar.pack(fill="x", pady=(round(2 * s), 0))
+        self.fraction: Optional[float] = -1.0
+        self.last = tk.Label(left, text="", bg=SURFACE, fg=MUTED, font=app.font_small, anchor="w", justify="left")
+        self.last.pack(fill="x", pady=(round(2 * s), 0))
+        self.enabled = True
+
+    def show(self, text: str, color: str = DIM, fraction: Optional[float] = None) -> None:
+        if self.status.cget("text") != text or self.status.cget("fg") != color:
+            self.status.configure(text=text, fg=color)
+        if fraction != self.fraction:
+            self.fraction = fraction
+            self.bar.delete("all")
+            if fraction is not None:
+                w = self.bar.winfo_width()
+                self.bar.create_rectangle(0, 0, w, self.bar_h, fill=FIELD, outline="")
+                self.bar.create_rectangle(0, 0, round(w * min(1.0, fraction)), self.bar_h, fill=ACCENT, outline="")
+
+    def set_enabled(self, enabled: bool) -> None:
+        if enabled != self.enabled:
+            self.enabled = enabled
+            self.button.state(["!disabled"] if enabled else ["disabled"])
+
+
+class PhotoViewer(tk.Toplevel):
+    """A photo from the aircraft, fitted to the window, with when and where it was taken. The arrow
+    keys (or the buttons) go through the others in the folder."""
+
+    def __init__(self, app: "App") -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.configure(bg=BG)
+        if app.icon is not None:
+            self.iconphoto(False, app.icon)
+        s, pad = app.scale, round(10 * app.scale)
+        self.bar = bar = tk.Frame(self, bg=SURFACE)
+        bar.pack(side="bottom", fill="x")
+        self.caption = tk.Label(bar, text="", bg=SURFACE, fg=TEXT, font=app.font, anchor="w", justify="left")
+        self.caption.pack(fill="x", padx=pad, pady=(round(8 * s), round(6 * s)))
+        bar.bind("<Configure>", lambda e: self.caption.configure(wraplength=max(100, e.width - 2 * pad)))
+        buttons = tk.Frame(bar, bg=SURFACE)
+        buttons.pack(fill="x", padx=pad, pady=(0, round(8 * s)))
+        self.older = ttk.Button(buttons, text="◀ Older", command=lambda: self.step(-1))
+        self.older.pack(side="left")
+        self.newer = ttk.Button(buttons, text="Newer ▶", command=lambda: self.step(1))
+        self.newer.pack(side="left", padx=(round(6 * s), 0))
+        ttk.Button(buttons, text="Show in folder", command=lambda: self.path and reveal(self.path)).pack(side="right")
+        self.picture = tk.Label(self, bg=LOG_BG, bd=0)
+        self.picture.pack(fill="both", expand=True)
+        self.bind("<Left>", lambda _e: self.step(-1))
+        self.bind("<Right>", lambda _e: self.step(1))
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.picture.bind("<Configure>", lambda _e: self._fit_later())
+        self.path: Optional[str] = None
+        self.paths: List[str] = []
+        self.full = None
+        self.shown = None
+        self.fit_job: Optional[str] = None
+        self.sized = False
+        dark_title_bar(self)
+
+    def show(self, path: str) -> None:
+        self.paths = photo_files(os.path.dirname(path)) or [path]
+        self.path = path if path in self.paths else self.paths[-1]
+        index = self.paths.index(self.path)
+        self.older.state(["!disabled"] if index > 0 else ["disabled"])
+        self.newer.state(["!disabled"] if index < len(self.paths) - 1 else ["disabled"])
+        meta = photo_meta(self.path)
+        self.caption.configure(text=photo_caption(meta) or os.path.basename(self.path))
+        self.title(f"{APP} photo {index + 1} of {len(self.paths)}")
+        try:
+            with Image.open(self.path) as img:
+                img.load()
+                self.full = img.copy()
+        except Exception as exc:
+            self.full = None
+            self.picture.configure(image="", text=f"Cannot show this photo: {exc}", fg=MUTED, font=self.app.font)
+            return
+        if not self.sized:  # the photo at its own size, if the screen has room
+            self.sized = True
+            self.update_idletasks()
+            w = max(round(520 * self.app.scale), min(self.full.width, round(self.winfo_screenwidth() * 0.8)))
+            self.caption.configure(wraplength=w - round(20 * self.app.scale))
+            self.update_idletasks()
+            h = min(self.full.height, round(self.winfo_screenheight() * 0.75))
+            self.geometry(f"{w}x{h + self.bar.winfo_reqheight()}")
+        self._fit()
+
+    def is_newest(self) -> bool:
+        return not self.paths or self.path == self.paths[-1]
+
+    def step(self, delta: int) -> None:
+        if self.path in self.paths:
+            index = self.paths.index(self.path) + delta
+            if 0 <= index < len(self.paths):
+                self.show(self.paths[index])
+
+    def _fit_later(self) -> None:
+        if self.fit_job is not None:
+            self.after_cancel(self.fit_job)
+        self.fit_job = self.after(80, self._fit)
+
+    def _fit(self) -> None:
+        self.fit_job = None
+        if self.full is None:
+            return
+        w, h = max(1, self.picture.winfo_width()), max(1, self.picture.winfo_height())
+        scale = min(w / self.full.width, h / self.full.height)
+        if scale >= 1 or w < 10:  # never larger than it is: the pixels are all there are
+            img = self.full
+        else:
+            img = self.full.resize((max(1, round(self.full.width * scale)), max(1, round(self.full.height * scale))),
+                                   Image.LANCZOS)
+        self.shown = ImageTk.PhotoImage(img)
+        self.picture.configure(image=self.shown, text="")
+
+
 class SettingsDialog(tk.Toplevel):
     def __init__(self, app: "App") -> None:
         super().__init__(app.root)
@@ -434,10 +766,12 @@ def setup_style(root: tk.Tk) -> None:
     style.theme_use("clam")
     style.configure("TButton", background=FIELD, foreground=TEXT, bordercolor=BORDER, lightcolor=FIELD,
                     darkcolor=FIELD, focuscolor=FIELD, padding=(14, 4))
-    style.map("TButton", background=[("pressed", BORDER), ("active", "#3a3b3e")])
+    style.map("TButton", background=[("pressed", BORDER), ("active", "#3a3b3e")], foreground=[("disabled", DIM)])
     style.configure("Accent.TButton", background=ACCENT, foreground=ON_ACCENT, bordercolor=ACCENT,
                     lightcolor=ACCENT, darkcolor=ACCENT, focuscolor=ACCENT)
-    style.map("Accent.TButton", background=[("pressed", "#4cb84c"), ("active", "#72d972")])
+    style.map("Accent.TButton", background=[("disabled", FIELD), ("pressed", "#4cb84c"), ("active", "#72d972")],
+              foreground=[("disabled", DIM)], bordercolor=[("disabled", BORDER)],
+              lightcolor=[("disabled", FIELD)], darkcolor=[("disabled", FIELD)])
     style.configure("Vertical.TScrollbar", background=FIELD, troughcolor=LOG_BG, bordercolor=LOG_BG,
                     arrowcolor=MUTED, lightcolor=FIELD, darkcolor=FIELD, gripcount=0)
     style.map("Vertical.TScrollbar", background=[("active", "#3a3b3e")])
@@ -457,6 +791,9 @@ class App:
         logging.getLogger("mavrelay").setLevel(logging.INFO)
         self.rate_mark = (time.monotonic(), 0, 0)
         self.rates = (0.0, 0.0)
+        self.photos_in: "queue.Queue[Tuple[str, mr.PhotoInfo]]" = queue.Queue()  # saved by the agent's thread
+        self.clicked_at = -1e9  # Snapshot: the photo that comes next opens in the viewer
+        self.viewer: Optional[PhotoViewer] = None
 
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
         family = "Segoe UI" if "Segoe UI" in tkfont.families(root) else "TkDefaultFont"
@@ -499,6 +836,7 @@ class App:
                             bd=0)
         self.menu.add_command(label="Settings…", command=self.open_settings)
         self.menu.add_command(label="Show log", command=self.toggle_log)
+        self.menu.add_command(label="Photo folder", command=self.open_photo_folder)
         self.menu.add_separator()
         self.menu.add_command(label="Exit", command=self.close)
         menu_button.bind("<Button-1>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
@@ -551,6 +889,11 @@ class App:
             value = tk.Label(grid, text="-", bg=SURFACE, fg=TEXT, font=self.font, anchor="w")
             value.grid(row=row, column=1, sticky="w", padx=(12, 0))
             self.craft_values[label] = value
+        self.camera = CameraRow(self, craft)
+        self.camera.pack(fill="x")
+        newest = photo_files(self.settings.photo_folder())
+        self.camera.thumbnail.show(newest[-1] if newest else None)
+        self._show_last(newest[-1] if newest else None)
 
         self.log_frame = tk.Frame(self.body, bg=BG)
         self.log_text = tk.Text(self.log_frame, height=7, width=48, font=("Consolas", 9), bg=LOG_BG, fg="#b8bcc2",
@@ -581,8 +924,54 @@ class App:
             key = mr.parse_key(self.settings.key)
         except ValueError:
             return False
-        self.runner.start(server, key)
+        self.runner.start(server, key, self.settings.photo_folder(),
+                          on_photo=lambda path, info: self.photos_in.put((path, info)))
         return True
+
+    def snapshot(self) -> None:
+        if not self.camera.enabled:
+            return
+        size = self.camera.size.selected
+        if self.runner.running and self.runner.snapshot(size):
+            self.clicked_at = time.monotonic()
+            log.info("asking the aircraft for a photo (%s, %d×%d)", SIZE_NAMES[size], *mr.SNAP_SIZES[size])
+        else:
+            self.camera.show("Not connected to the relay", RED)
+
+    def choose_size(self, index: int) -> None:
+        self.settings.photo_size = SIZE_NAMES[index]
+        self._remember("photo_size")
+        self.camera.show(self.SIZE_HINTS[index])
+
+    def show_photo(self, path: Optional[str] = None) -> None:
+        """Opens the photo (the last one: the thumbnail's) in the viewer."""
+        path = path or self.camera.thumbnail.path
+        if not path or not os.path.exists(path):
+            newest = photo_files(self.settings.photo_folder())
+            if not newest:
+                return
+            path = newest[-1]
+        if Image is None:  # no Pillow: the system's viewer
+            open_file(path)
+            return
+        if self.viewer is None or not self.viewer.winfo_exists():
+            self.viewer = PhotoViewer(self)
+        self.viewer.show(path)
+        self.viewer.deiconify()
+        self.viewer.lift()
+
+    def open_photo_folder(self) -> None:
+        folder = self.settings.photo_folder()
+        newest = photo_files(folder)
+        if newest:
+            reveal(newest[-1])
+            return
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror(APP, f"Cannot make the photo folder {folder}: {exc.strerror or exc}")
+            return
+        open_file(folder)
 
     def toggle(self, card: ChannelCard, on: bool) -> None:
         if not on:
@@ -698,7 +1087,70 @@ class App:
                 where = f"UDP, port {port}" if mr.is_loopback(host) else f"UDP {host}, port {port}"
                 self.udp_card.show(*self._port_status(online, "Mission Planner connected" if heard else "", where))
         self._show_aircraft(agent, status, now)
+        self._take_photos(now)
+        self._show_camera(agent, online, now)
         self.poll_job = self.root.after(self.POLL_MS, self.poll)
+
+    # size hints: typical JPEG sizes from the aircraft's OV5640 (bright, detailed scenes: the upper end)
+    SIZE_HINTS = ("320×240, about 5-10 KB", "640×480, about 10-30 KB", "1024×768, about 25-80 KB")
+
+    def _take_photos(self, now: float) -> None:
+        """Photos the agent saved: the newest goes on the thumbnail; after a Snapshot click, into the
+        viewer too (photos that come in by themselves, missed while MavLTE was closed, do not pop up)."""
+        arrived = []
+        while True:
+            try:
+                arrived.append(self.photos_in.get_nowait())
+            except queue.Empty:
+                break
+        if not arrived:
+            return
+        path = max(arrived, key=lambda item: item[1].photo_id)[0]
+        newest = photo_files(os.path.dirname(path))  # one missed earlier may come in after a newer one
+        path = newest[-1] if newest else path
+        self.camera.thumbnail.show(path)
+        self._show_last(path)
+        viewer_open = self.viewer is not None and self.viewer.winfo_exists()
+        if now - self.clicked_at < 120.0:
+            self.clicked_at = -1e9
+            self.show_photo(path)
+        elif viewer_open and self.viewer.is_newest():
+            self.viewer.show(path)
+        if len(arrived) > 1:
+            log.info("%d photos came in", len(arrived))
+
+    def _show_last(self, path: Optional[str]) -> None:
+        text = ""
+        if path:
+            caption = photo_caption(photo_meta(path), short=True)
+            text = f"Last photo {caption}" if caption else "Last photo"
+        if self.camera.last.cget("text") != text:
+            self.camera.last.configure(text=text)
+
+    def _show_camera(self, agent, online: bool, now: float) -> None:
+        card = self.camera
+        photos = agent.photos if agent is not None else None
+        connected = agent is not None and bool(agent.client.session)
+        arriving = photos.arriving if photos is not None else None
+        busy = False
+        if not connected:
+            card.show("Not connected to the relay")
+        elif arriving is not None:
+            info, got = arriving
+            card.show(f"Arriving: {got / 1024:.0f} of {info.size / 1024:.0f} KB ({info.width}×{info.height})", TEXT,
+                      got / info.size)
+            busy = True
+        elif photos.asked_at is not None:
+            card.show("Asking the aircraft…", TEXT)
+            busy = True
+        elif photos.problem and now - photos.problem_at < 60.0:
+            card.show(f"No photo: {photos.problem}", AMBER)
+        elif not online:
+            card.show("The aircraft is offline")
+        else:
+            card.show(self.SIZE_HINTS[card.size.selected])
+        card.set_enabled(connected and online and not busy)
+        card.size.set_enabled(not busy)
 
     @staticmethod
     def _port_status(online: bool, gcs: str, where: str) -> Tuple[str, str]:

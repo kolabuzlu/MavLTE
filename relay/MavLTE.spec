@@ -5,8 +5,8 @@ PyInstaller build spec for MavLTE.exe.
 Build with:  python build_release.py        (it runs  pyinstaller MavLTE.spec)
 
 A ONE-FILE build, like MavJOY: a single MavLTE.exe that carries the icon and can be put anywhere.
-MavGCS is one-folder because QtWebEngine brings its own helper exe; MavLTE is the standard library
-and Tk, which unpack from the exe in about a second.
+MavGCS is one-folder because QtWebEngine brings its own helper exe; MavLTE is the standard library,
+Tk and Pillow (to show the aircraft's photos), which unpack from the exe in about a second.
 """
 
 import re
@@ -52,7 +52,11 @@ a = Analysis(
     # serial: mavrelay imports it only for a flight controller on a serial port, which is the
     # command-line vehicle, never the app. The rest are big packages this app never imports; named
     # so the exe does not depend on what the build machine has installed for other projects.
-    excludes=["serial", "PIL", "numpy", "pymavlink", "matplotlib", "yaml", "setuptools"],
+    # Pillow (PIL) is in, for the JPEG photos in the viewer and thumbnail, but not its codecs for
+    # other formats: AVIF alone would add 8 MB to an exe that unpacks on every start.
+    excludes=["serial", "numpy", "pymavlink", "matplotlib", "yaml", "setuptools",
+              "PIL._avif", "PIL.AvifImagePlugin", "PIL._webp", "PIL.WebPImagePlugin", "PIL.ImageCms",
+              "PIL._imagingcms"],
     noarchive=False,
 )
 

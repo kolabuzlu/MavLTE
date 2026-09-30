@@ -26,3 +26,6 @@ CONFIG_COMPILER_CXX_EXCEPTIONS=y
 # Recover from any hang by rebooting
 CONFIG_ESP_TASK_WDT_PANIC=y
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+
+# Camera (esp32-camera): its DMA buffer lives in internal RAM, as do the photos (PSRAM stays off)
+CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=16384

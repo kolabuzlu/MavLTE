@@ -18,6 +18,10 @@ sets the level the module reports (the bars in the MavLTE app), slows the link, 
 troubles more frequent and longer. From a fair signal down, 2G is slower than the telemetry, so it
 queues up and packets are lost, as they would be in the air.
 
+The board's camera is there too, with its own switch (the CAM DIP switch on the board): MavLTE's
+Snapshot button gets a picture of sky and fields, seen as the plane flies, rolls and pitches, of the
+size a real one would be, sent as the firmware sends it, without crowding out the telemetry.
+
     python plane_sim.py            (or double-click PlaneSim.pyw)
 
 The relay server and vehicle key come from the [vehicle] section of mavrelay.ini. Mission Planner
@@ -29,7 +33,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import io
 import logging
+import math
 import os
 import queue
 import random
@@ -47,6 +53,11 @@ from typing import Callable, Dict, Optional, Tuple
 import mavlte as ui
 import mavrelay as mr
 import sitl_demo
+
+try:
+    from PIL import Image, ImageDraw, ImageFilter
+except ImportError:  # no camera then: the aircraft answers that it has none
+    Image = None
 
 APP = "MavLTE Plane Simulator"
 TITLE = f"{APP} V{mr.__version__}"
@@ -98,6 +109,11 @@ GOOD_SIGNAL = 2
 RAT_SWITCH_S = 3.0  # no data while the modem moves between 2G and LTE
 REGISTER_AGAIN_S = 4.0  # no data while it registers again after having no coverage
 MAX_BACKLOG_S = 2.0  # data queued in the network beyond this much sending time is dropped (full buffer)
+# The camera: JPEG quality that gives the sizes of the board's OV5640 (Small 5-10 KB, Medium 10-30 KB,
+# Large 25-80 KB), and the most of the uplink a photo may take (bytes/s), as the firmware allows it:
+# the rest stays for the telemetry, and less when the round trip shows the link filling up.
+CAMERA_QUALITY = 80
+PHOTO_CAP = {NET_2G: 2048, NET_LTE: 32768}
 
 
 def speed_text(bytes_per_s: float) -> str:
@@ -183,6 +199,11 @@ class FcState:
         self.armed = False
         self.volts: Optional[float] = None
         self.alt: Optional[float] = None  # metres above home
+        # for the camera: where the plane is and how it lies in the air
+        self.lat = self.lon = mr.UNKNOWN_I32  # 1e-7 degrees
+        self.alt_mm = mr.UNKNOWN_I32  # above home
+        self.heading = mr.UNKNOWN_HEADING  # centidegrees
+        self.roll = self.pitch = 0.0  # degrees, right wing down and nose up positive
 
     def feed(self, data: bytes, now: float) -> None:
         buf = self.buf
@@ -224,8 +245,61 @@ class FcState:
         elif msgid == 1:  # SYS_STATUS: voltage_battery in mV
             mv = struct.unpack_from("<H", payload, 14)[0]
             self.volts = None if mv == 0xFFFF else mv / 1000
-        elif msgid == 33:  # GLOBAL_POSITION_INT: relative_alt in mm
-            self.alt = struct.unpack_from("<i", payload, 16)[0] / 1000
+        elif msgid == 30:  # ATTITUDE: roll and pitch in radians
+            roll, pitch = struct.unpack_from("<ff", payload, 4)
+            if math.isfinite(roll) and math.isfinite(pitch):
+                self.roll, self.pitch = math.degrees(roll), math.degrees(pitch)
+        elif msgid == 33:  # GLOBAL_POSITION_INT: lat, lon (1e-7 degrees), relative_alt (mm), hdg (cdeg)
+            self.lat, self.lon, _, self.alt_mm = struct.unpack_from("<iiii", payload, 4)
+            self.heading = struct.unpack_from("<H", payload, 26)[0]
+            self.alt = self.alt_mm / 1000
+
+
+def camera_picture(width: int, height: int, fc: FcState, quality: int = CAMERA_QUALITY) -> bytes:
+    """What the simulator's camera sees, looking ahead: sky, and fields that change as the plane flies
+    (the same place gives the same fields), the horizon tilted as it rolls and moved as it pitches,
+    sensor noise, and a caption. A JPEG of about the size the board's camera would make."""
+    known = fc.lat != mr.UNKNOWN_I32
+    rng = random.Random(f"{fc.lat // 10000},{fc.lon // 10000}" if known else 0)  # 100 m squares
+    big = int(math.hypot(width, height)) + 4  # drawn larger, turned by the roll, then cut to size
+    img = Image.new("RGB", (big, big))
+    d = ImageDraw.Draw(img)
+    pitch = max(-40.0, min(40.0, fc.pitch))
+    horizon = max(0, min(big, big // 2 + int(pitch / 40 * height)))  # nose down: the horizon rises
+    for y in range(horizon):  # the sky, deeper blue upwards
+        t = y / max(1, horizon)
+        d.line([(0, y), (big, y)], fill=(int(70 + 90 * t), int(120 + 80 * t), int(200 + 45 * t)))
+    d.rectangle([0, horizon, big, big], fill=(92, 110, 70))
+    colours = ((98, 128, 60), (120, 140, 70), (150, 140, 90), (84, 110, 52), (170, 160, 110), (110, 96, 64),
+               (132, 150, 80))
+    y, row = horizon, 0
+    while y < big:  # rows of fields, larger towards the camera
+        h = 2 + int(row * row * 0.9)
+        x = -rng.randrange(0, 60)
+        while x < big:
+            w = rng.randrange(30, 90) * (1 + row // 3)
+            d.rectangle([x, y, x + w, y + h], fill=rng.choice(colours))
+            if rng.random() < 0.15:  # a farm track
+                d.line([(x, y), (x + w, y + h)], fill=(190, 180, 150), width=max(1, row // 4))
+            x += w + rng.randrange(0, 3)
+        y += h + 1
+        row += 1
+    img = img.rotate(fc.roll, resample=Image.BILINEAR)
+    left, top = (big - width) // 2, (big - height) // 2
+    img = img.crop((left, top, left + width, top + height))
+    noise = Image.effect_noise((width, height), 22).convert("RGB")  # real photos are neither flat nor sharp
+    img = Image.blend(img, noise, 0.12).filter(ImageFilter.GaussianBlur(0.6))
+    caption = [time.strftime("%H:%M:%S"), "MavLTE Plane Simulator"]
+    if fc.alt is not None:
+        caption.insert(1, f"{fc.alt:.0f} m")
+    if known:
+        caption.insert(-1, f"{fc.lat / 1e7:.5f}, {fc.lon / 1e7:.5f}")
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, height - 16, width, height], fill=(0, 0, 0))
+    d.text((4, height - 14), "  ".join(caption), fill=(255, 255, 255))
+    out = io.BytesIO()
+    img.save(out, "JPEG", quality=quality)
+    return out.getvalue()
 
 
 class Network(sitl_demo.LinkEmulator):
@@ -321,6 +395,7 @@ class Modem:
         self.net: Optional[Network] = None
         self.client: Optional[mr.TunnelClient] = None
         self.batcher: Optional[mr.Batcher] = None
+        self.photos: Optional[mr.PhotoOutbox] = None
 
     def send(self, chunk: bytes) -> None:
         if self.client is not None and self.client.gcs_present:  # like the firmware: held back without a GCS
@@ -339,6 +414,7 @@ class Plane:
         # the switches
         self.battery = False
         self.lte = False  # switched on, the module runs whenever the battery is on
+        self.camera = Image is not None  # the board's CAM DIP switch
         self.quick = False
         self.network = NET_LTE
         self.signal = GOOD_SIGNAL
@@ -402,6 +478,12 @@ class Plane:
         m = self.modem
         if m is not None and m.net is not None:
             m.net.set_network(self.network, signal)
+
+    def set_camera(self, on: bool) -> None:
+        self.camera = on and Image is not None
+        if self.modem is not None and self.modem.photos is not None:
+            self.modem.photos.capture = self._capture if self.camera else None
+        log.info("camera: %s", "on" if self.camera else "off (the aircraft answers that it has none)")
 
     # -- flight controller
 
@@ -507,6 +589,9 @@ class Plane:
             m.batcher = mr.Batcher()
             m.client = mr.TunnelClient(mr.ROLE_VEHICLE, self.key, *m.net.address, on_data=self._to_fc,
                                        info=f"mavlte-planesim/{mr.__version__}", radio=self._radio)
+            m.photos = mr.PhotoOutbox(m.client, capture=self._capture if self.camera else None, where=self._where,
+                                      cap=lambda: PHOTO_CAP.get(self.network, PHOTO_CAP[NET_2G]))
+            m.client.on_packet, m.client.on_session = m.photos.on_packet, m.photos.on_session
             m.stage = "data"
             log.info("LTE module: mobile data up")
             await asyncio.gather(m.client.run(), self._flush(m))
@@ -530,9 +615,11 @@ class Plane:
         session = 0
         while True:
             await asyncio.sleep(0.005)
-            chunk = m.batcher.poll(time.monotonic(), 0.05)
+            now = time.monotonic()
+            chunk = m.batcher.poll(now, 0.05)
             if chunk:
                 m.send(chunk)
+            m.photos.pump(now)
             if m.client.session != session:
                 session = m.client.session
                 if session:
@@ -545,6 +632,15 @@ class Plane:
         if rat is None:
             return mr.RSSI_UNKNOWN, mr.RAT_UNKNOWN
         return SIGNALS[self.signal][1], rat
+
+    def _capture(self, width: int, height: int) -> bytes:
+        jpeg = camera_picture(width, height, self.fc)
+        log.info("camera: photo %d×%d, %d KB, on its way", width, height, round(len(jpeg) / 1024))
+        return jpeg
+
+    def _where(self) -> Tuple[int, int, int, int]:
+        fc = self.fc
+        return fc.lat, fc.lon, fc.alt_mm, fc.heading
 
     # -- from the window's thread
 
@@ -695,8 +791,9 @@ class SimWindow:
         tk.Label(top, text="LTE module", bg=ui.SURFACE, fg=ui.TEXT, font=self.font_bold).pack(side="left")
         self.lte_bars = ui.Bars(top, s, ui.SURFACE)
         self.lte_bars.pack(side="right")
-        self.lte_values = self._grid(card, ("State", "Network", "Signal", "Link", "Round trip", "GCS", "Data"),
-                                     {"Network": self._network, "Signal": self._signal})
+        self.lte_values = self._grid(card, ("State", "Network", "Signal", "Link", "Round trip", "GCS", "Data",
+                                            "Camera"),
+                                     {"Network": self._network, "Signal": self._signal, "Camera": self._camera})
         self.quick = tk.BooleanVar(value=self.plane.quick)
         tk.Checkbutton(card, text="Quick start (the real modem takes about 16 s)", variable=self.quick,
                        command=self.toggle_quick, bg=ui.SURFACE, fg=ui.TEXT, selectcolor=ui.FIELD,
@@ -779,6 +876,18 @@ class SimWindow:
         self.set_signal(str(self.plane.signal))
         return frame
 
+    def _camera(self, parent) -> tk.Frame:
+        """The board's CAM DIP switch, and what the camera is doing."""
+        s = self.scale
+        frame = tk.Frame(parent, bg=ui.SURFACE)
+        self.camera_switch = ui.Switch(frame, s * 0.8, ui.SURFACE, self.toggle_camera)
+        self.camera_switch.set(self.plane.camera)
+        self.camera_switch.pack(side="left", anchor="n", pady=(round(2 * s), 0))
+        self.camera_text = tk.Label(frame, text="", bg=ui.SURFACE, fg=ui.TEXT, font=self.font, anchor="w",
+                                    justify="left", wraplength=round(230 * s))
+        self.camera_text.pack(side="left", padx=(round(8 * s), 0))
+        return frame
+
     # -- actions
 
     def toggle_battery(self, on: bool) -> None:
@@ -791,6 +900,11 @@ class SimWindow:
 
     def toggle_quick(self) -> None:
         self.plane.quick = self.quick.get()
+
+    def toggle_camera(self, on: bool) -> None:
+        on = on and Image is not None
+        self.camera_switch.set(on)
+        self.plane.call(self.plane.set_camera, on)
 
     def set_network(self, network: int) -> None:
         self.plane.call(self.plane.set_network, network)
@@ -819,7 +933,30 @@ class SimWindow:
         self._drain_log()
         self._show_fc(now)
         self._show_lte(now, blink=self.tick % 10 < 5)
+        self._show_camera()
         self.poll_job = self.root.after(self.POLL_MS, self.poll)
+
+    def _show_camera(self) -> None:
+        p = self.plane
+        photos = p.modem.photos if p.modem is not None else None
+        if Image is None:
+            text = "Needs Pillow: pip install pillow"
+        elif not p.camera:
+            text = "Off: the aircraft answers that it has no camera"
+        elif not p.battery:
+            text = "-"
+        elif photos is not None and photos.busy:
+            sender = photos.sender
+            info = sender.info
+            text = f"Sending {info.width}×{info.height}: {sender.progress * info.size / 1024:.0f} of " \
+                   f"{info.size / 1024:.0f} KB"
+        elif photos is not None and photos.last is not None:
+            info, sent, took = photos.last
+            text = (f"Sent {info.width}×{info.height}, {info.size / 1024:.0f} KB in {took:.1f} s" if sent
+                    else f"Gave up on {info.width}×{info.height}: nothing more from the relay")
+        else:
+            text = "Ready: Snapshot in MavLTE takes a photo"
+        self._set(self.camera_text, text)
 
     def _show_fc(self, now: float) -> None:
         p, v = self.plane, self.fc_values

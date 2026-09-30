@@ -102,4 +102,22 @@ menu "MavLTE"
             saves mobile data. The bridge keeps its session with the relay alive either way and
             resumes within about a second after a GCS connects.
 
+    config BRIDGE_CAMERA
+        bool "Camera: a photo when MavLTE asks for one (Snapshot)"
+        default y
+        help
+            The board's OV5640 camera on its 24-pin connector, with DIP switch CAM on. It is
+            started for each photo and stopped after it: between photos it takes no memory and
+            no power, and it never takes a photo nobody asked for. Without a camera (or with this
+            off) the aircraft answers that it has none.
+
+    config BRIDGE_CAMERA_QUALITY
+        int "Camera JPEG quality (lower: better and larger)"
+        depends on BRIDGE_CAMERA
+        range 4 63
+        default 12
+        help
+            12 makes photos of about 5-10 KB at 320x240, 10-30 KB at 640x480 and 25-80 KB at
+            1024x768, the upper end for bright, detailed scenes.
+
 endmenu

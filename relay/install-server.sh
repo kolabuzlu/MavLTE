@@ -26,6 +26,8 @@ gcs_key = ${GKEY}
 #tcp_allow = 127.0.0.1/32, ::1/128
 session_timeout = 120
 log_level = info
+# photos from the aircraft: in /var/lib/mavrelay/snapshots, for 7 days
+#snapshot_days = 7
 EOF
     chown root:mavrelay /etc/mavrelay/mavrelay.ini
     chmod 640 /etc/mavrelay/mavrelay.ini

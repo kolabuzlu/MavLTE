@@ -29,11 +29,15 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
   connected; it resumes within about a second when you connect.
 - **Recovers by itself** from lost coverage, modem resets, IP address changes and relay restarts.
 - **Link status**: the MavLTE app shows the aircraft's signal, round-trip time and packet loss.
+- **Snapshot on demand**: press *Snapshot* in the MavLTE app and the board's camera takes a photo,
+  which comes to you through the relay without holding up the telemetry, with where and when it
+  was taken. Only when you ask: the camera takes nothing by itself. The relay keeps photos for
+  7 days, and the app collects the ones it missed when it next connects.
 
 | Folder | What |
 |---|---|
 | [firmware/](firmware) | ESP-IDF firmware for the ESP32-S3 (PlatformIO or `idf.py`) |
-| [relay/](relay) | `mavrelay.py`: the relay server, the GCS agent and a Python vehicle for bench tests; `MavLTE.pyw` / `mavlte.py`: the MavLTE app (the GCS agent as a window), `build_release.py` makes it into `MavLTE.exe`; `sitl_demo.py`: the whole link with ArduPilot SITL on one PC; `PlaneSim.pyw` / `plane_sim.py`: SITL as a plane with a battery switch and a virtual LTE module |
+| [relay/](relay) | `mavrelay.py`: the relay server, the GCS agent and a Python vehicle for bench tests; `MavLTE.pyw` / `mavlte.py`: the MavLTE app (the GCS agent as a window), `build_release.py` makes it into `MavLTE.exe`; `sitl_demo.py`: the whole link with ArduPilot SITL on one PC; `PlaneSim.pyw` / `plane_sim.py`: SITL as a plane with a battery switch, a virtual LTE module and a virtual camera |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | Tunnel protocol |
 
 ## Setup, in order
@@ -69,6 +73,11 @@ provider has its own firewall (security group), open **UDP 14650** there too.
 Watch it work with `journalctl -u mavrelay -f`. Every five minutes it logs a summary, and it
 logs every connection, address change and link loss as it happens.
 
+The aircraft's photos are kept in `/var/lib/mavrelay/snapshots` for 7 days (`snapshot_dir` and
+`snapshot_days` in `mavrelay.ini`), each as a `.jpg` with a `.json` beside it. Updating an older
+relay: run the installer again, which also installs the new service file (it gives the service
+that folder); your keys stay.
+
 ## 2. Firmware
 
 The firmware talks to the modem over its UART (PPP on GPIO17/18, the same on both board
@@ -91,9 +100,10 @@ the chip to tell them apart and prints `board version V1` or `V2` at start-up.
 | Mobile network technology | Automatic (LTE, falls back to 2G) or LTE only |
 | Board version, flight controller pins | leave on detect / `-1` |
 | Flight controller baud rate | `115200` |
+| Camera | on (off, or no camera fitted: the aircraft answers that it has none) |
 
-The rest (modem UART speed, batching, sending with no GCS connected) can stay as they are;
-each has a help text. PlatformIO keeps your settings, including the key, in
+The rest (modem UART speed, batching, sending with no GCS connected, JPEG quality) can stay as
+they are; each has a help text. PlatformIO keeps your settings, including the key, in
 `firmware/sdkconfig.esp32s3-a7670e`: don't publish that file.
 
 **Build and flash.** With PlatformIO (VS Code or the command line) in the `firmware` folder:
@@ -108,17 +118,25 @@ The board's USB-C port goes through a USB hub to a CH343 USB-serial chip on the 
 so flashing and the log use the COM port that appears on your PC. (The ESP32's own USB pins are
 wired to the modem and never show up on the PC.)
 
-**DIP switches.** Set all four **OFF**:
+**DIP switches.** Set **CAM ON** if the camera is fitted, the other three **OFF**:
 
-| Switch | OFF means |
+| Switch | Setting |
 |---|---|
-| 1 CAM | camera power off (no camera is used) |
-| 2 HUB | the USB hub and CH343 only run while USB-C is plugged in |
-| 3 4G | the firmware switches the modem's power, so it can power-cycle a hung modem |
-| 4 USB | the modem's USB goes to the ESP32 (unused), not to your PC |
+| 1 CAM | ON: powers the camera (OFF: no camera, and the aircraft says so when asked for a photo) |
+| 2 HUB | OFF: the USB hub and CH343 only run while USB-C is plugged in |
+| 3 4G | OFF: the firmware switches the modem's power, so it can power-cycle a hung modem |
+| 4 USB | OFF: the modem's USB goes to the ESP32 (unused), not to your PC |
 
 With 4G ON the modem runs anyway, but the firmware can then only reset it by AT command; the
-log warns about it.
+log warns about it. On V2 boards the camera's clock line is on GPIO46, which the ESP32 reads
+while it starts: if flashing ever fails with the camera on, switch CAM off for the upload.
+
+**The camera** (the OV5640 that comes with the board, on its 24-pin connector) is started only
+when a photo is asked for and stopped once it is sent, so between photos it uses no memory and
+no power. It takes about two seconds per photo, letting the exposure settle first. The largest
+size (1024×768) needs about 150 KB of the ESP32's memory while it is taken and sent; should that
+ever be short, the aircraft answers that the photo could not be taken, and the smaller sizes
+still work.
 
 **A healthy start** takes about 20–40 s and logs (shortened):
 
@@ -173,6 +191,9 @@ battery) before you connect USB-C to a PC.
 
 **Antennas and SIM.** Screw the LTE antenna onto the modem's main antenna connector; the GNSS
 antenna is not needed. Insert a nano-SIM with a data plan, PIN removed.
+
+**Camera.** It sits on the board's own connector, so it needs no wiring. Mount the board (or the
+camera on an extension cable) looking where you want your photos, away from the propeller.
 
 ## 4. ArduPilot parameters
 
@@ -231,6 +252,14 @@ server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
   QGroundControl finds UDP 14550 by itself.
 - With both switches off the app only watches: the Available LEDs keep working, but the aircraft
   holds its telemetry back, so it uses almost no mobile data.
+- **Snapshot**, at the bottom of the *Aircraft* panel, asks the aircraft for a photo, whatever the
+  switches: pick **Small** (320×240, about 5–10 KB), **Medium** (640×480, 10–30 KB) or **Large**
+  (1024×768, 25–80 KB) beside it. The line below shows the photo arriving; it then opens in a
+  viewer with when it was taken, the position, the altitude above home and the heading (arrow
+  keys: older and newer photos). The thumbnail opens the last one again.
+- Photos go to **Pictures\MavLTE** (`photo_dir` in `mavrelay.ini` to change it), named by date
+  and time, each with a `.json` beside it holding the same notes. Photos taken while the app was
+  closed (asked for from another laptop, say) arrive by themselves when it connects.
 
 The app keeps its settings in the `[gcs]` section of `mavrelay.ini`: `MavLTE.exe` in
 `%LOCALAPPDATA%\MavLTE\mavrelay.ini` (or in a `mavrelay.ini` next to the exe, if you put one
@@ -328,6 +357,13 @@ section of `mavrelay.ini`.
   more frequent and longer: twice with *Fair*, four times with *Weak*, half with *Excellent*. From
   *Fair* down, 2G is slower than the telemetry, so it queues up and the *Data* line shows packets
   being lost.
+- **Camera** is the board's camera with its CAM switch: *Snapshot* in MavLTE gets a picture of sky
+  and fields as the SITL plane flies, rolls and pitches, with the plane's position, of the size a
+  real one would be, sent the way the firmware sends it. Off, the aircraft answers that it has no
+  camera. With the telemetry flowing, a medium photo takes about 3 s on LTE; on 2G from half a
+  minute (excellent signal) to two or three minutes (fair), as the photo only takes what the
+  telemetry leaves. With a weak 2G signal even the telemetry does not fit, and a photo hardly
+  gets through.
 
 Put the MavLTE app beside it and watch its LEDs follow: they go dark about 3 s after the plane
 goes quiet.
@@ -350,6 +386,10 @@ IP and UDP headers the way a mobile operator bills them:
 A full parameter download is about 0.1 MB. While no MavLTE app (or agent) is connected, the aircraft sends
 no telemetry, only the link check (about 0.5 MB per hour). A longer batch interval saves header
 bytes at the cost of telemetry delay; commands from the GCS are never delayed.
+
+A photo costs its size plus about 6%: roughly 10 KB small, 25 KB medium, 60 KB large. Only the
+aircraft's uplink counts; photos coming again from the relay (to a second laptop, or ones
+missed while the app was closed) travel over your laptop's internet.
 
 ## In the aircraft
 
@@ -378,16 +418,20 @@ bytes at the cost of telemetry delay; commands from the GCS are never delayed.
 | Agent connects, Mission Planner shows nothing | Mission Planner's port must match `--udp` (default 14550). Check `SERIALn_PROTOCOL` and `SERIALn_BAUD`, and that TX and RX are crossed. |
 | Mission Planner connects but commands are ignored | Signing is on and this Mission Planner does not have the key. |
 | Data use higher than expected | Mission Planner raised the stream rates: set the "Ignore Streamrate" option and the rates, then reboot the flight controller. |
+| `No photo: the aircraft has no camera` | DIP switch CAM on, the camera's ribbon cable seated in its connector (contacts the right way round), *Camera* on in menuconfig. The ESP32 log says why. |
+| `No photo: the camera could not take the photo` | The ESP32 log says why; for *Large*, too little free memory: take *Medium*. |
+| Photos have no position in their notes | The flight controller sends no `GLOBAL_POSITION_INT` on the bridge's port: set the `POSITION` stream rate (see above). |
 
 ## Development
 
 ```bash
 cd relay && python -m unittest discover -s tests       # relay, protocol, end-to-end over UDP
-cd firmware/test/host && make test                      # C core: SHA-256/HMAC, framing, tunnel client
+cd firmware/test/host && make test                      # C core: SHA-256/HMAC, framing, tunnel, snapshots, position
 ```
 
 On Linux, macOS or WSL the relay tests also build `firmware/test/host/tunnel_harness` and run the
-firmware's C tunnel code against the Python relay, including a relay restart.
+firmware's C tunnel code against the Python relay, including a relay restart, and have it send a
+photo to a Python GCS agent.
 
 **One version number for everything:** the firmware (`firmware/main/version.h`) and the app,
 simulator and relay (`__version__` in `relay/mavrelay.py`) always carry the same number; a test

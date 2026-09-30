@@ -184,7 +184,8 @@ async def run(args, keys) -> None:
         relay_addr = ("127.0.0.1", args.relay_port)
         tasks.append(mr.run_server(argparse.Namespace(
             listen=relay_addr, vehicle_key=vehicle_key, gcs_key=gcs_key, tcp_listen=None, tcp_allow=[],
-            session_timeout=120.0)))
+            session_timeout=120.0, snapshot_dir=str(Path(tempfile.gettempdir()) / "mavrelay-sitl" / "snapshots"),
+            snapshot_days=7.0)))
     link = LinkEmulator(relay_addr, args.delay, args.jitter, args.loss)
     await link.start()
     tasks.append(mr.run_vehicle(argparse.Namespace(

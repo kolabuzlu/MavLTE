@@ -236,6 +236,11 @@ bool tun_send_data(tun_client_t *t, const uint8_t *data, size_t len)
     return true;
 }
 
+bool tun_send_packet(tun_client_t *t, uint8_t type, const uint8_t *body, size_t len)
+{
+    return t->session && type != TUN_HELLO && len <= TUN_MAX_PAYLOAD && send_packet(t, type, body, len);
+}
+
 static bool tag_ok(const tun_client_t *t, const uint8_t *pkt, size_t len)
 {
     uint8_t mac[SHA256_DIGEST_SIZE];
@@ -299,5 +304,7 @@ void tun_input(tun_client_t *t, const uint8_t *pkt, size_t len, uint32_t now_ms)
         uint32_t rtt = now_ms - get_u32(body);
         t->rtt_ms = rtt < TUN_U16_UNKNOWN ? (uint16_t)rtt : TUN_U16_UNKNOWN - 1;
         t->gcs_present = (body[4] & TUN_PONG_GCS_PRESENT) != 0;
+    } else if (type >= TUN_SNAP_REQ && t->cfg.on_packet) {
+        t->cfg.on_packet(t->cfg.ctx, type, body, body_len);
     }
 }

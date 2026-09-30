@@ -3,7 +3,12 @@ flight controller in place of SITL, and its window. Skipped where tkinter is mis
 
 import asyncio
 import gc
+import io
+import json
+import math
 import os
+import shutil
+import tempfile
 import random
 import struct
 import subprocess
@@ -38,11 +43,14 @@ except Exception:  # no tkinter, or no display
 
 
 def fc_telemetry(seq: int) -> bytes:
-    """What SITL's SERIAL1 sends: HEARTBEAT (FBWA, armed), SYS_STATUS (12.6 V), GLOBAL_POSITION_INT (120 m)."""
+    """What SITL's SERIAL1 sends: HEARTBEAT (FBWA, armed), SYS_STATUS (12.6 V), ATTITUDE (rolled 10 degrees
+    right, nose 3 degrees down), GLOBAL_POSITION_INT (over Istanbul, 120 m above home, heading 45)."""
     heartbeat = struct.pack("<IBBBBB", 5, 1, 3, 0x81, 4, 3)
     sys_status = bytes(14) + struct.pack("<H", 12600) + bytes(15)
-    position = bytes(16) + struct.pack("<i", 120_000) + bytes(8)
-    return v2_frame(0, heartbeat, seq) + v2_frame(1, sys_status, seq + 1) + v2_frame(33, position, seq + 2)
+    attitude = struct.pack("<Iffffff", 0, math.radians(10), math.radians(-3), 0.8, 0, 0, 0)
+    position = struct.pack("<IiiiihhhH", 0, 411234567, 289876543, 170_000, 120_000, 0, 0, 0, 4500)
+    return (v2_frame(0, heartbeat, seq) + v2_frame(1, sys_status, seq + 1) + v2_frame(30, attitude, seq + 2)
+            + v2_frame(33, position, seq + 3))
 
 
 class Ground:
@@ -73,7 +81,9 @@ class Ground:
     async def _ticks(self):
         while True:
             await asyncio.sleep(0.1)
-            self.relay.tick(time.monotonic())
+            now = time.monotonic()
+            self.relay.tick(now)
+            self.relay.photos.pump(now)
 
     async def _fc_client(self, reader, writer):  # plays SITL's SERIAL1
         self.fc_clients.append(writer)
@@ -82,7 +92,7 @@ class Ground:
             seq = 0
             while True:
                 writer.write(fc_telemetry(seq))
-                seq += 3
+                seq += 4
                 await asyncio.sleep(0.05)
 
         task = asyncio.ensure_future(talk())
@@ -218,6 +228,50 @@ class PlaneTest(unittest.TestCase):
             wait_for(self, lambda: any("cannot look up" in line for line in logs.output), "lookup retried")
         self.assertFalse(plane.modem_task.done())  # an empty label raises UnicodeError, not OSError
 
+    @unittest.skipUnless(plane_sim is not None and plane_sim.Image is not None, "needs Pillow")
+    def test_snapshot(self):
+        p, g = self.plane, self.ground
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        saved = []
+        inbox = mr.PhotoInbox(g.gcs, folder, on_photo=lambda path, info: saved.append((path, info)))
+
+        async def attach():  # the ground's GCS becomes a photo-taking MavLTE
+            g.gcs.on_packet = inbox.on_packet
+
+            async def pump():
+                while True:
+                    await asyncio.sleep(0.05)
+                    inbox.pump(time.monotonic())
+
+            asyncio.ensure_future(pump())
+
+        g.run(attach())
+        p.call(p.set_lte, True)
+        p.call(p.set_battery, True)
+        wait_for(self, self.session, "relay session")
+        wait_for(self, lambda: p.fc.lat != mr.UNKNOWN_I32, "position from the flight controller")
+        self.assertEqual((p.fc.lat, p.fc.lon, p.fc.heading), (411234567, 289876543, 4500))
+        self.assertAlmostEqual(p.fc.roll, 10.0, places=3)
+        self.assertAlmostEqual(p.fc.pitch, -3.0, places=3)
+        wait_for(self, lambda: g.relay.vehicle is not None, "the aircraft online at the relay")
+        g.loop.call_soon_threadsafe(inbox.request, 1)
+        wait_for(self, lambda: saved or inbox.problem, "the photo at the GCS", timeout=15)
+        self.assertEqual(inbox.problem, "")
+        path, info = saved[0]
+        self.assertEqual((info.width, info.height, info.lat, info.heading), (640, 480, 411234567, 4500))
+        with plane_sim.Image.open(path) as img:
+            self.assertEqual(img.size, (640, 480))
+        with open(path[:-4] + ".json") as f:
+            self.assertEqual(json.load(f)["altitude_m"], 120.0)
+        wait_for(self, lambda: p.modem.photos.last is not None, "the plane knows it was sent")
+        self.assertTrue(p.modem.photos.last[1])
+
+        p.call(p.set_camera, False)  # the CAM DIP switch off
+        g.loop.call_soon_threadsafe(inbox.request, 0)
+        wait_for(self, lambda: inbox.problem, "the answer")
+        self.assertEqual(inbox.problem, mr.SNAP_PROBLEMS[mr.SNAP_NO_CAMERA])
+
     def test_module_starts_switched_off(self):
         p = self.plane
         self.assertFalse(p.lte)
@@ -225,6 +279,23 @@ class PlaneTest(unittest.TestCase):
         wait_for(self, lambda: p.fc.mode == "FBWA", "flight controller up")
         time.sleep(0.3)
         self.assertIsNone(p.modem)
+
+
+@unittest.skipUnless(plane_sim is not None and plane_sim.Image is not None, "needs tkinter and Pillow")
+class CameraTest(unittest.TestCase):
+    def test_pictures_are_photo_sized(self):
+        fc = plane_sim.FcState()
+        fc.feed(fc_telemetry(0), time.monotonic())
+        # the sizes a JPEG from the board's OV5640 has (bright, detailed scenes at the upper end)
+        for (width, height), (low, high) in zip(mr.SNAP_SIZES, ((4, 12), (10, 35), (25, 90))):
+            jpeg = plane_sim.camera_picture(width, height, fc)
+            self.assertTrue(low * 1024 <= len(jpeg) <= high * 1024, f"{width}x{height}: {len(jpeg)} bytes")
+            with plane_sim.Image.open(io.BytesIO(jpeg)) as img:
+                self.assertEqual((img.format, img.size), ("JPEG", (width, height)))
+
+    def test_without_a_position(self):
+        jpeg = plane_sim.camera_picture(320, 240, plane_sim.FcState())  # the flight controller not heard yet
+        self.assertEqual(jpeg[:2], b"\xff\xd8")
 
 
 @unittest.skipUnless(plane_sim, "needs tkinter")
@@ -359,6 +430,13 @@ class WindowTest(unittest.TestCase):
                          pump=root.update)
                 wait_for(self, lambda: win.lte_led.color == ui.BLUE, "steady blue: a GCS is there",
                          pump=root.update)
+                expected = "Ready: Snapshot in MavLTE takes a photo" if plane_sim.Image is not None \
+                    else "Needs Pillow: pip install pillow"
+                self.assertEqual(text(win.camera_text), expected)
+                win.toggle_camera(False)
+                wait_for(self, lambda: text(win.camera_text) == "Off: the aircraft answers that it has no camera",
+                         "camera off", pump=root.update)
+                self.assertFalse(plane.camera)
                 win.toggle_lte(False)
                 wait_for(self, lambda: text(win.lte_values["State"]) == "Off", "module off", pump=root.update)
                 self.assertEqual(win.lte_led.color, ui.LED_OFF)

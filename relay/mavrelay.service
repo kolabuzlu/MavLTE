@@ -9,6 +9,9 @@ Group=mavrelay
 ExecStart=/usr/bin/python3 /opt/mavrelay/mavrelay.py server --config /etc/mavrelay/mavrelay.ini
 Restart=always
 RestartSec=2
+# /var/lib/mavrelay, writable for the service: the aircraft's photos go to its snapshots folder
+StateDirectory=mavrelay
+StateDirectoryMode=0750
 
 # hardening
 NoNewPrivileges=yes

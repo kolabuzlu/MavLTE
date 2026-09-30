@@ -2,3 +2,4 @@ dependencies:
   idf: ">=5.3"
   espressif/esp_modem: "^2.1.0"
   espressif/led_strip: "^3.0.3"
+  espressif/esp32-camera: "^2.1.8"  # 2.1.6 and later build on ESP-IDF 6

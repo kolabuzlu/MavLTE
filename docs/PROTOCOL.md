@@ -41,6 +41,11 @@ corrupts the frames around it.
 | 5    | PONG    | S → C | session / seq | `t_ms u32` (echo), `flags u8` (bit 0: a GCS is connected) |
 | 6    | REJECT  | S → C | the rejected session / 0 | `reason u8` (1 = unknown or expired session) |
 | 7    | STATUS  | S → GCS | session / seq | `flags u8, rat u8, rtt_ms u16, up_loss_permille u16, down_loss_permille u16, rssi_dbm i16, idle_ms u16` |
+| 8    | SNAP_REQ  | GCS → S → V | session / seq | `photo_id u32, size u8` (see [Snapshots](#snapshots)) |
+| 9    | SNAP_INFO | V → S → GCS | session / seq | `photo_id u32, bytes u32, width u16, height u16, lat i32, lon i32, alt_mm i32, heading_cdeg u16, status u8, time u32` |
+| 10   | SNAP_DATA | V → S → GCS | session / seq | `photo_id u32, chunk u16`, then the chunk (1024 bytes, the last one shorter) |
+| 11   | SNAP_ACK  | GCS → S → V | session / seq | `photo_id u32, flags u8` (bit 0: all there, bit 1: have the SNAP_INFO), then a bitmap of the chunks received |
+| 12   | SNAP_SYNC | GCS → S | session / seq | `newest_photo_id u32` |
 
 Unknown values are `0xFFFF` for u16 fields, `0x7FFF` for `rssi_dbm` and `0xFF` for `rat`.
 `rat` uses the 3GPP TS 27.007 access technology numbers (0 GSM, 3 EDGE, 7 LTE, ...).
@@ -102,6 +107,51 @@ REJECT to the client's current session.
   and does not count it as a connected GCS for the PONG flag, so the vehicle keeps its
   telemetry back. The flag holds until the agent's next PING; agents PING at once when it
   changes. Vehicles send 0; servers that predate the flag treat a watcher as a GCS.
+
+## Snapshots
+
+A photo from the aircraft's camera, on request only: the aircraft never takes one by itself.
+Each leg (aircraft to relay, relay to GCS agent) carries it the same way, and each receiver
+acknowledges what it has.
+
+1. A GCS agent sends SNAP_REQ with `photo_id` 0 and a size: 0 = 320×240, 1 = 640×480,
+   2 = 1024×768 (larger values mean the largest). The server picks the photo id, its own unix
+   time (and one more than the last if that is not larger), so ids grow across server restarts.
+   Without an online vehicle it answers at once with SNAP_INFO status NO_AIRCRAFT; otherwise it
+   passes SNAP_REQ with the id on to the vehicle, and again every 2 s until the vehicle answers.
+   After 20 s without an answer it tells the agent NO_ANSWER.
+2. The vehicle answers each SNAP_REQ with a SNAP_INFO: a problem (status NO_CAMERA, FAILED, or
+   BUSY while another photo is on its way), or the photo's size in bytes, its width and height,
+   and where the aircraft was (1e-7 degrees, mm above home, centidegrees; unknown: `0x80000000`
+   and `0xFFFF`). A SNAP_REQ for an id it has answered before gets the same answer, never a
+   second photo.
+3. The vehicle then sends the photo as SNAP_DATA chunks of 1024 bytes (up to 1024 chunks, 1 MB).
+   It sends its SNAP_INFO again until an ACK has flag bit 1, and any chunk again that the ACKs
+   do not show after `max(1 s, 2.5 × round trip)` (2 s while the round trip is unknown). It
+   gives up after 60 s without an ACK. A chunk that comes before its SNAP_INFO is kept.
+4. Each receiver ACKs twice a second while something arrives, and at once when it has it all
+   (flag bit 0). A sender that hears "all there" stops. A receiver that already finished a
+   photo answers any more of its packets with "all there".
+5. The server keeps finished photos (by default for 7 days, in a folder), sets `time` in the
+   SNAP_INFO it passes on to its unix time, and passes a photo on to every GCS agent that sent
+   SNAP_REQ or SNAP_SYNC during its session, starting while the photo is still arriving. A
+   problem goes only to the agent that asked.
+6. A GCS agent sends SNAP_SYNC with the newest photo id it has at the start of each session. The
+   server then sends it every photo it keeps with a larger id: photos taken while the agent was
+   away arrive by themselves.
+
+**Speed.** A photo goes only as fast as the link carries it without delaying the telemetry:
+senders pace their chunks, start at 4 KB/s, and follow the round trip (a queue building up in
+the network makes it grow): when it rises more than `max(150 ms, half its lowest value of the
+last minute)` above that lowest value, they halve their pace (at most once a second, not below
+256 B/s); otherwise they add a tenth of their cap each second, as LEDBAT does (RFC 6817). The
+vehicle's cap is 32 KB/s on LTE and 2 KB/s on 2G, the server's 64 KB/s to each agent. When the
+vehicle gets a new session (perhaps with a restarted server that knows nothing of the photo), it
+sends everything again; the first ACK tells what the server still has. A server takes a photo
+it did not ask for only if its id is within 10 minutes of its clock (asked for before it
+restarted).
+
+Status values: 0 OK, 1 NO_AIRCRAFT, 2 NO_CAMERA, 3 FAILED, 4 BUSY, 5 NO_ANSWER.
 
 ## Not provided
 

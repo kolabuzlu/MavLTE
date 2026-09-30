@@ -1,10 +1,13 @@
-/* Host tests for the portable firmware core (sha256, mavframe, tunnel). Build and run: make test */
+/* Host tests for the portable firmware core (sha256, mavframe, tunnel, snapshot, mavpos).
+ * Build and run: make test */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "mavframe.h"
+#include "mavpos.h"
 #include "sha256.h"
+#include "snapshot.h"
 #include "tunnel.h"
 
 static int failures;
@@ -576,6 +579,312 @@ static void test_tunnel_loss(void)
     CHECK(tun_loss_permille(&t) == 91); /* 9 of 99 */
 }
 
+/* ------------------------------------------------------------------ snapshots */
+
+#define WIRE_MAX 64
+
+typedef struct { /* what the tunnel sent, decoded */
+    int n;
+    uint8_t type[WIRE_MAX];
+    uint8_t body[WIRE_MAX][TUN_MAX_PAYLOAD];
+    size_t len[WIRE_MAX];
+} wire_t;
+
+static void wire_send(void *ctx, const uint8_t *p, size_t n)
+{
+    wire_t *w = ctx;
+    if (w->n < WIRE_MAX) {
+        w->type[w->n] = p[2];
+        w->len[w->n] = n - TUN_HEADER_LEN - TUN_TAG_LEN;
+        memcpy(w->body[w->n], p + TUN_HEADER_LEN, w->len[w->n]);
+    }
+    w->n++;
+}
+
+typedef struct {
+    int takes, releases;
+    uint32_t take_id, release_id;
+    uint16_t width, height;
+    bool sent;
+} camera_log_t;
+
+static void fake_take(void *ctx, uint32_t photo_id, uint16_t width, uint16_t height)
+{
+    camera_log_t *c = ctx;
+    c->takes++;
+    c->take_id = photo_id;
+    c->width = width;
+    c->height = height;
+}
+
+static void fake_release(void *ctx, uint32_t photo_id, bool sent)
+{
+    camera_log_t *c = ctx;
+    c->releases++;
+    c->release_id = photo_id;
+    c->sent = sent;
+}
+
+static void connect_tunnel(tun_client_t *t, wire_t *w, uint32_t now)
+{
+    uint8_t key[32] = {0}, pkt[64], nonce[8];
+    hmac_sha256_key_t k;
+    hmac_sha256_setkey(&k, key, 32);
+    tun_config_t cfg = {.role = TUN_ROLE_VEHICLE, .key = key, .key_len = 32, .send = wire_send,
+                        .on_data = fake_data, .random = fake_random, .ctx = w};
+    tun_init(t, &cfg, now);
+    tun_poll(t, now);
+    memcpy(nonce, w->body[0], 8);
+    size_t n = tun_encode(&k, pkt, TUN_WELCOME, TUN_ROLE_SERVER, 7, 0, nonce, 8);
+    tun_input(t, pkt, n, now);
+    w->n = 0;
+}
+
+static void request(snap_outbox_t *o, uint32_t photo_id, uint8_t size, uint32_t now)
+{
+    uint8_t body[5] = {(uint8_t)photo_id, (uint8_t)(photo_id >> 8), (uint8_t)(photo_id >> 16),
+                       (uint8_t)(photo_id >> 24), size};
+    snap_input(o, TUN_SNAP_REQ, body, sizeof(body), now);
+}
+
+static void ack(snap_outbox_t *o, uint32_t photo_id, uint8_t flags, uint8_t bitmap, uint32_t now)
+{
+    uint8_t body[6] = {(uint8_t)photo_id, (uint8_t)(photo_id >> 8), (uint8_t)(photo_id >> 16),
+                       (uint8_t)(photo_id >> 24), flags, bitmap};
+    snap_input(o, TUN_SNAP_ACK, body, sizeof(body), now);
+}
+
+/* the status in the last SNAP_INFO sent, or -1 */
+static int last_status(const wire_t *w, uint32_t photo_id)
+{
+    for (int i = w->n - 1; i >= 0; i--) {
+        if (w->type[i] == TUN_SNAP_INFO && u32(w->body[i]) == photo_id) {
+            return w->body[i][26];
+        }
+    }
+    return -1;
+}
+
+static int count(const wire_t *w, uint8_t type)
+{
+    int c = 0;
+    for (int i = 0; i < w->n && i < WIRE_MAX; i++) {
+        c += w->type[i] == type;
+    }
+    return c;
+}
+
+static void test_snapshot(void)
+{
+    static tun_client_t t;
+    static wire_t w;
+    static snap_outbox_t o;
+    static uint8_t photo[2500];
+    camera_log_t cam = {0};
+    uint32_t now = 0xFFFFF000u; /* the millisecond clock wraps around during this test */
+    for (size_t i = 0; i < sizeof(photo); i++) {
+        photo[i] = (uint8_t)(i * 7 + 3);
+    }
+    memset(&w, 0, sizeof(w));
+    connect_tunnel(&t, &w, now);
+    snap_config_t cfg = {.take = fake_take, .release = fake_release, .ctx = &cam};
+    snap_init(&o, &t, &cfg);
+
+    /* asked for a medium photo: the camera starts */
+    request(&o, 1000, 1, now);
+    CHECK(cam.takes == 1 && cam.take_id == 1000 && cam.width == 640 && cam.height == 480);
+    CHECK(snap_busy(&o) && w.n == 0);
+    request(&o, 1001, 0, now); /* another one meanwhile: busy */
+    CHECK(last_status(&w, 1001) == SNAP_BUSY && cam.takes == 1);
+    w.n = 0;
+    request(&o, 1000, 1, now); /* the relay asking again: already being taken */
+    CHECK(w.n == 0 && cam.takes == 1);
+
+    /* the photo: its SNAP_INFO at once, the chunks as the rate allows (4 KB/s to start with) */
+    snap_where_t where = {411234567, 289876543, 120000, 4500};
+    snap_photo_taken(&o, 1000, SNAP_OK, photo, sizeof(photo), &where, now);
+    snap_poll(&o, now, 32768);
+    CHECK(w.n == 1 && w.type[0] == TUN_SNAP_INFO && w.len[0] == SNAP_INFO_LEN);
+    CHECK(u32(w.body[0]) == 1000 && u32(w.body[0] + 4) == 2500);
+    CHECK(w.body[0][8] == (640 & 0xFF) && w.body[0][9] == 640 >> 8 && w.body[0][10] == 480 - 256);
+    CHECK(u32(w.body[0] + 12) == 411234567u && u32(w.body[0] + 20) == 120000u && w.body[0][26] == SNAP_OK);
+    CHECK(w.body[0][24] == (4500 & 0xFF) && w.body[0][25] == 4500 >> 8);
+    for (uint32_t ms = 100; ms <= 900; ms += 100) {
+        snap_poll(&o, now + ms, 32768);
+    }
+    CHECK(count(&w, TUN_SNAP_DATA) == 3 && count(&w, TUN_SNAP_INFO) == 1);
+    for (int i = 1; i < w.n; i++) {
+        unsigned index = w.body[i][4] | w.body[i][5] << 8;
+        size_t len = index < 2 ? 1024 : 452;
+        CHECK(u32(w.body[i]) == 1000 && w.len[i] == 6 + len);
+        CHECK(memcmp(w.body[i] + 6, photo + index * 1024, len) == 0);
+    }
+    /* chunk 1 lost: the ACK shows 0 and 2; after the wait (2 s while the round trip is unknown) chunk 1
+     * goes again, and only it */
+    ack(&o, 1000, SNAP_ACK_HAVE_INFO, 0x05, now + 1000);
+    w.n = 0;
+    snap_poll(&o, now + 1500, 32768);
+    CHECK(w.n == 0);
+    for (uint32_t ms = 2000; ms <= 3200; ms += 100) {
+        snap_poll(&o, now + ms, 32768);
+    }
+    CHECK(w.n == 1 && w.type[0] == TUN_SNAP_DATA && w.body[0][4] == 1);
+    /* all there: released, sent */
+    ack(&o, 1000, SNAP_ACK_DONE | SNAP_ACK_HAVE_INFO, 0x07, now + 3300);
+    snap_poll(&o, now + 3310, 32768);
+    CHECK(!snap_busy(&o) && cam.releases == 1 && cam.release_id == 1000 && cam.sent);
+    CHECK(o.last_id == 1000 && o.last_sent && o.last_ms == 3310);
+    w.n = 0;
+    request(&o, 1000, 1, now + 3400); /* a late copy of the request: not taken again */
+    CHECK(w.n == 0 && cam.takes == 1);
+
+    /* the camera fails: the relay hears so, and again if it asks again */
+    request(&o, 1002, 2, now + 4000);
+    CHECK(cam.takes == 2 && cam.width == 1024);
+    snap_photo_taken(&o, 1002, SNAP_FAILED, NULL, 0, NULL, now + 5000);
+    CHECK(last_status(&w, 1002) == SNAP_FAILED && !snap_busy(&o));
+    w.n = 0;
+    request(&o, 1002, 2, now + 5100);
+    CHECK(last_status(&w, 1002) == SNAP_FAILED && cam.takes == 2);
+
+    /* sent, but never acknowledged: given up after a minute */
+    request(&o, 1003, 0, now + 6000);
+    snap_photo_taken(&o, 1003, SNAP_OK, photo, 1000, NULL, now + 6000);
+    CHECK(u32(o.info + 12) == (uint32_t)SNAP_UNKNOWN_I32 && o.info[24] == 0xFF && o.info[25] == 0xFF); /* no position */
+    for (uint32_t ms = 6000; ms <= 6000 + 60000; ms += 500) {
+        snap_poll(&o, now + ms, 2048);
+    }
+    CHECK(snap_busy(&o));
+    snap_poll(&o, now + 6000 + 60001, 2048);
+    CHECK(!snap_busy(&o) && cam.releases == 2 && cam.release_id == 1003 && !cam.sent);
+
+    /* a new session (perhaps a new relay): the photo on its way goes again, all of it */
+    request(&o, 1004, 0, now + 70000);
+    snap_photo_taken(&o, 1004, SNAP_OK, photo, 2048, NULL, now + 70000);
+    for (uint32_t ms = 70000; ms <= 71000; ms += 50) {
+        snap_poll(&o, now + ms, 32768);
+    }
+    ack(&o, 1004, SNAP_ACK_HAVE_INFO, 0x03, now + 71000);
+    w.n = 0;
+    snap_restart(&o, now + 71100);
+    for (uint32_t ms = 71100; ms <= 72000; ms += 50) {
+        snap_poll(&o, now + ms, 32768);
+    }
+    CHECK(count(&w, TUN_SNAP_INFO) == 1 && count(&w, TUN_SNAP_DATA) == 2);
+
+    /* a photo nobody asked for is let go at once; one too large is refused */
+    snap_photo_taken(&o, 999, SNAP_OK, photo, 100, NULL, now + 72000);
+    CHECK(cam.releases == 3 && cam.release_id == 999);
+    ack(&o, 1004, SNAP_ACK_DONE | SNAP_ACK_HAVE_INFO, 0x03, now + 72000);
+    snap_poll(&o, now + 72001, 32768);
+    request(&o, 1005, 0, now + 73000);
+    snap_photo_taken(&o, 1005, SNAP_OK, photo, (size_t)SNAP_MAX_CHUNKS * SNAP_CHUNK + 1, NULL, now + 73000);
+    CHECK(last_status(&w, 1005) == SNAP_FAILED && cam.release_id == 1005 && !snap_busy(&o));
+
+    /* no camera at all */
+    snap_config_t none = {.release = fake_release, .ctx = &cam};
+    snap_init(&o, &t, &none);
+    w.n = 0;
+    request(&o, 2000, 1, now);
+    request(&o, 2000, 1, now + 2000);
+    CHECK(count(&w, TUN_SNAP_INFO) == 2 && last_status(&w, 2000) == SNAP_NO_CAMERA);
+}
+
+static void test_snapshot_rate(void)
+{
+    snap_rate_t r;
+    snap_rate_init(&r, 32768, 32768);
+    snap_rate_sample(&r, 100, 0);
+    snap_rate_sample(&r, 200, 1000); /* 100 ms more: within the allowance of 150 ms */
+    CHECK(r.rate == 32768);
+    snap_rate_sample(&r, 400, 2000); /* a queue: half as fast */
+    CHECK(r.rate == 16384);
+    snap_rate_sample(&r, 400, 2500); /* at most once a second */
+    CHECK(r.rate == 16384);
+    for (uint32_t s = 3; s < 20; s++) {
+        snap_rate_sample(&r, 2000, s * 1000);
+    }
+    CHECK(r.rate == 256); /* never slower than this */
+    for (uint32_t s = 20; s < 40; s++) {
+        snap_rate_sample(&r, 100, s * 1000);
+    }
+    CHECK(r.rate == 32768); /* back up, a tenth of the cap a time */
+
+    snap_rate_init(&r, 2048, 2048); /* 2G: a second's round trip is normal */
+    snap_rate_sample(&r, 1000, 0);
+    snap_rate_sample(&r, 1450, 1000);
+    CHECK(r.rate == 2048);
+    snap_rate_sample(&r, 1600, 2000);
+    CHECK(r.rate == 1024);
+
+    snap_rate_init(&r, 10000, 10000);
+    CHECK(snap_rate_budget(&r, 0) == 0);
+    CHECK(snap_rate_budget(&r, 100) == 1000);
+    r.tokens -= 1000;
+    CHECK(snap_rate_budget(&r, 10000) == 2048); /* no big burst after a pause */
+    CHECK(snap_rto_ms(TUN_U16_UNKNOWN) == 2000 && snap_rto_ms(100) == 1000 && snap_rto_ms(1000) == 2500);
+}
+
+/* ------------------------------------------------------------------ position from the flight controller */
+
+static size_t position_frame(uint8_t *f, uint8_t compid, int32_t lat, int32_t lon, int32_t rel_alt, uint16_t hdg)
+{
+    uint8_t p[28] = {0};
+    memcpy(p + 4, &lat, 4);
+    memcpy(p + 8, &lon, 4);
+    memcpy(p + 16, &rel_alt, 4);
+    memcpy(p + 26, &hdg, 2);
+    size_t plen = 28;
+    while (plen > 1 && p[plen - 1] == 0) { /* MAVLink 2 leaves out trailing zeros */
+        plen--;
+    }
+    uint8_t head[10] = {0xFD, (uint8_t)plen, 0, 0, 42, 1, compid, 33, 0, 0};
+    memcpy(f, head, 10);
+    memcpy(f + 10, p, plen);
+    uint8_t extra = 104;
+    uint16_t crc = mav_crc(mav_crc(0xFFFF, f + 1, 9 + plen), &extra, 1);
+    f[10 + plen] = (uint8_t)crc;
+    f[11 + plen] = (uint8_t)(crc >> 8);
+    return 12 + plen;
+}
+
+static void test_position(void)
+{
+    /* the CRC: the shared golden HEARTBEAT frame (CRC_EXTRA 50) */
+    uint8_t hb[32];
+    size_t n = unhex("fd0900002a0101000000000000000103410303ca52", hb);
+    uint8_t extra = 50;
+    CHECK(mav_crc(mav_crc(0xFFFF, hb + 1, 18), &extra, 1) == (hb[n - 2] | hb[n - 1] << 8));
+
+    mav_position_t pos;
+    mav_position_init(&pos);
+    uint8_t stream[512], frame[64];
+    size_t len = 0;
+    memcpy(stream, "\x00\x11junk", 6); /* bytes between frames */
+    len += 6;
+    memcpy(stream + len, hb, n); /* a HEARTBEAT: not a position */
+    len += n;
+    size_t fl = position_frame(frame, 1, 411234567, 289876543, 120000, 4500);
+    memcpy(stream + len, frame, fl);
+    len += fl;
+    for (size_t i = 0; i < len; i += 5) { /* in pieces, as the UART hands them over */
+        mav_position_feed(&pos, stream + i, len - i < 5 ? len - i : 5, 1234);
+    }
+    CHECK(pos.valid && pos.when_ms == 1234);
+    CHECK(pos.lat == 411234567 && pos.lon == 289876543 && pos.alt_mm == 120000 && pos.heading == 4500);
+
+    fl = position_frame(frame, 1, -335000000, -704000000, -2000, 0); /* southern and western, below home */
+    mav_position_feed(&pos, frame, fl, 2000);
+    CHECK(pos.lat == -335000000 && pos.lon == -704000000 && pos.alt_mm == -2000 && pos.heading == 0);
+    fl = position_frame(frame, 1, 1, 2, 3, 4);
+    frame[12] ^= 0x40; /* damaged on the way: CRC wrong */
+    mav_position_feed(&pos, frame, fl, 3000);
+    CHECK(pos.lat == -335000000 && pos.when_ms == 2000);
+    fl = position_frame(frame, 2, 1, 2, 3, 4); /* another component's (a camera gimbal, say) */
+    mav_position_feed(&pos, frame, fl, 3000);
+    CHECK(pos.lat == -335000000);
+}
+
 int main(void)
 {
     test_sha256();
@@ -586,6 +895,9 @@ int main(void)
     test_tunnel();
     test_tunnel_unanswered_hellos();
     test_tunnel_loss();
+    test_snapshot();
+    test_snapshot_rate();
+    test_position();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

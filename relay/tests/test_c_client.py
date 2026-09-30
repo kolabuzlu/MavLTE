@@ -1,13 +1,15 @@
-"""Runs the firmware's C tunnel code (firmware/test/host/tunnel_harness) against this relay.
+"""Runs the firmware's C tunnel and snapshot code (firmware/test/host/tunnel_harness) against this relay.
 
 Needs make and a C compiler (Linux, macOS or WSL); skipped otherwise.
 """
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -102,6 +104,49 @@ class CVehicleTest(unittest.IsolatedAsyncioTestCase):
             gaps += b != a + 1
         self.assertLessEqual(gaps, 1, "frames lost other than around the relay restart")
         self.assertGreater(len(counters), 500)
+
+    async def test_c_vehicle_photo(self):
+        """The firmware's snapshot outbox (C) sends a photo through the relay to a GCS agent (Python)."""
+        port = await self.start_server()
+        relay = self.relay
+        self.addCleanup(self.transport.close)
+
+        async def ticker():
+            last = 0.0
+            while True:
+                await asyncio.sleep(0.05)
+                now = time.monotonic()
+                relay.photos.pump(now)
+                if now - last >= 0.5:
+                    relay.tick(now)
+                    last = now
+
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        saved = []
+        agent = mr.GcsAgent(("127.0.0.1", port), KEY_G, photo_dir=folder,
+                            on_photo=lambda path, info: saved.append((path, info)))
+        for task in (asyncio.ensure_future(ticker()), asyncio.ensure_future(agent.run())):
+            self.addCleanup(task.cancel)
+        proc = await asyncio.create_subprocess_exec(self.harness, "127.0.0.1", str(port), KEY_V.hex(), "8",
+                                                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        await self.until(lambda: relay.vehicle is not None and agent.client.is_connected)
+        await asyncio.sleep(0.5)
+        self.assertTrue(agent.photos.request(2))
+        await self.until(lambda: saved or agent.photos.problem, timeout=10)
+        self.assertEqual(agent.photos.problem, "")
+        path, info = saved[0]
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), bytes((i * 13 + 7) & 0xFF for i in range(30000)))
+        self.assertEqual((info.width, info.height, info.lat, info.lon, info.alt, info.heading),
+                         (1024, 768, 411234567, 289876543, 120_000, 4500))
+        with open(path[:-4] + ".json") as f:
+            self.assertEqual(json.load(f)["latitude"], 41.1234567)
+
+        out, err = await asyncio.wait_for(proc.communicate(), 15)
+        self.assertEqual(proc.returncode, 0, err.decode())
+        stats = dict(item.split("=") for item in out.decode().split())
+        self.assertEqual((stats["photos"], stats["bad"]), ("1", "0"))
 
 
 if __name__ == "__main__":
