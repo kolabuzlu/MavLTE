@@ -72,7 +72,8 @@ def find_sitl() -> Optional[Path]:
     return next((c for c in candidates if c.is_file()), None)
 
 
-def start_sitl(args) -> subprocess.Popen:
+def start_sitl(args, console: bool = True) -> subprocess.Popen:
+    """console=False for window apps: on Windows SITL then gets no console window of its own."""
     exe = Path(args.sitl) if args.sitl else find_sitl()
     if exe is None or not exe.is_file():
         raise SystemExit("ArduPlane SITL not found. Start a plane simulation in Mission Planner once (it downloads "
@@ -88,7 +89,9 @@ def start_sitl(args) -> subprocess.Popen:
         cmd += ["--wipe"]
     logfile = open(workdir / "sitl.log", "w")
     log.info("starting %s (log: %s)", exe.name, workdir / "sitl.log")
-    return subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.DEVNULL, stdout=logfile, stderr=subprocess.STDOUT)
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" and not console else 0
+    return subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.DEVNULL, stdout=logfile, stderr=subprocess.STDOUT,
+                            creationflags=flags)
 
 
 class LinkEmulator:

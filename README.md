@@ -33,7 +33,7 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
 | Folder | What |
 |---|---|
 | [firmware/](firmware) | ESP-IDF firmware for the ESP32-S3 (PlatformIO or `idf.py`) |
-| [relay/](relay) | `mavrelay.py`: the relay server, the GCS agent and a Python vehicle for bench tests; `MavLTE.pyw` / `mavlte.py`: the MavLTE app (the GCS agent as a window), `build_release.py` makes it into `MavLTE.exe`; `sitl_demo.py`: the whole link with ArduPilot SITL on one PC |
+| [relay/](relay) | `mavrelay.py`: the relay server, the GCS agent and a Python vehicle for bench tests; `MavLTE.pyw` / `mavlte.py`: the MavLTE app (the GCS agent as a window), `build_release.py` makes it into `MavLTE.exe`; `sitl_demo.py`: the whole link with ArduPilot SITL on one PC; `PlaneSim.pyw` / `plane_sim.py`: SITL as a plane with a battery switch and a virtual LTE module |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | Tunnel protocol |
 
 ## Setup, in order
@@ -289,6 +289,19 @@ python sitl_demo.py --server your-server:14650 --no-agent
 
 It takes the vehicle key from the `[vehicle]` section of `mavrelay.ini` (`key = <vehicle key>`)
 or from `--vehicle-key`. Give the MavLTE app the server and the GCS key.
+
+**Plane simulator.** The same, as a window with the plane's power switches: double-click
+`PlaneSim.pyw` (or run `python plane_sim.py`). It uses the `[vehicle]` section of `mavrelay.ini`.
+
+- **Battery** powers the whole plane: on starts SITL, off stops it at once.
+- **LTE module** is the modem. On, it starts up like the real one (about 16 s, or a couple of
+  seconds with *Quick start*); off cuts it without a goodbye, as a power cut would. Its LED
+  blinks like the board's RGB LED.
+- **Coverage** sets the signal it reports and the delay and loss of its link, from *Excellent* to
+  *No signal*.
+
+Put the MavLTE app beside it and watch its LEDs follow: they go dark about 3 s after the plane
+goes quiet.
 
 **Real flight controller on USB.** `mavrelay.py vehicle` does in Python what the ESP32 does:
 `python mavrelay.py vehicle --server your-server:14650 --key <vehicle key> --serial COM5:115200`
