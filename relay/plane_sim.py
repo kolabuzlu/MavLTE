@@ -10,7 +10,7 @@ The plane's two power switches, in a window beside the MavLTE app (both start of
   as the ESP32 firmware does. Off cuts it without a goodbye, so the relay only notices the
   silence, as it would in the air.
 
-The module's LED blinks like the RGB LED on the board. Coverage sets the signal the module
+The module's LED shows what the RGB LED on the board shows. Coverage sets the signal the module
 reports (the bars in the MavLTE app) and the delay and loss on its link.
 
     python plane_sim.py            (or double-click PlaneSim.pyw)
@@ -456,7 +456,7 @@ def kill_with_us(proc: subprocess.Popen) -> None:
 
 
 class SimWindow:
-    POLL_MS = 100  # the module's LED blinks like the board's, in 100 ms steps
+    POLL_MS = 100  # the module's LED blinks like the board's, in 100 ms steps, when it blinks
 
     def __init__(self, root: tk.Tk, plane: Plane) -> None:
         self.root, self.plane = root, plane
@@ -635,7 +635,7 @@ class SimWindow:
         now = time.monotonic()
         self._drain_log()
         self._show_fc(now)
-        self._show_lte(now, blink=self.tick % 10 < 5, flash=self.tick % 10 < 2)
+        self._show_lte(now, blink=self.tick % 10 < 5)
         self.poll_job = self.root.after(self.POLL_MS, self.poll)
 
     def _show_fc(self, now: float) -> None:
@@ -657,22 +657,24 @@ class SimWindow:
         self._set(v["USB port"], f"TCP 127.0.0.1:{sitl_demo.USB_PORT}" if p.battery else "-")
         self._set(self.volts, f"{fc.volts:.1f} V" if fresh and fc.volts is not None else "")
 
-    def _show_lte(self, now: float, blink: bool, flash: bool) -> None:
+    def _show_lte(self, now: float, blink: bool) -> None:
         p, v = self.plane, self.lte_values
         m = p.modem
         client = m.client if m is not None else None
         session = client is not None and client.session != 0
-        # the LED, as on the board (README: "The RGB LED"): red without mobile data (blinking while it
-        # starts and searches), yellow while the relay does not answer, blue when connected (flashing
-        # while no GCS is connected, so the telemetry is held back)
+        # the LED, as on the board (README: "The RGB LED"), from worst to best: red without mobile data
+        # (blinking while it starts and searches), yellow while the relay does not answer, green when
+        # connected but no GCS is (telemetry held back), blue when a GCS is and the telemetry flows
         if m is None:
             color = ui.LED_OFF
         elif m.stage != "data" or p.coverage == 0:
             color = ui.RED if blink else ui.LED_OFF
         elif not session:
             color = YELLOW
+        elif not client.gcs_present:
+            color = ui.GREEN
         else:
-            color = ui.BLUE if client.gcs_present or flash else ui.LED_OFF
+            color = ui.BLUE
         self.lte_led.set(color)
 
         if not p.battery:

@@ -24,17 +24,19 @@ static void status_task(void *arg)
     uint32_t shown = UINT32_MAX;
     for (unsigned tick = 0;; tick++) { /* 100 ms per tick */
         bool blink = tick % 10 < 5;
-        bool flash = tick % 10 < 2;
         bridge_state_t link = bridge_state();
         uint8_t r = 0, g = 0, b = 0;
+        /* from worst to best: red, yellow, green, blue */
         if (modem_state == STATUS_MODEM_ERROR) {
             r = LEVEL; /* red: modem, SIM or network problem */
         } else if (modem_state == STATUS_MODEM_STARTING) {
             r = blink ? LEVEL : 0; /* red, blinking: no mobile data yet */
         } else if (!link.relay) {
             r = g = LEVEL; /* yellow: mobile data up, but the relay does not answer */
+        } else if (!link.gcs) {
+            g = LEVEL; /* green: connected to the relay, no GCS yet (telemetry held back) */
         } else {
-            b = link.gcs || flash ? LEVEL : 0; /* blue: connected; flashing while no GCS is connected */
+            b = LEVEL; /* blue: a GCS is connected and the telemetry flows */
         }
         uint32_t color = (uint32_t)r << 16 | (uint32_t)g << 8 | b;
         if (color != shown) {

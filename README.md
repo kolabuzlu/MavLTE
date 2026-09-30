@@ -135,15 +135,16 @@ I (16530) bridge: connected to the relay (session 5c1e0a77)
 
 Once a minute the bridge logs its counters: relay state, round-trip time, bytes each way.
 
-**The RGB LED** on the board shows the state without a laptop:
+**The RGB LED** on the board shows the state without a laptop, from worst to best red, yellow,
+green, blue. Green and blue match the Available and Connected LEDs in the MavLTE app:
 
 | LED | Meaning |
 |---|---|
 | red, blinking | no mobile data yet: modem starting, searching for the network |
 | red | modem, SIM or network problem; the log says which (it tries again by itself) |
 | yellow | mobile data up, but the relay does not answer (yet) |
-| blue, flashing | connected to the relay, no GCS connected (telemetry held back) |
-| blue | connected to the relay and a GCS is connected |
+| green | connected to the relay, no GCS connected yet (telemetry held back) |
+| blue | a GCS is connected and the telemetry flows |
 
 ## 3. Wiring and power
 
@@ -300,7 +301,7 @@ section of `mavrelay.ini`.
 - **Battery** powers the whole plane: on starts SITL, off stops it at once.
 - **LTE module** is the modem. On, it starts up like the real one (about 16 s, or a couple of
   seconds with *Quick start*); off cuts it without a goodbye, as a power cut would. Its LED
-  blinks like the board's RGB LED.
+  shows what the board's RGB LED shows.
 - **Coverage** sets the signal it reports and the delay and loss of its link, from *Excellent* to
   *No signal*.
 

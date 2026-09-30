@@ -255,7 +255,7 @@ class WindowTest(unittest.TestCase):
             win = root = None
             gc.collect()
 
-    def test_led_red_yellow_blue(self):
+    def test_led_red_yellow_green_blue(self):
         ground = Ground()
         self.addCleanup(ground.close)
         plane = plane_sim.Plane(("127.0.0.1", ground.relay_port), KEY_V, fc_port=ground.fc_port)
@@ -275,7 +275,16 @@ class WindowTest(unittest.TestCase):
                 win.toggle_lte(True)
                 win.toggle_battery(True)
                 wait_for(self, lambda: ui.RED in seen, "red while there is no mobile data", pump=pump)
-                wait_for(self, lambda: win.lte_led.color == ui.BLUE, "blue once connected", pump=pump)
+                wait_for(self, lambda: win.lte_led.color == ui.BLUE, "blue: connected, a GCS is there", pump=pump)
+
+                def gcs_watches(on):  # like MavLTE with both switches off
+                    ground.gcs.ping_flags = mr.PING_FLAG_WATCHING if on else 0
+                    ground.gcs.ping_now()
+
+                ground.loop.call_soon_threadsafe(gcs_watches, True)
+                wait_for(self, lambda: win.lte_led.color == ui.GREEN, "green: connected, no GCS", pump=pump)
+                ground.loop.call_soon_threadsafe(gcs_watches, False)
+                wait_for(self, lambda: win.lte_led.color == ui.BLUE, "blue again", pump=pump)
                 ground.loop.call_soon_threadsafe(setattr, ground.relay, "keys", {})  # the relay stops answering
                 wait_for(self, lambda: win.lte_led.color == plane_sim.YELLOW, "yellow: no answer from the relay",
                          pump=pump)
