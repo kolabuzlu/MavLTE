@@ -278,9 +278,17 @@ and a key into `mavrelay.ini`, so the app connects without any setup. The demo a
 command line for the text agent.
 
 The plane's "USB port" (SITL `SERIAL0`) is TCP 127.0.0.1:5780, which you can use to set up MAVLink
-signing first, just like over USB on the real flight controller. Add `--server your-server:14650
---vehicle-key <key> --gcs-key <key>` to run the demo through your real relay instead of one on
-the PC.
+signing first, just like over USB on the real flight controller.
+
+**Through your real relay server**, the SITL plane connects exactly as the ESP32 will, and the
+MavLTE app connects to the same server:
+
+```bash
+python sitl_demo.py --server your-server:14650 --no-agent
+```
+
+It takes the vehicle key from the `[vehicle]` section of `mavrelay.ini` (`key = <vehicle key>`)
+or from `--vehicle-key`. Give the MavLTE app the server and the GCS key.
 
 **Real flight controller on USB.** `mavrelay.py vehicle` does in Python what the ESP32 does:
 `python mavrelay.py vehicle --server your-server:14650 --key <vehicle key> --serial COM5:115200`

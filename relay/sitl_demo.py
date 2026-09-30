@@ -9,7 +9,8 @@ One command starts all of it. Then, in Mission Planner, choose UDP, click Connec
 
     python sitl_demo.py                               clean link
     python sitl_demo.py --delay 80 --jitter 30 --loss 3    a mediocre mobile link
-    python sitl_demo.py --server your-server:14650 --vehicle-key ... --gcs-key ...   through your relay
+    python sitl_demo.py --server your-server:14650 --no-agent   through your relay server, for the
+                                  MavLTE app (vehicle key: [vehicle] in mavrelay.ini, or --vehicle-key)
 
 Finds Mission Planner's copy of ArduPlane SITL by itself (or give --sitl). Runs SITL in its own
 folder, so Mission Planner's simulator settings are not touched. Stop with Ctrl+C.
@@ -195,7 +196,8 @@ async def run(args, keys) -> None:
     print("-" * 100)
     print(f" SITL plane -> vehicle (plays the ESP32) -> emulated 4G ({link.describe()}) -> relay -> GCS agent")
     if args.no_agent and args.server:
-        print(f" Start your GCS agent as usual, with relay server {args.server} and your GCS key.")
+        print(f" Open the MavLTE app with relay server {args.server} and your server's GCS key, and switch")
+        print(" UDP or TCP on.")
     elif args.no_agent:
         script = str(Path(mr.__file__).resolve())
         script = f'"{script}"' if " " in script else script
@@ -233,9 +235,11 @@ def main(argv=None) -> None:
     p.add_argument("--no-agent", action="store_true",
                    help="do not start a GCS agent: you run your own (the demo prints the command)")
     p.add_argument("--config", default=str(CONFIG),
-                   help="with --no-agent: settings file whose [gcs] key the local relay uses (default mavrelay.ini)")
+                   help="settings file (default mavrelay.ini): with --server the vehicle key comes from its "
+                        "[vehicle] section; with --no-agent the local relay uses its [gcs] key")
     p.add_argument("--server", help="use your relay server (host:port) instead of one on this PC")
-    p.add_argument("--vehicle-key", help="vehicle key (of your server; default: a new random one)")
+    p.add_argument("--vehicle-key", help="vehicle key (of your server; default: the [vehicle] key in mavrelay.ini "
+                                         "with --server, else a new random one)")
     p.add_argument("--gcs-key", help="GCS key (of your server; default: a new random one)")
     p.add_argument("--relay-port", type=int, default=14650, help="UDP port of the local relay (default 14650)")
     p.add_argument("--udp", default="127.0.0.1:14550", help="where the GCS agent sends MAVLink (default 127.0.0.1:14550)")
@@ -243,8 +247,11 @@ def main(argv=None) -> None:
     p.add_argument("--batch-ms", type=float, default=50.0, help="telemetry batching, like the firmware (default 50)")
     args = p.parse_args(argv)
 
-    if args.server and not args.vehicle_key:
-        p.error("--server needs --vehicle-key")
+    if args.server and not args.vehicle_key:  # the key of the bench-test vehicle in mavrelay.ini
+        conf = mr.load_config(args.config, "vehicle") if Path(args.config).exists() else {}
+        args.vehicle_key = conf.get("key", "").strip()
+        if not args.vehicle_key:
+            p.error(f"--server needs --vehicle-key, or key = ... in the [vehicle] section of {args.config}")
     if args.server and not args.no_agent and not args.gcs_key:
         p.error("--server needs --gcs-key (or --no-agent)")
     handler = logging.StreamHandler()
