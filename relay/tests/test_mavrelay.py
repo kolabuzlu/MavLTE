@@ -3,6 +3,7 @@
 import asyncio
 import os
 import random
+import re
 import socket
 import sys
 import tempfile
@@ -313,6 +314,15 @@ class ConfigTest(unittest.TestCase):
         self.assertTrue(port.allowed("::1"))
         self.assertTrue(port.allowed("::ffff:127.0.0.1"))
         self.assertFalse(port.allowed("203.0.113.9"))
+
+
+class VersionTest(unittest.TestCase):
+    def test_one_version_for_everything(self):
+        # the firmware and the PC and server side always carry the same number
+        path = os.path.join(os.path.dirname(__file__), "..", "..", "firmware", "main", "version.h")
+        with open(path, encoding="utf-8") as f:
+            firmware = re.search(r'#define FIRMWARE_VERSION "([^"]+)"', f.read()).group(1)
+        self.assertEqual(firmware, mr.__version__)
 
 
 class HelloReplayTest(unittest.TestCase):

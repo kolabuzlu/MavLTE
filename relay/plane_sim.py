@@ -662,15 +662,17 @@ class SimWindow:
         m = p.modem
         client = m.client if m is not None else None
         session = client is not None and client.session != 0
-        # the LED, as on the board (README: "The RGB LED")
+        # the LED, as on the board (README: "The RGB LED"): red without mobile data (blinking while it
+        # starts and searches), yellow while the relay does not answer, blue when connected (flashing
+        # while no GCS is connected, so the telemetry is held back)
         if m is None:
             color = ui.LED_OFF
-        elif m.stage != "data":
-            color = YELLOW if blink else ui.LED_OFF
+        elif m.stage != "data" or p.coverage == 0:
+            color = ui.RED if blink else ui.LED_OFF
         elif not session:
-            color = ui.BLUE
+            color = YELLOW
         else:
-            color = ui.GREEN if client.gcs_present or flash else ui.LED_OFF
+            color = ui.BLUE if client.gcs_present or flash else ui.LED_OFF
         self.lte_led.set(color)
 
         if not p.battery:

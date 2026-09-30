@@ -245,13 +245,42 @@ class WindowTest(unittest.TestCase):
                 self.assertEqual(text(win.volts), "12.6 V")
                 wait_for(self, lambda: text(win.lte_values["State"]) == "Connected to the relay", "module connected",
                          pump=root.update)
-                wait_for(self, lambda: win.lte_led.color == ui.GREEN, "steady green: a GCS is there",
+                wait_for(self, lambda: win.lte_led.color == ui.BLUE, "steady blue: a GCS is there",
                          pump=root.update)
                 win.toggle_lte(False)
                 wait_for(self, lambda: text(win.lte_values["State"]) == "Off", "module off", pump=root.update)
                 self.assertEqual(win.lte_led.color, ui.LED_OFF)
         finally:
             win.close()  # also closes the plane; Tk objects go in this thread
+            win = root = None
+            gc.collect()
+
+    def test_led_red_yellow_blue(self):
+        ground = Ground()
+        self.addCleanup(ground.close)
+        plane = plane_sim.Plane(("127.0.0.1", ground.relay_port), KEY_V, fc_port=ground.fc_port)
+        plane.quick = True
+        root = tk.Tk()
+        root.withdraw()
+        win = plane_sim.SimWindow(root, plane)
+        seen = set()
+
+        def pump():
+            root.update()
+            seen.add(win.lte_led.color)
+
+        try:
+            with mock.patch.object(plane_sim, "STARTUP_QUICK", (0.6, 0.3, 0.3)), \
+                    mock.patch.object(mr, "LINK_TIMEOUT", 2.5):
+                win.toggle_lte(True)
+                win.toggle_battery(True)
+                wait_for(self, lambda: ui.RED in seen, "red while there is no mobile data", pump=pump)
+                wait_for(self, lambda: win.lte_led.color == ui.BLUE, "blue once connected", pump=pump)
+                ground.loop.call_soon_threadsafe(setattr, ground.relay, "keys", {})  # the relay stops answering
+                wait_for(self, lambda: win.lte_led.color == plane_sim.YELLOW, "yellow: no answer from the relay",
+                         pump=pump)
+        finally:
+            win.close()
             win = root = None
             gc.collect()
 

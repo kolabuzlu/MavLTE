@@ -139,11 +139,11 @@ Once a minute the bridge logs its counters: relay state, round-trip time, bytes 
 
 | LED | Meaning |
 |---|---|
-| red, blinking | modem, SIM or network problem; the log says which |
-| yellow, blinking | modem starting, searching for the network |
-| blue | mobile data up, relay not answering (yet) |
-| green, flashing | connected to the relay, no GCS connected (telemetry held back) |
-| green | connected to the relay and a GCS is connected |
+| red, blinking | no mobile data yet: modem starting, searching for the network |
+| red | modem, SIM or network problem; the log says which (it tries again by itself) |
+| yellow | mobile data up, but the relay does not answer (yet) |
+| blue, flashing | connected to the relay, no GCS connected (telemetry held back) |
+| blue | connected to the relay and a GCS is connected |
 
 ## 3. Wiring and power
 
@@ -363,6 +363,10 @@ cd firmware/test/host && make test                      # C core: SHA-256/HMAC, 
 
 On Linux, macOS or WSL the relay tests also build `firmware/test/host/tunnel_harness` and run the
 firmware's C tunnel code against the Python relay, including a relay restart.
+
+**One version number for everything:** the firmware (`firmware/main/version.h`) and the app,
+simulator and relay (`__version__` in `relay/mavrelay.py`) always carry the same number; a test
+fails if they differ.
 
 **MavLTE.exe** (on Windows, with `pip install pyinstaller`):
 

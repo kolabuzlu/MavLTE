@@ -28,13 +28,13 @@ static void status_task(void *arg)
         bridge_state_t link = bridge_state();
         uint8_t r = 0, g = 0, b = 0;
         if (modem_state == STATUS_MODEM_ERROR) {
-            r = blink ? LEVEL : 0;
+            r = LEVEL; /* red: modem, SIM or network problem */
         } else if (modem_state == STATUS_MODEM_STARTING) {
-            r = g = blink ? LEVEL : 0;
+            r = blink ? LEVEL : 0; /* red, blinking: no mobile data yet */
         } else if (!link.relay) {
-            b = LEVEL;
+            r = g = LEVEL; /* yellow: mobile data up, but the relay does not answer */
         } else {
-            g = link.gcs || flash ? LEVEL : 0;
+            b = link.gcs || flash ? LEVEL : 0; /* blue: connected; flashing while no GCS is connected */
         }
         uint32_t color = (uint32_t)r << 16 | (uint32_t)g << 8 | b;
         if (color != shown) {
