@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """MavLTE: the GCS agent as a window.
 
-Gives Mission Planner (or QGroundControl) a TCP and a UDP port, each with its own switch; the LED
-next to a switch lights up while the aircraft is online. Both switches start off. Switching
-both off again also disconnects from the relay, so the aircraft stops sending telemetry.
+Gives Mission Planner (or QGroundControl) a TCP and a UDP port, each with its own switch. Two LEDs
+on each: Available (green, left) while the aircraft's LTE module is online at the relay, whatever
+the switches; Connected (blue, next to the switch) while it is online and that port is on. Both
+switches start off. With both off the app only watches: the aircraft holds its telemetry back.
 
     python mavlte.py            (or double-click MavLTE.pyw, or run MavLTE.exe: build_release.py)
 
@@ -62,6 +63,7 @@ DIM = "#7d8ea0"
 ACCENT = "#5ccf5c"  # MavGreen
 ON_ACCENT = "#04210f"
 GREEN = "#5ccf5c"
+BLUE = "#4d9bff"
 AMBER = "#d8a23a"
 RED = "#ff5555"
 LED_OFF = "#3a3b3e"
@@ -284,8 +286,10 @@ class ChannelCard(tk.Frame):
         s, pad = app.scale, round(8 * app.scale)
         top = tk.Frame(self, bg=SURFACE)
         top.pack(fill="x", padx=pad, pady=(pad, round(2 * s)))
-        self.led = Led(top, s, SURFACE)
-        self.led.pack(side="left")
+        self.available = Led(top, s, SURFACE)  # the aircraft's LTE module is online, switch or not
+        self.available.pack(side="left")
+        self.led = Led(top, s, SURFACE)  # connected: online, and this port is on
+        self.led.pack(side="left", padx=(round(4 * s), 0))
         self.switch = Switch(top, s, SURFACE, lambda on: app.toggle(self, on))
         self.switch.pack(side="left", padx=(round(6 * s), round(8 * s)))
         self.title = tk.Label(top, text=app.settings.name, bg=SURFACE, fg=TEXT, font=app.font_bold)
@@ -451,6 +455,7 @@ class App:
         setup_style(root)
         self._build()
         dark_title_bar(root)
+        self._connect()
         self.poll()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.report_callback_exception = self._report
@@ -550,35 +555,40 @@ class App:
 
     # -- actions
 
+    def _connect(self) -> bool:
+        """Connects to the relay as soon as there are settings. With both switches off the agent
+        only watches, so the Available LEDs work while the aircraft holds its telemetry back."""
+        if self.runner.running:
+            return True
+        try:
+            server = mr.parse_hostport(self.settings.server)
+            key = mr.parse_key(self.settings.key)
+        except ValueError:
+            return False
+        self.runner.start(server, key)
+        return True
+
     def toggle(self, card: ChannelCard, on: bool) -> None:
         if not on:
             if self.runner.running:
                 self.runner.set_output(card.kind, None)
             card.set_on(False)
             card.show("Off")
-            if not (self.tcp_card.switch.on or self.udp_card.switch.on) and self.runner.running:
-                self.runner.stop()  # nothing to feed: the aircraft may stop sending telemetry
-                log.info("both ports off: disconnected from the relay")
+            if not (self.tcp_card.switch.on or self.udp_card.switch.on):
+                log.info("both ports off: only watching, the aircraft holds its telemetry back")
             return
         try:
             address = card.address()
         except ValueError as exc:
             card.show(str(exc), RED)
             return
-        if not self.runner.running:
-            try:
-                server = mr.parse_hostport(self.settings.server)
-                key = mr.parse_key(self.settings.key)
-            except ValueError:
-                card.show("Set the relay server and GCS key first (☰ → Settings).", RED)
-                self.open_settings()
-                return
-            self.runner.start(server, key)
+        if not self._connect():
+            card.show("Set the relay server and GCS key first (☰ → Settings).", RED)
+            self.open_settings()
+            return
         error = self.runner.set_output(card.kind, address)
         if error:
             card.show(error, RED)
-            if not (self.tcp_card.switch.on or self.udp_card.switch.on):
-                self.runner.stop()
             return
         card.set_on(True)
         self._remember()
@@ -595,11 +605,13 @@ class App:
         self.settings.name, self.settings.server, self.settings.key = name, server, key
         self._update_server_label()
         self._remember()
-        if changed and self.runner.running:  # reconnect with the new server or key
+        if changed:  # reconnect with the new server or key
             cards = [card for card in (self.tcp_card, self.udp_card) if card.switch.on]
-            self.runner.stop()
+            if self.runner.running:
+                self.runner.stop()
             for card in cards:
                 card.set_on(False)
+            self._connect()
             for card in cards:
                 self.toggle(card, True)
 
@@ -636,7 +648,7 @@ class App:
         status = None
         if agent is None:
             self.relay_led.set(LED_OFF)
-            self._set(self.relay_text, "Off: switch on TCP or UDP to connect")
+            self._set(self.relay_text, "Not connected: set the relay server and key (☰ → Settings)")
         else:
             client = agent.client
             if client.session:
@@ -654,8 +666,9 @@ class App:
         bars = self._bars(status) if online else None
 
         for card in (self.tcp_card, self.udp_card):
-            card.led.set(GREEN if card.switch.on and online else LED_OFF)
-            card.bars.set(bars if card.switch.on else None)
+            card.available.set(GREEN if online else LED_OFF)
+            card.led.set(BLUE if card.switch.on and online else LED_OFF)
+            card.bars.set(bars)
         if agent is not None:
             if self.tcp_card.switch.on and agent.tcp is not None:
                 n = len(agent.tcp.clients)
@@ -698,7 +711,7 @@ class App:
             self._set(self.craft_state, "Waiting for news from the relay…")
         elif status.online:
             self.craft_led.set(GREEN)
-            self._set(self.craft_state, "Online")
+            self._set(self.craft_state, "Available: switch TCP or UDP on" if agent.watching else "Online")
         elif status.idle_ms == mr.U16_UNKNOWN:
             self.craft_led.set(LED_OFF)
             self._set(self.craft_state, "Not connected to the relay (yet)")

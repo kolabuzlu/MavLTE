@@ -67,7 +67,6 @@ PLANE_MODES = {0: "MANUAL", 1: "CIRCLE", 2: "STABILIZE", 3: "TRAINING", 4: "ACRO
                22: "QAUTOTUNE", 23: "QACRO", 24: "THERMAL", 25: "LOITER2QLAND", 26: "AUTOLAND"}
 
 YELLOW = "#e6c84a"
-BLUE = "#4d9bff"
 
 log = logging.getLogger("mavrelay.plane")
 
@@ -662,7 +661,7 @@ class SimWindow:
         elif m.stage != "data":
             color = YELLOW if blink else ui.LED_OFF
         elif not session:
-            color = BLUE
+            color = ui.BLUE
         else:
             color = ui.GREEN if client.gcs_present or flash else ui.LED_OFF
         self.lte_led.set(color)

@@ -50,6 +50,7 @@ class GuiTest(unittest.TestCase):
         self.thread.start()
         self.relay = mr.RelayServer({mr.ROLE_VEHICLE: KEY_V, mr.ROLE_GCS: KEY_G})
         self.vehicle_inbox = []
+        self.vehicle_quiet = False
 
         async def start():
             transport, _ = await self.loop.create_datagram_endpoint(lambda: self.relay,
@@ -57,7 +58,7 @@ class GuiTest(unittest.TestCase):
             port = transport.get_extra_info("sockname")[1]
             self.vehicle = mr.TunnelClient(mr.ROLE_VEHICLE, KEY_V, "127.0.0.1", port,
                                            on_data=self.vehicle_inbox.append)
-            asyncio.ensure_future(self.vehicle.run())
+            self.vehicle_task = asyncio.ensure_future(self.vehicle.run())
 
             async def ticks():
                 seq = 0
@@ -65,7 +66,8 @@ class GuiTest(unittest.TestCase):
                     await asyncio.sleep(0.1)
                     self.relay.tick(time.monotonic())
                     seq += 1
-                    self.vehicle.send_data(v2_frame(0, bytes(9), seq))  # 10 heartbeats a second
+                    if not self.vehicle_quiet:
+                        self.vehicle.send_data(v2_frame(0, bytes(9), seq))  # 10 heartbeats a second
 
             asyncio.ensure_future(ticks())
             return port
@@ -121,9 +123,15 @@ class GuiTest(unittest.TestCase):
 
     def test_switches_leds_and_traffic(self):
         app = self.app
-        self.pump(lambda: self.text(app.relay_text).startswith("Off"), what="initial state")
-        self.assertFalse(app.runner.running)
+        # both switches off: connected, but only watching
+        self.pump(lambda: self.text(app.relay_text).startswith("Connected to the relay"), what="watching")
+        self.assertTrue(app.runner.agent.watching)
+        self.pump(lambda: app.udp_card.available.color == mavlte.GREEN, what="Available LED")
+        self.assertEqual(app.tcp_card.available.color, mavlte.GREEN)
         self.assertEqual(app.udp_card.led.color, mavlte.LED_OFF)
+        self.pump(lambda: self.text(app.craft_state) == "Available: switch TCP or UDP on", what="aircraft available")
+        self.pump(lambda: not self.vehicle.gcs_present, what="aircraft told there is no GCS")
+        self.assertEqual(app.runner.agent.to_gcs_bytes, 0)  # the relay sends a watcher no telemetry
 
         mp_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # plays Mission Planner on UDP
         mp_udp.bind(("127.0.0.1", self.udp_port))
@@ -131,11 +139,11 @@ class GuiTest(unittest.TestCase):
         self.addCleanup(mp_udp.close)
 
         app.toggle(app.udp_card, True)
-        self.assertTrue(app.udp_card.switch.on and app.runner.running)
+        self.assertTrue(app.udp_card.switch.on and not app.runner.agent.watching)
         self.assertEqual(str(app.udp_card.entries[1].cget("state")), "disabled")  # no editing while on
-        self.pump(lambda: self.text(app.relay_text).startswith("Connected to the relay"), what="relay connected")
-        self.pump(lambda: app.udp_card.led.color == mavlte.GREEN, what="UDP LED green")
+        self.pump(lambda: app.udp_card.led.color == mavlte.BLUE, what="UDP Connected LED blue")
         self.assertEqual(self.text(app.craft_state), "Online")
+        self.pump(lambda: self.vehicle.gcs_present, what="aircraft told a GCS is there")
         self.assertEqual(app.tcp_card.led.color, mavlte.LED_OFF)  # switched off: stays dark
 
         data, agent_addr = mp_udp.recvfrom(4096)
@@ -150,17 +158,20 @@ class GuiTest(unittest.TestCase):
         self.addCleanup(mp_tcp.close)
         self.pump(lambda: self.text(app.tcp_card.status) == "1 GCS connected", what="TCP client counted")
         self.assertEqual(mp_tcp.recv(100)[:1], b"\xfd")
-        self.pump(lambda: app.tcp_card.led.color == mavlte.GREEN, what="TCP LED green")
+        self.pump(lambda: app.tcp_card.led.color == mavlte.BLUE, what="TCP Connected LED blue")
 
         app.toggle(app.udp_card, False)
-        self.assertTrue(app.runner.running)  # TCP still on
+        self.assertFalse(app.runner.agent.watching)  # TCP still on
         self.pump(lambda: app.udp_card.led.color == mavlte.LED_OFF, what="UDP LED off")
         self.assertEqual(self.text(app.udp_card.status), "Off")
+        self.assertEqual(app.udp_card.available.color, mavlte.GREEN)
 
-        app.toggle(app.tcp_card, False)  # both off: disconnect from the relay
-        self.assertFalse(app.runner.running)
-        self.pump(lambda: self.text(app.relay_text).startswith("Off"), what="off again")
-        self.assertEqual(self.text(app.craft_state), "Not connected to the relay")
+        app.toggle(app.tcp_card, False)  # both off: only watching again
+        self.assertTrue(app.runner.agent.watching)
+        self.pump(lambda: self.text(app.craft_state) == "Available: switch TCP or UDP on", what="watching again")
+        self.pump(lambda: not self.vehicle.gcs_present, what="aircraft holds its telemetry back again")
+        self.assertEqual(app.tcp_card.led.color, mavlte.LED_OFF)
+        self.assertEqual(app.tcp_card.available.color, mavlte.GREEN)
 
         saved = mavlte.Settings.load(self.config)
         self.assertEqual((saved.name, saved.key), ("Test UAV", KEY_G.hex()))
@@ -180,22 +191,31 @@ class GuiTest(unittest.TestCase):
         app.toggle(app.tcp_card, True)
         self.assertFalse(app.tcp_card.switch.on)
         self.assertIn("in use", self.text(app.tcp_card.status))
-        self.assertFalse(app.runner.running)
+        self.assertTrue(app.runner.agent.watching)  # still only watching
         app.tcp_card.port.set("99999")
         app.toggle(app.tcp_card, True)
         self.assertIn("1 to 65535", self.text(app.tcp_card.status))
 
     def test_starts_with_both_switches_off(self):
         # even though the settings file (from an earlier version) says they were on
-        self.pump(lambda: self.text(self.app.relay_text).startswith("Off"), what="initial state")
+        self.pump(lambda: self.text(self.app.relay_text).startswith("Connected to the relay"), what="initial state")
         self.assertFalse(self.app.tcp_card.switch.on or self.app.udp_card.switch.on)
-        self.assertFalse(self.app.runner.running)
+        self.assertTrue(self.app.runner.agent.watching)
         self.assertEqual(self.app.root.title(), "MavLTE")
+
+    def test_available_led_follows_the_aircraft(self):
+        app = self.app
+        self.pump(lambda: app.udp_card.available.color == mavlte.GREEN, what="available")
+        self.relay.ONLINE_TIMEOUT = 0.5  # quicker than the real 3 s
+        self.vehicle_quiet = True
+        self.loop.call_soon_threadsafe(self.vehicle_task.cancel)  # the LTE module loses power
+        self.pump(lambda: app.udp_card.available.color == mavlte.LED_OFF, what="dark once the aircraft is quiet")
+        self.assertEqual(app.tcp_card.available.color, mavlte.LED_OFF)
+        self.pump(lambda: self.text(app.craft_state).startswith("Offline"), what="aircraft offline")
 
     def test_wrong_key_says_no_answer(self):
         app = self.app
-        app.settings.key = KEY_V.hex()  # not the GCS key: the relay stays silent
-        app.toggle(app.udp_card, True)
+        app.apply_settings(app.settings.name, app.settings.server, KEY_V.hex())  # not the GCS key: no answer
         self.pump(lambda: self.text(app.relay_text).startswith("No answer from the relay"), timeout=10,
                   what="no-answer message")
 

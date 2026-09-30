@@ -32,7 +32,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -63,6 +63,7 @@ U16_UNKNOWN = 0xFFFF
 RSSI_UNKNOWN = 0x7FFF
 RAT_UNKNOWN = 0xFF
 PONG_GCS_PRESENT = 0x01
+PING_FLAG_WATCHING = 0x01  # GCS agent: only watching the vehicle's link, send it STATUS but no telemetry
 STATUS_VEHICLE_ONLINE = 0x01
 REJECT_UNKNOWN_SESSION = 1
 NO_VEHICLE_STATUS = STATUS_BODY.pack(0, RAT_UNKNOWN, U16_UNKNOWN, U16_UNKNOWN, U16_UNKNOWN, RSSI_UNKNOWN, U16_UNKNOWN)
@@ -354,6 +355,7 @@ class Session:
         self.addr = addr
         self.info = info
         self.active = False
+        self.watching = False  # a GCS agent with no GCS software attached (PING_FLAG_WATCHING)
         self.created = now
         self.last_rx = now
         self.tx_seq = 0
@@ -456,7 +458,8 @@ class RelayServer(asyncio.DatagramProtocol):
 
     def _from_vehicle(self, payload: bytes) -> None:
         for sess in self.gcs_sessions():
-            self._send(sess, DATA, payload)
+            if not sess.watching:
+                self._send(sess, DATA, payload)
         if self.tcp is not None:
             self.tcp.broadcast(payload)
 
@@ -466,7 +469,7 @@ class RelayServer(asyncio.DatagramProtocol):
     def gcs_present(self, now: float) -> bool:
         if self.tcp is not None and self.tcp.clients:
             return True
-        return any(now - s.last_rx < self.GCS_PRESENT_TIMEOUT for s in self.gcs_sessions())
+        return any(now - s.last_rx < self.GCS_PRESENT_TIMEOUT for s in self.gcs_sessions() if not s.watching)
 
     def _send(self, sess: Session, ptype: int, body: bytes) -> None:
         if sess.tx_seq >= 0xFFFFFFFF:  # sequence numbers used up: the client will get REJECT and start over
@@ -518,7 +521,11 @@ class RelayServer(asyncio.DatagramProtocol):
         if len(body) < 4:
             return
         if len(body) >= PING_BODY.size:
-            _, sess.rtt_ms, sess.peer_loss, sess.rssi_dbm, sess.rat, _ = PING_BODY.unpack_from(body)
+            _, sess.rtt_ms, sess.peer_loss, sess.rssi_dbm, sess.rat, ping_flags = PING_BODY.unpack_from(body)
+            watching = sess.role == ROLE_GCS and bool(ping_flags & PING_FLAG_WATCHING)
+            if watching != sess.watching:
+                sess.watching = watching
+                slog.info("%s %s", sess.describe(), "is only watching" if watching else "wants telemetry")
         flags = PONG_GCS_PRESENT if self.gcs_present(time.monotonic()) else 0
         self._send(sess, PONG, body[:4] + bytes([flags]))
 
@@ -591,7 +598,9 @@ class RelayServer(asyncio.DatagramProtocol):
         )
         tcp = len(self.tcp.clients) if self.tcp is not None else 0
         extra = ", ".join(f"{k} {n}" for k, n in sorted(self.counters.items()))
-        return f"status: {vs}; {len(self.gcs_sessions())} GCS agent(s), {tcp} TCP client(s)" + (
+        gcs = self.gcs_sessions()
+        watching = sum(s.watching for s in gcs)
+        return f"status: {vs}; {len(gcs)} GCS agent(s) ({watching} only watching), {tcp} TCP client(s)" + (
             f"; {extra}" if extra else ""
         )
 
@@ -681,6 +690,7 @@ class TunnelClient(asyncio.DatagramProtocol):
         self.on_status = on_status
         self.info = info.encode()[:INFO_MAX]
         self.radio = radio  # returns (rssi_dbm, rat) for PINGs
+        self.ping_flags = 0  # PING_FLAG_*
         self.transport: Optional[asyncio.DatagramTransport] = None
         self.server_addr = None
         self.session = 0
@@ -779,10 +789,17 @@ class TunnelClient(asyncio.DatagramProtocol):
         except OSError as exc:
             self.log.debug("send failed: %s", exc)
 
+    def ping_now(self) -> None:
+        """PINGs at once instead of within the second, e.g. so the server learns new ping_flags."""
+        if self.session:
+            self.last_ping = time.monotonic()
+            self._send_ping()
+
     def _send_ping(self) -> None:
         rssi, rat = self.radio() if self.radio else (RSSI_UNKNOWN, RAT_UNKNOWN)
         loss = self.loss.permille()
-        body = PING_BODY.pack(mono_ms(), self.rtt_ms, U16_UNKNOWN if loss is None else loss, rssi, rat, 0)
+        body = PING_BODY.pack(mono_ms(), self.rtt_ms, U16_UNKNOWN if loss is None else loss, rssi, rat,
+                              self.ping_flags)
         self._send(PING, body)
 
     def _drop_session(self) -> None:
@@ -1076,7 +1093,9 @@ def is_loopback(host: str) -> bool:
 class GcsAgent:
     """The GCS agent: a session with the relay, plus a UDP and a TCP port for GCS software.
 
-    The two ports can be switched on and off while the agent runs (gcs_gui.py does that).
+    The two ports can be switched on and off while the agent runs (the MavLTE app does that).
+    With neither on, the agent only watches: the relay keeps it posted on the aircraft's link
+    but does not count it as a GCS, so the aircraft holds its telemetry back.
     """
 
     STATUS_FRESH = 3.0  # seconds a STATUS from the relay stays valid
@@ -1084,6 +1103,7 @@ class GcsAgent:
     def __init__(self, server: Tuple[str, int], key: bytes, on_status=None, info: Optional[str] = None) -> None:
         self.client = TunnelClient(ROLE_GCS, key, server[0], server[1], on_data=self._to_gcs,
                                    on_status=self._got_status, info=info or f"mavlte-agent/{__version__}")
+        self.client.ping_flags = PING_FLAG_WATCHING  # until a port is on
         self.on_status = on_status
         self.status: Optional[LinkStatus] = None
         self.status_time = 0.0
@@ -1091,6 +1111,16 @@ class GcsAgent:
         self.tcp: Optional[LocalTcp] = None
         self.to_gcs_bytes = 0  # MAVLink from the aircraft, handed to GCS software
         self.from_gcs_bytes = 0  # MAVLink from GCS software, sent to the aircraft
+
+    @property
+    def watching(self) -> bool:
+        return bool(self.client.ping_flags & PING_FLAG_WATCHING)
+
+    def _update_watching(self) -> None:
+        flags = PING_FLAG_WATCHING if self.udp is None and self.tcp is None else 0
+        if flags != self.client.ping_flags:
+            self.client.ping_flags = flags
+            self.client.ping_now()  # telemetry starts (or stops) within a second, not two
 
     def vehicle_status(self) -> Optional[LinkStatus]:
         """The aircraft's link as last reported by the relay, or None if that is not recent."""
@@ -1115,44 +1145,62 @@ class GcsAgent:
         self.client.send_data(chunk)
 
     async def start_udp(self, target: Tuple[str, int]) -> None:
-        self.stop_udp()
+        self._close_udp()
         host = target[0] or "127.0.0.1"
         udp = LocalUdp((host, target[1]), self._from_gcs)
-        await asyncio.get_running_loop().create_datagram_endpoint(
-            lambda: udp, local_addr=("127.0.0.1" if is_loopback(host) else "0.0.0.0", 0))
-        self.udp = udp
+        try:
+            await asyncio.get_running_loop().create_datagram_endpoint(
+                lambda: udp, local_addr=("127.0.0.1" if is_loopback(host) else "0.0.0.0", 0))
+            self.udp = udp
+        finally:
+            self._update_watching()
         glog.info("sending MAVLink to udp %s (Mission Planner: connect UDP, port %d)", fmt_addr((host, target[1])),
                   target[1])
 
     def stop_udp(self) -> None:
-        if self.udp is not None:
-            self.udp.close()
-            self.udp = None
-            glog.info("UDP port off")
+        if self._close_udp():
+            self._update_watching()
+
+    def _close_udp(self) -> bool:
+        if self.udp is None:
+            return False
+        self.udp.close()
+        self.udp = None
+        glog.info("UDP port off")
+        return True
 
     async def start_tcp(self, bind: Tuple[str, int]) -> None:
         """Raises OSError if the port is taken."""
-        self.stop_tcp()
+        self._close_tcp()
         host = bind[0] or "127.0.0.1"
         tcp = LocalTcp(self._from_gcs)
-        await tcp.start(host, bind[1])
-        self.tcp = tcp
+        try:
+            await tcp.start(host, bind[1])
+            self.tcp = tcp
+        finally:
+            self._update_watching()
         glog.info("listening on tcp %s (Mission Planner: connect TCP, %s, port %d)", fmt_addr((host, bind[1])),
                   "127.0.0.1" if host in ("0.0.0.0", "::") else host, bind[1])
 
     def stop_tcp(self) -> None:
-        if self.tcp is not None:
-            self.tcp.stop()
-            self.tcp = None
-            glog.info("TCP port off")
+        if self._close_tcp():
+            self._update_watching()
+
+    def _close_tcp(self) -> bool:
+        if self.tcp is None:
+            return False
+        self.tcp.stop()
+        self.tcp = None
+        glog.info("TCP port off")
+        return True
 
     async def run(self) -> None:
         glog.info("connecting to relay %s:%d", self.client.host, self.client.port)
         try:
             await self.client.run()
         finally:
-            self.stop_udp()
-            self.stop_tcp()
+            self._close_udp()
+            self._close_tcp()
 
 
 async def run_gcs(opts) -> None:

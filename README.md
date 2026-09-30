@@ -221,12 +221,15 @@ server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
 
 - Switch **UDP** on to send to Mission Planner on 127.0.0.1:14550, and/or **TCP** to listen on
   127.0.0.1:5760. Change a port while its switch is off.
-- The **LED** next to each switch lights green while the aircraft is online; the bars show its
-  4G signal. The header shows the link to the relay, the *Aircraft* panel signal, round trip,
-  packet loss and traffic, and ☰ → Show log the details.
+- Each card has two **LEDs**. **Available** (green, on the left) lights while the aircraft's LTE
+  module is online at the relay, even with the switches off. **Connected** (blue, next to the
+  switch) lights while it is online and that port is on. The bars show its 4G signal. The
+  header shows the link to the relay, the *Aircraft* panel signal, round trip, packet loss and
+  traffic, and ☰ → Show log the details.
 - In Mission Planner pick **UDP**, port **14550**, or **TCP**, host **127.0.0.1**, port **5760**.
   QGroundControl finds UDP 14550 by itself.
-- Switching both off also disconnects from the relay, so the aircraft stops sending telemetry.
+- With both switches off the app only watches: the Available LEDs keep working, but the aircraft
+  holds its telemetry back, so it uses almost no mobile data.
 
 The app keeps its settings in the `[gcs]` section of `mavrelay.ini`: `MavLTE.exe` in
 `%LOCALAPPDATA%\MavLTE\mavrelay.ini` (or in a `mavrelay.ini` next to the exe, if you put one

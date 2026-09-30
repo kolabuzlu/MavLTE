@@ -373,6 +373,40 @@ class LiveTest(unittest.IsolatedAsyncioTestCase):
         # the vehicle reports its round-trip time in the PING after it first measured it
         await self.until(lambda: any(s.online and s.rtt_ms < 1000 and s.up_loss == 0 for s in gcs.status))
 
+    async def test_watching_gcs_gets_status_but_no_telemetry(self):
+        vehicle, gcs = await self.connected_pair()
+        await self.until(lambda: vehicle.gcs_present)
+        gcs.ping_flags = mr.PING_FLAG_WATCHING
+        gcs.ping_now()
+        await self.until(lambda: self.relay.gcs_sessions()[0].watching)
+        await self.until(lambda: not vehicle.gcs_present)  # a watcher is not a GCS for the vehicle
+        vehicle.send_data(v2_frame(0, bytes(9), 1))
+        await self.until(lambda: any(s.online for s in gcs.status))  # it is still told about the vehicle
+        await asyncio.sleep(0.3)
+        self.assertEqual(gcs.inbox, [])  # but gets none of its telemetry
+        gcs.ping_flags = 0
+        gcs.ping_now()
+        await self.until(lambda: vehicle.gcs_present)
+        vehicle.send_data(v2_frame(0, bytes(9), 2))
+        await self.until(lambda: gcs.inbox == [v2_frame(0, bytes(9), 2)])
+
+    async def test_agent_only_watches_without_ports(self):
+        vehicle = self.client(mr.ROLE_VEHICLE)
+        agent = mr.GcsAgent(("127.0.0.1", self.port), KEY_G)
+        self.tasks.append(asyncio.ensure_future(agent.run()))
+        self.assertTrue(agent.watching)
+        await self.until(lambda: agent.vehicle_status() is not None and agent.vehicle_status().online)
+        await self.until(lambda: not vehicle.gcs_present)
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.bind(("127.0.0.1", 0))
+        self.addCleanup(probe.close)
+        await agent.start_udp(probe.getsockname())
+        self.assertFalse(agent.watching)
+        await self.until(lambda: vehicle.gcs_present)
+        agent.stop_udp()
+        self.assertTrue(agent.watching)
+        await self.until(lambda: not vehicle.gcs_present)
+
     async def test_forged_and_replayed_packets_are_ignored(self):
         vehicle, gcs = await self.connected_pair()
         probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

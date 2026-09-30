@@ -37,7 +37,7 @@ corrupts the frames around it.
 | 1    | HELLO   | C → S | 0 / 0 | nonce (8 bytes), then optional UTF-8 info text (≤ 64 bytes) |
 | 2    | WELCOME | S → C | new session / 0 | the 8-byte nonce from the HELLO |
 | 3    | DATA    | C ↔ S | session / seq | MAVLink bytes (whole frames), ≤ 1172 bytes |
-| 4    | PING    | C → S | session / seq | `t_ms u32, rtt_ms u16, rx_loss_permille u16, rssi_dbm i16, rat u8, reserved u8` |
+| 4    | PING    | C → S | session / seq | `t_ms u32, rtt_ms u16, rx_loss_permille u16, rssi_dbm i16, rat u8, flags u8` (bit 0, GCS only: watching) |
 | 5    | PONG    | S → C | session / seq | `t_ms u32` (echo), `flags u8` (bit 0: a GCS is connected) |
 | 6    | REJECT  | S → C | the rejected session / 0 | `reason u8` (1 = unknown or expired session) |
 | 7    | STATUS  | S → GCS | session / seq | `flags u8, rat u8, rtt_ms u16, up_loss_permille u16, down_loss_permille u16, rssi_dbm i16, idle_ms u16` |
@@ -92,6 +92,11 @@ to the client's current nonce and REJECT to the client's current session.
   carrier NAT mapping alive.
 - The vehicle reports its measured round-trip time, downlink loss and modem signal in PING.
   The server passes these on to GCS agents in STATUS once a second.
+- A GCS agent with no GCS software attached sets PING flag bit 0 (*watching*). The server
+  still sends it STATUS, so it can show whether the vehicle is available, but sends it no DATA
+  and does not count it as a connected GCS for the PONG flag, so the vehicle keeps its
+  telemetry back. The flag holds until the agent's next PING; agents PING at once when it
+  changes. Vehicles send 0; servers that predate the flag treat a watcher as a GCS.
 
 ## Not provided
 
