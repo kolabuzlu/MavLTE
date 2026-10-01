@@ -208,7 +208,7 @@ uint32_t gnss_unix_time(int year, int month, int day, int hour, int minute, int 
 }
 
 void locator_pack(uint8_t *out, const gnss_fix_t *fix, uint8_t flags, uint16_t fc_silent_s, uint16_t battery_mv,
-                  uint8_t battery_pct)
+                  uint8_t battery_pct, int8_t chip_c)
 {
     gnss_fix_t none;
     if (!fix) {
@@ -229,4 +229,5 @@ void locator_pack(uint8_t *out, const gnss_fix_t *fix, uint8_t flags, uint16_t f
     put_u16(out + 27, battery_mv);
     out[29] = battery_pct;
     put_u32(out + 30, 0); /* time: the relay's clock */
+    out[34] = (uint8_t)chip_c;
 }

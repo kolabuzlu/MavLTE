@@ -148,6 +148,7 @@ class CVehicleTest(unittest.IsolatedAsyncioTestCase):
         pos = agent.last_fix
         self.assertEqual((pos.lat, pos.lon, pos.sats, pos.fix), (411234567, 289876543, 11, mr.FIX_3D))
         self.assertEqual((pos.alt, pos.hdop, pos.fc_silent, pos.gnss_time), (150_500, 90, 42, 1790769600))
+        self.assertEqual(pos.temp, 41)  # the harness's chip
         self.assertTrue(pos.fc_is_silent)
 
         out, err = await asyncio.wait_for(proc.communicate(), 15)

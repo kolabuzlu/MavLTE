@@ -964,12 +964,15 @@ static void test_locator_packet(void)
     uint8_t body[LOCATOR_BODY_LEN], expect[LOCATOR_BODY_LEN];
     gnss_fix_t f = {.time = 1790841600u, .lat = 411234567, .lon = -289876543, .alt_mm = 150500, .speed = 632,
                     .course = 4560, .hdop = 90, .sats = 14, .fix = GNSS_FIX_3D};
-    locator_pack(body, &f, LOCATOR_FC_SILENT, 42, 3950, 78);
-    CHECK(unhex("0013be6a07f18218c1d5b8eee44b02007802d0115a000e03012a006e0f4e00000000", expect) == sizeof(expect));
+    locator_pack(body, &f, LOCATOR_FC_SILENT, 42, 3950, 78, 47);
+    CHECK(unhex("0013be6a07f18218c1d5b8eee44b02007802d0115a000e03012a006e0f4e000000002f", expect) == sizeof(expect));
     CHECK(memcmp(body, expect, sizeof(body)) == 0);
-    locator_pack(body, NULL, LOCATOR_NO_GNSS, LOCATOR_U16_UNKNOWN, LOCATOR_U16_UNKNOWN, LOCATOR_BATTERY_UNKNOWN);
-    unhex("00000000000000800000008000000080ffffffffffff000002ffffffffff00000000", expect);
+    locator_pack(body, NULL, LOCATOR_NO_GNSS, LOCATOR_U16_UNKNOWN, LOCATOR_U16_UNKNOWN, LOCATOR_BATTERY_UNKNOWN,
+                 LOCATOR_TEMP_UNKNOWN);
+    unhex("00000000000000800000008000000080ffffffffffff000002ffffffffff0000000080", expect);
     CHECK(memcmp(body, expect, sizeof(body)) == 0);
+    locator_pack(body, NULL, 0, 0, 0, 0, -5); /* below freezing */
+    CHECK(body[34] == 0xFB);
 }
 
 int main(void)

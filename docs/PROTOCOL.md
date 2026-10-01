@@ -46,7 +46,7 @@ corrupts the frames around it.
 | 10   | SNAP_DATA | V → S → GCS | session / seq | `photo_id u32, chunk u16`, then the chunk (1024 bytes, the last one shorter) |
 | 11   | SNAP_ACK  | GCS → S → V | session / seq | `photo_id u32, flags u8` (bit 0: all there, bit 1: have the SNAP_INFO), then a bitmap of the chunks received |
 | 12   | SNAP_SYNC | GCS → S | session / seq | `newest_photo_id u32` |
-| 13   | POSITION  | V → S → GCS | session / seq | `gnss_time u32, lat i32, lon i32, alt_mm i32, speed_cms u16, course_cdeg u16, hdop u16, sats u8, fix u8, flags u8, fc_silent_s u16, battery_mv u16, battery_pct u8, time u32` (see [Locator](#locator)) |
+| 13   | POSITION  | V → S → GCS | session / seq | `gnss_time u32, lat i32, lon i32, alt_mm i32, speed_cms u16, course_cdeg u16, hdop u16, sats u8, fix u8, flags u8, fc_silent_s u16, battery_mv u16, battery_pct u8, time u32, chip_c i8` (see [Locator](#locator)) |
 
 Unknown values are `0xFFFF` for u16 fields, `0x7FFF` for `rssi_dbm` and `0xFF` for `rat`.
 `rat` uses the 3GPP TS 27.007 access technology numbers (0 GSM, 3 EDGE, 7 LTE, ...).
@@ -167,7 +167,12 @@ the module has power.
   `0xFFFF`). `flags` bit 0: the flight controller has sent nothing for 10 s or more; bit 1: the
   module cannot read its GNSS. `fc_silent_s` is the time since the flight controller last sent
   anything (`0xFFFF`: nothing since the module started). The module's battery: millivolts and
-  percent (`0xFFFF`, `0xFF` unknown). `time` is 0.
+  percent (`0xFFFF`, `0xFF` unknown). `time` is 0. `chip_c` is the temperature of the module's
+  ESP32-S3, from its own sensor, in °C (`-128` unknown). It reads warmer than the air around
+  the board; MavLTE shows it in amber from 70 °C and in red from 80 °C.
+- Before version 1.4.0 the body ended after `time` (34 bytes). Each side reads the fields it
+  knows and ignores any that follow, so both lengths work everywhere: a 34-byte body has no
+  temperature.
 - The server sets `time` to its unix time and passes the POSITION on to every active GCS
   session, watching ones too. It keeps the last POSITION with a fix (on disk, so that it
   survives a restart) and sends it to each GCS session when that becomes active: an agent that

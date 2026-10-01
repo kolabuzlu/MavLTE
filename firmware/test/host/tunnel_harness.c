@@ -183,7 +183,7 @@ int main(int argc, char **argv)
             gnss_parse("+CGNSSINFO: 3,06,03,02,4107.407402,N,02859.259258,E,300926,120000.0,150.5,0.0,0.0,1.2,0.9,0.8",
                        &fix);
             last_position = now;
-            locator_pack(body, &fix, LOCATOR_FC_SILENT, 42, LOCATOR_U16_UNKNOWN, LOCATOR_BATTERY_UNKNOWN);
+            locator_pack(body, &fix, LOCATOR_FC_SILENT, 42, LOCATOR_U16_UNKNOWN, LOCATOR_BATTERY_UNKNOWN, 41);
             tun_send_packet(&tun, TUN_POSITION, body, sizeof(body));
         }
     }

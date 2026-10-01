@@ -359,6 +359,26 @@ class GuiTest(unittest.TestCase):
         self.assertEqual(app.craft_values["Position"].cget("fg"), mavlte.AMBER)
         self.assertEqual(value("Module"), "-")
 
+    def test_chip_temperature(self):
+        app = self.app
+        chip = app.chip_temp  # the module's chip, after the rest of the Module row, in a colour of its own
+
+        def report(temp):
+            pos = mr.Position(gnss_time=int(time.time()), sats=3, fc_silent=0, battery_pct=78, temp=temp)
+            self.loop.call_soon_threadsafe(self.vehicle.send_packet, mr.POSITION, pos.pack())
+
+        self.pump(lambda: app.camera.enabled, what="aircraft online")
+        report(45)
+        self.pump(lambda: self.text(chip) == " · 45 °C", what="the chip's temperature")
+        self.assertEqual(self.text(app.craft_values["Module"]), "flight controller talking · battery 78%")
+        self.assertEqual(chip.cget("fg"), mavlte.TEXT)
+        for temp, color in ((72, mavlte.AMBER), (85, mavlte.RED)):
+            report(temp)
+            self.pump(lambda: self.text(chip) == f" · {temp} °C", what=f"{temp} °C")
+            self.assertEqual(chip.cget("fg"), color)
+        report(mr.TEMP_UNKNOWN)  # an aircraft from before 1.4.0
+        self.pump(lambda: self.text(chip) == "", what="no temperature")
+
     def test_wrong_key_says_no_answer(self):
         app = self.app
         app.apply_settings(app.settings.name, app.settings.server, KEY_V.hex())  # not the GCS key: no answer

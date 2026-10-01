@@ -207,9 +207,23 @@ flight controller. Either:
 The 5V pin is wired straight to the USB-C port's power line. Unplug the BEC (or the flight
 battery) before you connect USB-C to a PC.
 
+**Heat.** The ESP32-S3R8 of V2 boards is rated for at most 65 °C of air around it (V1's
+ESP32-S3R2: 85 °C), and a closed fuselage parked in the summer sun gets that hot. Give the board
+some airflow, away from the motor and its ESC, and keep the aircraft in the shade on the ground.
+The module sends its chip's temperature with every position report and MavLTE shows it under
+*Module*. The chip reads warmer than the air around it (it heats itself, and the modem beside it
+heats the board), so take amber (70 °C) as a sign that the board is getting hot, and red (80 °C)
+as a sign to cool it down.
+
 **Antennas and SIM.** Screw the LTE antenna onto the modem's main antenna connector, and the
 GNSS antenna (the small ceramic patch) onto the board's GNSS connector, for the locator: mount it
 flat, facing the sky, away from the LTE antenna. Insert a nano-SIM with a data plan, PIN removed.
+
+**Radio.** The ESP32's own Wi-Fi and Bluetooth are off for good: the firmware never starts them,
+and it is built without the libraries that could (`CONFIG_APP_NO_BLOBS`). So the board sends
+nothing on 2.4 GHz, where ELRS and many video links work; its only transmitter is the LTE
+modem. Mount the LTE antenna as far as the airframe allows from the RC receiver's antennas and
+from the flight controller's GPS.
 
 **Camera.** It sits on the board's own connector, so it needs no wiring. Mount the board (or the
 camera on an extension cable) looking where you want your photos, away from the propeller.
@@ -286,7 +300,8 @@ server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
   last known position and how long ago that was (in amber): the relay keeps it, so the app shows
   it even when it was closed at the time. **Module** says whether the flight controller still
   talks to the module, in red when it has gone silent (a crash, say) while the module still
-  reports, and the module's battery when it has a cell.
+  reports, the module's battery when it has a cell, and the temperature of its ESP32-S3 chip:
+  in amber from 70 °C, in red from 80 °C (see *Heat* in section 3).
 - **Snapshot**, at the bottom of the *Aircraft* panel, asks the aircraft for a photo, whatever the
   switches: pick **Small** (320×240, about 5–10 KB), **Medium** (640×480, 10–30 KB) or **Large**
   (1024×768, 25–80 KB) beside it. The line below shows the photo arriving; it then opens in a
@@ -405,6 +420,9 @@ section of `mavrelay.ini`.
   off in flight to stage a crash: the flight controller dies, the module runs on and keeps
   reporting where the plane came down, and MavLTE shows the flight controller silent (red).
   Take the cell out as well, and the plane is gone: MavLTE keeps its last known position.
+- The module's chip temperature (top right of its panel) follows the air in the fuselage plus
+  its own heat. **In the sun** heats the fuselage to 65 °C: within a minute or two MavLTE shows
+  the chip in amber, then in red.
 
 Put the MavLTE app beside it and watch its LEDs follow: they go dark about 3 s after the plane
 goes quiet.
@@ -464,6 +482,7 @@ missed while the app was closed) travel over your laptop's internet.
 | `No photo: the aircraft has no camera` | DIP switch CAM on, the camera's ribbon cable seated in its connector (contacts the right way round), *Camera* on in menuconfig. The ESP32 log says why. |
 | `No photo: the camera could not take the photo` | The ESP32 log says why; for *Large*, too little free memory: take *Medium*. |
 | Photos have no position in their notes | The flight controller sends no `GLOBAL_POSITION_INT` on the bridge's port: set the `POSITION` stream rate (see above). |
+| MavLTE shows the module's chip temperature in amber or red | The board is too warm: in the sun, or without airflow (see *Heat* in section 3). Above 65 °C of air around it, V2 boards are outside their chip's rating. |
 | Position says `GNSS searching` for minutes | The GNSS antenna on the board's GNSS connector, flat and with open sky above it; not under carbon fibre or metal. Indoors it hardly ever gets a fix. |
 | Position says `the LTE module cannot read its GNSS` | The modem did not take its multiplexer (CMUX), which reading the GNSS during the data call needs; the ESP32 log says so. The link works without it. To try again: erase the flash (`pio run -t erase`) and upload. |
 

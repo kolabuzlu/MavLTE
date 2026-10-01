@@ -280,7 +280,11 @@ static void log_stats(void)
     bool gcs = tun.gcs_present;
     tun_stats_t ts = tun.stats;
     xSemaphoreGive(lock);
-    char rtt_text[12] = "?", loss_text[12] = "?";
+    char rtt_text[12] = "?", loss_text[12] = "?", chip_text[12] = "?";
+    int8_t chip = board_chip_temp();
+    if (chip != INT8_MIN) {
+        snprintf(chip_text, sizeof(chip_text), "%d C", chip);
+    }
     if (rtt != TUN_U16_UNKNOWN) {
         snprintf(rtt_text, sizeof(rtt_text), "%u ms", rtt);
     }
@@ -288,10 +292,11 @@ static void log_stats(void)
         snprintf(loss_text, sizeof(loss_text), "%u.%u%%", loss / 10, loss % 10);
     }
     ESP_LOGI(TAG, "relay %s, rtt %s, downlink loss %s, GCS %s | up %" PRIu32 " B in %" PRIu32 " pkts, down %" PRIu32
-             " B | FC rx %" PRIu32 " B tx %" PRIu32 " B | held back %" PRIu32 " B, dropped %" PRIu32 ", errors %" PRIu32,
+             " B | FC rx %" PRIu32 " B tx %" PRIu32 " B | held back %" PRIu32 " B, dropped %" PRIu32 ", errors %" PRIu32
+             " | chip %s",
              connected ? "connected" : "not connected", rtt_text, loss_text, gcs ? "connected" : "absent", ts.tx_bytes,
              ts.tx_packets, ts.rx_bytes, stats.fc_rx_bytes, stats.fc_tx_bytes, stats.paused_bytes, ts.dropped,
-             stats.send_errors);
+             stats.send_errors, chip_text);
 }
 
 #if CONFIG_BRIDGE_LOCATOR
@@ -319,7 +324,7 @@ static void send_position(uint32_t now)
             flags |= LOCATOR_FC_SILENT;
         }
     }
-    locator_pack(body, fix, flags, silent, battery_mv, battery_pct);
+    locator_pack(body, fix, flags, silent, battery_mv, battery_pct, board_chip_temp());
     tun_send_packet(&tun, TUN_POSITION, body, sizeof(body));
 }
 #endif

@@ -295,6 +295,7 @@ class PlaneTest(unittest.TestCase):
         self.assertLess(abs(pos.lat - 411234567) + abs(pos.lon - 289876543), 2000)  # within a few metres
         self.assertFalse(pos.fc_is_silent)
         self.assertEqual(pos.battery_pct, 100)
+        self.assertTrue(plane_sim.AIR_C <= pos.temp <= plane_sim.AIR_C + plane_sim.SELF_HEAT_C)  # its chip
 
         p.call(p.set_battery, False)
         wait_for(self, lambda: not g.fc_clients, "flight controller dead")
@@ -307,6 +308,26 @@ class PlaneTest(unittest.TestCase):
 
         p.call(p.set_cell, False)  # the cell out as well: now it is gone
         wait_for(self, lambda: p.modem is None, "module off")
+
+    def test_chip_temperature(self):
+        """The module's chip: the air in the fuselage, plus its own heat while it runs, followed with a lag;
+        in the sun hot enough for MavLTE's amber, then red."""
+        p = self.plane
+        p._chip_update()
+        self.assertAlmostEqual(p.chip_c, plane_sim.AIR_C, delta=0.1)  # a cold board, in the shade
+        p.modem = mock.Mock()  # running, as far as its heat goes
+        self.addCleanup(setattr, p, "modem", None)
+        p.chip_at -= 10 * plane_sim.CHIP_LAG_S
+        p._chip_update()
+        self.assertAlmostEqual(p.chip_c, plane_sim.AIR_C + plane_sim.SELF_HEAT_C, delta=0.1)
+        self.assertLess(p.chip_c, mr.TEMP_WARM)
+        p.set_sun(True)
+        p.chip_at -= plane_sim.CHIP_LAG_S  # a lag later: most of the way
+        p._chip_update()
+        self.assertTrue(mr.TEMP_WARM <= p.chip_c < mr.TEMP_HOT, p.chip_c)
+        p.chip_at -= 10 * plane_sim.CHIP_LAG_S
+        p._chip_update()
+        self.assertGreaterEqual(p.chip_c, mr.TEMP_HOT)
 
     def test_module_starts_switched_off(self):
         p = self.plane

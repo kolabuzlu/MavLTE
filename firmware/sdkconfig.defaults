@@ -40,3 +40,7 @@ CONFIG_ESP_MODEM_C_API_STR_MAX=256
 
 # UART interrupts keep running while flash is written (the modem at 921600 baud has no flow control)
 CONFIG_UART_ISR_IN_IRAM=y
+
+# No Wi-Fi and no Bluetooth: the firmware never starts the ESP32's radio, and without Espressif's
+# binary radio libraries it cannot, so the board sends nothing on 2.4 GHz (ELRS, video links)
+CONFIG_APP_NO_BLOBS=y

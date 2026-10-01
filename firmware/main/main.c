@@ -1,4 +1,6 @@
-/* MavLTE: flight controller UART <-> relay server over the A7670E's mobile data. */
+/* MavLTE: flight controller UART <-> relay server over the A7670E's mobile data. The ESP32's own Wi-Fi
+ * and Bluetooth stay off: nothing starts them, and the build leaves out the libraries that could
+ * (CONFIG_APP_NO_BLOBS in sdkconfig.defaults). */
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"

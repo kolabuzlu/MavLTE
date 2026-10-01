@@ -20,7 +20,7 @@ KEY_G = bytes(range(100, 132))
 
 def fix(**kw):
     values = dict(gnss_time=int(time.time()), lat=411234567, lon=289876543, alt=150_000, speed=1200, course=4500,
-                  hdop=90, sats=11, fix=mr.FIX_3D, fc_silent=0, battery_mv=3950, battery_pct=78)
+                  hdop=90, sats=11, fix=mr.FIX_3D, fc_silent=0, battery_mv=3950, battery_pct=78, temp=47)
     values.update(kw)
     return mr.Position(**values)
 
@@ -28,10 +28,24 @@ def fix(**kw):
 class PositionTest(unittest.TestCase):
     def test_roundtrip(self):
         pos = fix(flags=mr.POS_FC_SILENT, fc_silent=42, time=1790000000)
-        self.assertEqual(mr.POSITION_BODY.size, 34)
+        self.assertEqual((mr.POSITION_BODY.size, len(pos.pack())), (34, 35))  # 34 before 1.4.0
         self.assertEqual(mr.Position.unpack(pos.pack()), pos)
         self.assertTrue(pos.has_fix and pos.fc_is_silent)
         self.assertEqual(pos.describe(), "41.123457, 28.987654, 11 satellites")
+        self.assertEqual(mr.Position.unpack(fix(temp=-5).pack()).temp, -5)
+
+    def test_same_bytes_as_the_firmware(self):  # firmware/test/host/test_core.c, test_locator_packet
+        pos = mr.Position(gnss_time=1790841600, lat=411234567, lon=-289876543, alt=150500, speed=632, course=4560,
+                          hdop=90, sats=14, fix=mr.FIX_3D, flags=mr.POS_FC_SILENT, fc_silent=42, battery_mv=3950,
+                          battery_pct=78, temp=47)
+        self.assertEqual(pos.pack().hex(), "0013be6a07f18218c1d5b8eee44b02007802d0115a000e03012a006e0f4e000000002f")
+        self.assertEqual(mr.Position(flags=mr.POS_NO_GNSS).pack().hex(),
+                         "00000000000000800000008000000080ffffffffffff000002ffffffffff0000000080")
+
+    def test_reports_before_1_4_0_have_no_temperature(self):
+        old = fix().pack()[:34]
+        self.assertEqual(mr.Position.unpack(old), fix(temp=mr.TEMP_UNKNOWN))
+        self.assertEqual(mr.Position.unpack(fix().pack() + b"later"), fix())  # what comes later is skipped
 
     def test_no_fix(self):
         self.assertFalse(mr.Position(sats=3).has_fix)
@@ -126,10 +140,20 @@ class RelayLocatorTest(unittest.TestCase):
         self.connect(mr.ROLE_GCS, self.LAPTOP)
         self.packet(mr.ROLE_VEHICLE, plane, self.PLANE, mr.POSITION, fix().pack()[:20])
         self.assertEqual(self.positions_to(self.LAPTOP), [])
+        self.packet(mr.ROLE_VEHICLE, plane, self.PLANE, mr.POSITION, fix().pack()[:34])  # an aircraft before 1.4.0
+        [old] = self.positions_to(self.LAPTOP)
+        self.assertEqual(old._replace(time=0), fix(temp=mr.TEMP_UNKNOWN))
         os.makedirs(self.state, exist_ok=True)
         with open(os.path.join(self.state, "locator.json"), "w") as f:
             f.write("{not json")
         self.assertIsNone(self.new_relay().locator.last_fix)  # a broken file is not fatal
+
+    def test_saved_before_1_4_0(self):
+        saved = dict(fix(time=1790000000)._asdict(), latitude=41.1234567, longitude=28.9876543)
+        del saved["temp"]
+        with open(os.path.join(self.state, "locator.json"), "w") as f:
+            json.dump(saved, f)
+        self.assertEqual(self.new_relay().locator.last_fix, fix(time=1790000000, temp=mr.TEMP_UNKNOWN))
 
 
 class LiveLocatorTest(unittest.IsolatedAsyncioTestCase):
@@ -175,6 +199,15 @@ class LiveLocatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("flight controller is silent (12 s)" in line for line in logs.output))
         self.assertTrue(agent.position.fc_is_silent)
         self.assertEqual(agent.position_text(), "GNSS 41.123457, 28.987654 (11 satellites, 0 s ago)")
+
+        with self.assertLogs("mavrelay.gcs", "INFO") as logs:  # the module's chip gets hot, then cools down
+            for temp in (75, 85, 78, 65):
+                vehicle.send_packet(mr.POSITION, fix(temp=temp).pack())
+                await self.until(lambda: agent.position.temp == temp)
+        hot = [line for line in logs.output if "°C" in line]
+        self.assertEqual(len(hot), 2)
+        self.assertIn("WARNING:mavrelay.gcs:the aircraft's LTE module is hot: its chip is at 85 °C", hot[0])
+        self.assertIn("cooled down to 65 °C", hot[1])
 
         # an agent that connects later hears the last known one at once, even with the aircraft gone
         vehicle_task = self.tasks[0]

@@ -902,6 +902,9 @@ class App:
             if label == "Position":  # the LTE module's own GNSS: where to look for the aircraft
                 self.map_link = self._link(cell, "Map", self.open_map)
                 self.copy_link = self._link(cell, "Copy", self.copy_position)
+            elif label == "Module":  # its chip's temperature, in a colour of its own
+                self.chip_temp = tk.Label(cell, text="", bg=SURFACE, fg=TEXT, font=self.font, anchor="w", padx=0)
+                self.chip_temp.pack(side="left")
         self.shown_fix: Optional[mr.Position] = None  # the position Map and Copy use
         self.camera = CameraRow(self, craft)
         self.camera.pack(fill="x")
@@ -1272,6 +1275,7 @@ class App:
             self._paint(link, link.cget("text"), BLUE if shown else LED_OFF)
 
         module, color = "-", TEXT
+        temp, temp_color = "", TEXT
         if live:
             if pos.fc_silent == mr.U16_UNKNOWN:
                 module, color = "flight controller not heard yet", AMBER
@@ -1281,7 +1285,11 @@ class App:
                 module = "flight controller talking"
             if pos.battery_pct != mr.BATTERY_UNKNOWN:
                 module += f" · battery {pos.battery_pct}%"
+            if pos.temp != mr.TEMP_UNKNOWN:
+                temp = f" · {pos.temp} °C"
+                temp_color = RED if pos.temp >= mr.TEMP_HOT else AMBER if pos.temp >= mr.TEMP_WARM else TEXT
         self._paint(self.craft_values["Module"], module, color)
+        self._paint(self.chip_temp, temp, temp_color)
 
     def _link(self, parent: tk.Misc, text: str, command: Callable[[], None]) -> tk.Label:
         link = tk.Label(parent, text=text, bg=SURFACE, fg=LED_OFF, font=self.font_small, cursor="hand2")

@@ -8,10 +8,11 @@
 #include <stdint.h>
 
 #define TUN_POSITION 13
-#define LOCATOR_BODY_LEN 34
+#define LOCATOR_BODY_LEN 35
 #define LOCATOR_UNKNOWN_I32 INT32_MIN
 #define LOCATOR_U16_UNKNOWN 0xFFFF
 #define LOCATOR_BATTERY_UNKNOWN 0xFF
+#define LOCATOR_TEMP_UNKNOWN INT8_MIN
 #define LOCATOR_FC_SILENT 0x01 /* nothing from the flight controller for LOCATOR_FC_SILENT_S or more */
 #define LOCATOR_NO_GNSS 0x02   /* the GNSS cannot be read */
 #define LOCATOR_FC_SILENT_S 10
@@ -41,6 +42,6 @@ uint32_t gnss_unix_time(int year, int month, int day, int hour, int minute, int 
 
 /* The POSITION body (LOCATOR_BODY_LEN bytes): the fix, or none (NULL, with LOCATOR_NO_GNSS in flags),
  * and the rest of what the relay and MavLTE show. fc_silent_s: seconds since the flight controller was
- * last heard, LOCATOR_U16_UNKNOWN if never. */
+ * last heard, LOCATOR_U16_UNKNOWN if never; chip_c: the ESP32-S3's temperature in degrees C. */
 void locator_pack(uint8_t *out, const gnss_fix_t *fix, uint8_t flags, uint16_t fc_silent_s, uint16_t battery_mv,
-                  uint8_t battery_pct);
+                  uint8_t battery_pct, int8_t chip_c);

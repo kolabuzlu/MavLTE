@@ -34,7 +34,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -601,12 +601,19 @@ POSITION = 13
 # GNSS time (unix seconds), latitude and longitude (1e-7 degrees), altitude (mm above sea level),
 # speed (cm/s), course (centidegrees), HDOP (x100), satellites used, fix, flags, seconds since the
 # flight controller was last heard, the module's battery (mV, %), time (unix seconds, set by the relay)
-POSITION_BODY = struct.Struct("<IiiiHHHBBBHHBI")
+POSITION_BODY = struct.Struct("<IiiiHHHBBBHHBI")  # all a POSITION has: before 1.4.0, nothing followed
+POSITION_TEMP = struct.Struct("<b")  # then the module's chip temperature (degrees C)
 FIX_NONE, FIX_2D, FIX_3D = 0, 2, 3
 POS_FC_SILENT = 0x01  # nothing from the flight controller for FC_SILENT_S or more
 POS_NO_GNSS = 0x02  # the module cannot read its GNSS (fix fields unknown)
 FC_SILENT_S = 10
 BATTERY_UNKNOWN = 0xFF
+TEMP_UNKNOWN = -128
+# The ESP32-S3's own sensor reads warmer than the air around the board. V2 boards' ESP32-S3R8 is rated
+# for 65 degrees C of air around it (V1's ESP32-S3R2: 85); its datasheet ties that to the chip's octal
+# PSRAM, which the firmware does not use.
+TEMP_WARM = 70  # getting hot
+TEMP_HOT = 80  # too hot: give the board air, out of the sun
 
 
 class Position(NamedTuple):
@@ -624,13 +631,17 @@ class Position(NamedTuple):
     battery_mv: int = U16_UNKNOWN
     battery_pct: int = BATTERY_UNKNOWN
     time: int = 0  # unix seconds, when the relay got it
+    temp: int = TEMP_UNKNOWN  # degrees C, the module's chip
 
     def pack(self) -> bytes:
-        return POSITION_BODY.pack(*self)
+        return POSITION_BODY.pack(*self[:-1]) + POSITION_TEMP.pack(self.temp)
 
     @classmethod
     def unpack(cls, body: bytes) -> "Position":
-        return cls(*POSITION_BODY.unpack_from(body))
+        """From POSITION_BODY.size bytes or more: an aircraft before 1.4.0 sends no temperature."""
+        temp = POSITION_TEMP.unpack_from(body, POSITION_BODY.size)[0] if len(body) > POSITION_BODY.size \
+            else TEMP_UNKNOWN
+        return cls(*POSITION_BODY.unpack_from(body), temp)
 
     @property
     def has_fix(self) -> bool:
@@ -934,6 +945,7 @@ class LocatorStore:
             try:
                 with open(path, encoding="utf-8") as f:
                     meta = json.load(f)
+                meta.setdefault("temp", TEMP_UNKNOWN)  # files from before 1.4.0 have none
                 self.last_fix = Position(*(int(meta[field]) for field in Position._fields))
                 slog.info("last known position of the aircraft: %s", self.last_fix.describe())
             except FileNotFoundError:
@@ -2068,6 +2080,7 @@ class GcsAgent:
         # the locator: the aircraft's own position, from its LTE module's GNSS
         self.position: Optional[Position] = None  # the newest: live, or the last known one from the relay
         self.last_fix: Optional[Position] = None
+        self.module_hot = False  # its chip reached TEMP_HOT, and has not cooled below TEMP_WARM since
         self.client.on_packet = self._on_packet
 
     @property
@@ -2113,6 +2126,14 @@ class GcsAgent:
                          pos.fc_silent, pos.describe())
         elif old is None or old.has_fix != pos.has_fix or old.fc_is_silent != pos.fc_is_silent:
             glog.info("aircraft's position (its own GNSS): %s", pos.describe())
+        if pos.temp != TEMP_UNKNOWN and (not pos.time or age < self.POSITION_LIVE):
+            if pos.temp >= TEMP_HOT and not self.module_hot:
+                self.module_hot = True
+                glog.warning("the aircraft's LTE module is hot: its chip is at %d °C. Give it air, out of the sun",
+                             pos.temp)
+            elif pos.temp < TEMP_WARM and self.module_hot:
+                self.module_hot = False
+                glog.info("the aircraft's LTE module has cooled down to %d °C", pos.temp)
 
     def position_text(self) -> str:
         """The aircraft's last known position for the log, or ''."""

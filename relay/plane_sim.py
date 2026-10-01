@@ -123,6 +123,13 @@ LOCATOR_INTERVAL = 5.0  # seconds between the module's position reports, as the 
 # The 18650 cell in the board's holder keeps the module on without the flight battery: a 3000 mAh cell at
 # about 150 mA (ESP32, the modem idling between reports, GNSS) lasts some 20 hours.
 CELL_HOURS = 20.0
+# The module's chip temperature, as its ESP32-S3 measures it: the air in the fuselage plus the board's
+# own heat while it runs (the modem's transmitter most), reached with a lag. Parked in the summer sun,
+# a closed fuselage gets hot enough for MavLTE's amber (from 70 degrees C) and red (from 80).
+AIR_C = 25.0
+SUN_AIR_C = 65.0
+SELF_HEAT_C = 20.0
+CHIP_LAG_S = 40.0  # a real board takes minutes; quicker here, to see it happen
 
 
 def speed_text(bytes_per_s: float) -> str:
@@ -470,6 +477,9 @@ class Plane:
         self.signal = GOOD_SIGNAL
         self.cell_pct = 100.0
         self.cell_at = time.monotonic()
+        self.sun = False  # parked in the sun: the fuselage heats up
+        self.chip_c = AIR_C  # the module's chip
+        self.chip_at = time.monotonic()
         # where the plane really is (lat, lon, alt MSL mm, vx, vy), as SITL last said: the GNSS's truth
         self.truth: Optional[Tuple[int, int, int, int, int]] = None
         # flight controller
@@ -545,6 +555,19 @@ class Plane:
             if self.cell_pct <= 0:
                 log.warning("LTE module: its cell is empty")
                 self._modem_off()
+
+    def set_sun(self, on: bool) -> None:
+        self._chip_update()
+        self.sun = on
+        log.info("LTE module: %s", f"in the sun: the fuselage heats up to {SUN_AIR_C:.0f} °C" if on
+                 else "in the shade again")
+
+    def _chip_update(self) -> None:
+        """The module's chip follows the air in the fuselage, plus its own heat while it runs."""
+        now = time.monotonic()
+        elapsed, self.chip_at = now - self.chip_at, now
+        target = (SUN_AIR_C if self.sun else AIR_C) + (SELF_HEAT_C if self.modem is not None else 0.0)
+        self.chip_c += (target - self.chip_c) * (1 - math.exp(-elapsed / CHIP_LAG_S))
 
     def set_network(self, network: int) -> None:
         old, self.network = self.network, network
@@ -647,11 +670,13 @@ class Plane:
 
     def _modem_on(self) -> None:
         if self.modem is None:
+            self._chip_update()
             self.modem = Modem(GNSS_TTFF_QUICK if self.quick else GNSS_TTFF)
             self.modem_task = self.loop.create_task(self._modem_run(self.modem))
 
     def _modem_off(self) -> None:
         if self.modem is not None:
+            self._chip_update()
             log.info("LTE module: power off")
             self.modem_task.cancel()  # a power cut: no goodbye to the relay
             self.modem = self.modem_task = None
@@ -719,8 +744,8 @@ class Plane:
                     log.warning("LTE module: lost the relay session")
 
     def _position(self, m: Modem, now: float) -> mr.Position:
-        """The module's position report: its GNSS, how long the flight controller has been silent, and
-        its cell, if it has one."""
+        """The module's position report: its GNSS, how long the flight controller has been silent, its
+        cell, if it has one, and its chip's temperature."""
         heard = self.fc.last_rx
         silent = mr.U16_UNKNOWN if not heard else min(mr.U16_UNKNOWN - 1, int(now - heard))
         flags = mr.POS_FC_SILENT if heard and silent >= mr.FC_SILENT_S else 0
@@ -728,7 +753,8 @@ class Plane:
         if self.cell:
             pct = int(round(self.cell_pct))
             pos = pos._replace(battery_pct=pct, battery_mv=3300 + 9 * pct)
-        return pos._replace(flags=pos.flags | flags, fc_silent=silent)
+        self._chip_update()
+        return pos._replace(flags=pos.flags | flags, fc_silent=silent, temp=int(round(self.chip_c)))
 
     def _radio(self) -> Tuple[int, int]:
         rat = NETWORKS[self.network][1]
@@ -895,15 +921,22 @@ class SimWindow:
         tk.Label(top, text="LTE module", bg=ui.SURFACE, fg=ui.TEXT, font=self.font_bold).pack(side="left")
         self.lte_bars = ui.Bars(top, s, ui.SURFACE)
         self.lte_bars.pack(side="right")
+        self.chip_text = tk.Label(top, text="", bg=ui.SURFACE, fg=ui.MUTED, font=self.font)  # as it reports it
+        self.chip_text.pack(side="right", padx=(0, round(8 * s)))
         self.lte_values = self._grid(card, ("State", "Network", "Signal", "Link", "Round trip", "GCS", "Data",
                                             "Camera", "GPS", "Backup cell"),
                                      {"Network": self._network, "Signal": self._signal, "Camera": self._camera,
                                       "Backup cell": self._backup_cell})
         self.quick = tk.BooleanVar(value=self.plane.quick)
-        tk.Checkbutton(card, text="Quick start (the real modem takes about 16 s)", variable=self.quick,
-                       command=self.toggle_quick, bg=ui.SURFACE, fg=ui.TEXT, selectcolor=ui.FIELD,
-                       activebackground=ui.SURFACE, activeforeground=ui.TEXT, font=self.font_small, bd=0,
-                       highlightthickness=0).pack(anchor="w", padx=round(4 * s), pady=(0, pad))
+        self.sun = tk.BooleanVar(value=self.plane.sun)
+        line = tk.Frame(card, bg=ui.SURFACE)
+        line.pack(fill="x", padx=round(4 * s), pady=(0, pad))
+        for text, var, command in (("Quick start (the real modem takes about 16 s)", self.quick, self.toggle_quick),
+                                   (f"In the sun ({SUN_AIR_C:.0f} °C)", self.sun, self.toggle_sun)):
+            tk.Checkbutton(line, text=text, variable=var, command=command, bg=ui.SURFACE, fg=ui.TEXT,
+                           selectcolor=ui.FIELD, activebackground=ui.SURFACE, activeforeground=ui.TEXT,
+                           font=self.font_small, bd=0, highlightthickness=0).pack(side="left",
+                                                                                  padx=(0, round(10 * s)))
 
         self._section(body, "Log")
         frame = tk.Frame(body, bg=ui.BG)
@@ -1006,6 +1039,9 @@ class SimWindow:
     def toggle_quick(self) -> None:
         self.plane.quick = self.quick.get()
 
+    def toggle_sun(self) -> None:
+        self.plane.call(self.plane.set_sun, self.sun.get())
+
     def _backup_cell(self, parent) -> tk.Frame:
         """An 18650 cell in the board's holder: with it, the module runs on when the flight battery goes
         (a crash, say), and keeps reporting where the plane is."""
@@ -1074,6 +1110,11 @@ class SimWindow:
             gps = f"Searching ({pos.sats} satellites)" if p.truth is not None or pos.sats else \
                 "Searching (start the flight controller to give the plane a place)"
         self._set(self.lte_values["GPS"], gps)
+        temp = pos.temp if pos is not None and m is not None else mr.TEMP_UNKNOWN
+        text = f"chip {temp} °C" if temp != mr.TEMP_UNKNOWN else ""
+        color = ui.RED if temp >= mr.TEMP_HOT else ui.AMBER if temp >= mr.TEMP_WARM else ui.MUTED
+        if self.chip_text.cget("text") != text or self.chip_text.cget("fg") != color:
+            self.chip_text.configure(text=text, fg=color)
         if not p.cell:
             cell = "None: off with the flight battery"
         elif p.battery:
