@@ -25,6 +25,7 @@ import logging
 import os
 import queue
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -307,9 +308,9 @@ class AgentRunner:
             try:
                 await (agent.start_tcp(address) if kind == "tcp" else agent.start_udp(address))
             except OSError as exc:
-                if kind == "tcp":
-                    return f"TCP port {address[1]} is in use by another program ({exc.strerror or exc})"
-                return f"cannot use UDP {address[0]}:{address[1]} ({exc.strerror or exc})"
+                if isinstance(exc, socket.gaierror):
+                    return f"cannot find {address[0]} ({exc.strerror or exc})"
+                return f"{kind.upper()} port {address[1]} is in use by another program ({exc.strerror or exc})"
             return None
 
         return self._call(go())
@@ -445,6 +446,9 @@ class ChannelCard(tk.Frame):
         self.status = tk.Label(self, text="Off", bg=SURFACE, fg=DIM, font=app.font_small, anchor="w",
                                justify="left", wraplength=round(300 * s))
         self.status.pack(fill="x", padx=pad, pady=(round(2 * s), pad))
+        # as wide as the card, so that an address fits on one line and the window stays short; never
+        # wider: the label would widen the card, which would widen the label again
+        self.bind("<Configure>", lambda e: self.status.configure(wraplength=max(100, e.width - 2 * pad - 4)))
 
     def address(self) -> Tuple[str, int]:
         return parse_address(self.host.get(), self.port.get())
@@ -796,6 +800,8 @@ class App:
         self.photos_in: "queue.Queue[Tuple[str, mr.PhotoInfo]]" = queue.Queue()  # saved by the agent's thread
         self.clicked_at = -1e9  # Snapshot: the photo that comes next opens in the viewer
         self.viewer: Optional[PhotoViewer] = None
+        self.lan: Optional[str] = None  # this computer's address on its network, for the cards
+        self.lan_at = -1e9
 
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
         family = "Segoe UI" if "Segoe UI" in tkfont.families(root) else "TkDefaultFont"
@@ -1087,13 +1093,20 @@ class App:
         if agent is not None:
             if self.tcp_card.switch.on and agent.tcp is not None:
                 n = len(agent.tcp.clients)
-                where = f"TCP, {self.tcp_card.text().replace(':', ', port ')}"
+                host, _, port = self.tcp_card.text().rpartition(":")
+                where = f"TCP, {self._reached_at(host, now)}, port {port}"
                 self.tcp_card.show(*self._port_status(online, f"{n} GCS connected" if n else "", where))
-            if self.udp_card.switch.on and agent.udp is not None:
-                heard = now - agent.udp.last_rx < 3.0
-                host, port = agent.udp.target
-                where = f"UDP, port {port}" if mr.is_loopback(host) else f"UDP {host}, port {port}"
-                self.udp_card.show(*self._port_status(online, "Mission Planner connected" if heard else "", where))
+            udp = agent.udp
+            if self.udp_card.switch.on and udp is not None:
+                if udp.target is None:  # it listens: GCS software on any computer connects to it
+                    n = udp.gcs_count()
+                    gcs = f"{n} GCS connected" if n else ""
+                    where = f"UDPCl, {self._reached_at(udp.local[0], now)}, port {udp.port}"
+                else:
+                    host, port = udp.target
+                    gcs = "Mission Planner connected" if now - udp.last_rx < 3.0 else ""
+                    where = f"UDP, port {port}" if mr.is_loopback(host) else f"UDP {host}, port {port}"
+                self.udp_card.show(*self._port_status(online, gcs, where))
         self._show_aircraft(agent, status, now)
         self._take_photos(now)
         self._show_camera(agent, online, now)
@@ -1159,6 +1172,15 @@ class App:
             card.show(self.SIZE_HINTS[card.size.selected])
         card.set_enabled(connected and online and not busy)
         card.size.set_enabled(not busy)
+
+    def _reached_at(self, host: str, now: float) -> str:
+        """The address GCS software connects to, for a port on `host`. On all of them (0.0.0.0): this
+        computer's on its network, which other computers use (GCS software on this one: 127.0.0.1 too)."""
+        if host != "0.0.0.0":
+            return host
+        if now - self.lan_at >= 5.0:  # Wi-Fi may change it
+            self.lan_at, self.lan = now, mr.lan_address()
+        return self.lan or "this computer's address"
 
     @staticmethod
     def _port_status(online: bool, gcs: str, where: str) -> Tuple[str, str]:

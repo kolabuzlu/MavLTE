@@ -34,7 +34,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -1713,15 +1713,89 @@ class PhotoOutbox:
 # Local endpoints of the GCS agent
 
 
-class LocalUdp(asyncio.DatagramProtocol):
-    """Sends to a GCS that listens on UDP (Mission Planner / QGC default: 127.0.0.1:14550)."""
+def udp_plan(host: str, port: int, own: bool = False) -> Tuple[Optional[Tuple[str, int]], Tuple[str, int]]:
+    """How the agent's UDP port works for an address: where it sends (None: it listens, and sends
+    to the GCS software that talks to it) and the local address it binds.
 
-    def __init__(self, target: Tuple[str, int], on_input: Callable[[bytes], None]) -> None:
+    0.0.0.0 (or ::) listens on that port, as the TCP port does: GCS software on any computer that
+    sends to this one's address and port (Mission Planner: UDPCl) gets the telemetry. An address of
+    this computer's own (own) listens on that address. Any other address sends there, to GCS
+    software that listens (Mission Planner and QGroundControl: on port 14550), from a port of the
+    agent's own: a loopback address to GCS software on this computer, the default."""
+    host = host or "127.0.0.1"
+    if is_loopback(host):
+        return (host, port), ("::1" if ":" in host else "127.0.0.1", 0)
+    if host in ("0.0.0.0", "::") or own:
+        return None, (host, port)
+    return (host, port), ("::" if ":" in host else "0.0.0.0", 0)
+
+
+def is_own_address(host: str) -> bool:
+    """Whether an IP address is one of this computer's: one it can bind."""
+    try:
+        family = socket.AF_INET6 if ipaddress.ip_address(host).version == 6 else socket.AF_INET
+        with socket.socket(family, socket.SOCK_DGRAM) as s:
+            s.bind((host, 0))
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def lan_address() -> Optional[str]:
+    """This computer's address on its network, the one other computers reach it at, or None."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))  # sends nothing: picks the interface toward other networks
+            host = s.getsockname()[0]
+    except OSError:
+        return None
+    return None if host.startswith("0.") else host
+
+
+def udp_socket(local: Tuple[str, int]) -> socket.socket:
+    """A UDP socket bound to `local`. On Windows a port of our choice is ours alone: otherwise another
+    program could still bind it on one address, 127.0.0.1 say, and take the packets sent there."""
+    sock = socket.socket(socket.AF_INET6 if ":" in local[0] else socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        if local[1] and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        sock.bind(local)
+        sock.setblocking(False)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+class LocalUdp(asyncio.DatagramProtocol):
+    """GCS software on UDP. With a target, sends there (Mission Planner and QGroundControl listen on
+    127.0.0.1:14550). Without one it listens, like a server: it sends to every address that sent
+    something lately, so that several GCS programs, on any computers, can connect (see udp_plan)."""
+
+    PEER_TIMEOUT = 10.0  # seconds: GCS software sends a heartbeat every second
+    MAX_PEERS = 8
+
+    def __init__(self, target: Optional[Tuple[str, int]], on_input: Callable[[bytes], None]) -> None:
         self.target = target
         self.on_input = on_input
         self.batcher = Batcher()
         self.transport: Optional[asyncio.DatagramTransport] = None
         self.last_rx = 0.0  # when the GCS last sent something (Mission Planner: a heartbeat every second)
+        self.peers: Dict[tuple, float] = {}  # address: when it last sent something
+
+    @property
+    def local(self) -> Tuple[str, int]:
+        """The local address and port: the ones to connect to, when listening."""
+        return self.transport.get_extra_info("sockname")[:2] if self.transport is not None else ("", 0)
+
+    @property
+    def port(self) -> int:
+        return self.local[1]
+
+    def gcs_count(self, within: float = 3.0) -> int:
+        """GCS software heard from lately."""
+        now = time.monotonic()
+        return sum(now - seen < within for seen in list(self.peers.values()))
 
     def connection_made(self, transport) -> None:
         self.transport = transport
@@ -1737,6 +1811,9 @@ class LocalUdp(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr) -> None:
         now = time.monotonic()
         self.last_rx = now
+        if addr not in self.peers and len(self.peers) >= self.MAX_PEERS:
+            del self.peers[min(self.peers, key=self.peers.get)]
+        self.peers[addr] = now
         for chunk in self.batcher.feed(data, now):
             self.on_input(chunk)
         chunk = self.batcher.poll(now, 0)
@@ -1744,9 +1821,19 @@ class LocalUdp(asyncio.DatagramProtocol):
             self.on_input(chunk)
 
     def send(self, payload: bytes) -> None:
-        if self.transport is not None:
+        if self.transport is None:
+            return
+        if self.target:
+            to = [self.target]
+        else:  # listening: to each GCS program heard from lately
+            now = time.monotonic()
+            for addr, seen in list(self.peers.items()):
+                if now - seen > self.PEER_TIMEOUT:
+                    del self.peers[addr]
+            to = list(self.peers)
+        for addr in to:
             try:
-                self.transport.sendto(payload, self.target)
+                self.transport.sendto(payload, addr)
             except OSError:
                 pass
 
@@ -2047,17 +2134,33 @@ class GcsAgent:
         self.client.send_data(chunk)
 
     async def start_udp(self, target: Tuple[str, int]) -> None:
-        self._close_udp()
-        host = target[0] or "127.0.0.1"
-        udp = LocalUdp((host, target[1]), self._from_gcs)
+        """Sends to GCS software at `target`, or listens there if it is 0.0.0.0 or an address of this
+        computer (see udp_plan). Raises OSError if the name does not resolve, or the port is taken."""
+        if self._close_udp():
+            await asyncio.sleep(0)  # its socket closes on the loop's next turn, and frees the port
+        loop = asyncio.get_running_loop()
+        host, port = target[0] or "127.0.0.1", target[1]
+        if host not in ("0.0.0.0", "::"):  # a name resolves once, to the address replies come from
+            try:
+                infos = await loop.getaddrinfo(host, port, family=socket.AF_INET6 if ":" in host else socket.AF_INET,
+                                               type=socket.SOCK_DGRAM)
+            except UnicodeError as exc:  # a name the IDNA codec refuses
+                raise socket.gaierror(f"{host}: {exc}") from None
+            host = infos[0][4][0]
+        send_to, local = udp_plan(host, port, own=is_own_address(host))
+        udp = LocalUdp(send_to, self._from_gcs)
         try:
-            await asyncio.get_running_loop().create_datagram_endpoint(
-                lambda: udp, local_addr=("127.0.0.1" if is_loopback(host) else "0.0.0.0", 0))
+            await loop.create_datagram_endpoint(lambda: udp, sock=udp_socket(local))
             self.udp = udp
         finally:
             self._update_watching()
-        glog.info("sending MAVLink to udp %s (Mission Planner: connect UDP, port %d)", fmt_addr((host, target[1])),
-                  target[1])
+        if send_to is None:
+            here = lan_address() if host in ("0.0.0.0", "::") else host
+            glog.info("listening on udp %s (Mission Planner on any computer: connect UDPCl to %s, port %d)",
+                      fmt_addr(local), here or "this computer's address", port)
+        else:
+            glog.info("sending MAVLink to udp %s (Mission Planner%s: connect UDP, port %d)", fmt_addr(send_to),
+                      "" if is_loopback(host) else " there", port)
 
     def stop_udp(self) -> None:
         if self._close_udp():
@@ -2122,7 +2225,10 @@ async def run_gcs(opts) -> None:
     agent = GcsAgent(opts.server, opts.key, on_status=printer)
     printer.where = agent.position_text
     if opts.udp:
-        await agent.start_udp(opts.udp)
+        try:
+            await agent.start_udp(opts.udp)
+        except OSError as exc:
+            glog.warning("cannot use udp %s: %s", fmt_addr(opts.udp), exc)
     if opts.tcp:
         try:
             await agent.start_tcp(opts.tcp)
@@ -2242,7 +2348,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--config", help="INI file with a [gcs] section")
     g.add_argument("--server", help="relay address, host:port")
     g.add_argument("--key", help="hex GCS key (same as gcs_key on the server)")
-    g.add_argument("--udp", help="send MAVLink to this UDP address (default 127.0.0.1:14550, 'off' to disable)")
+    g.add_argument("--udp", help="send MAVLink to GCS software at this UDP address (default 127.0.0.1:14550), "
+                                 "or listen for it on any computer with 0.0.0.0:port; 'off' to disable")
     g.add_argument("--tcp", help="listen for GCS software on this TCP address (default 127.0.0.1:5760, 'off')")
     g.add_argument("--status-interval", type=float, help="seconds between vehicle link status lines (10)")
     g.add_argument("--log-level", help="debug, info, warning (default info)")

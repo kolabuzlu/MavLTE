@@ -316,6 +316,31 @@ class ConfigTest(unittest.TestCase):
         self.assertFalse(port.allowed("203.0.113.9"))
 
 
+class UdpPlanTest(unittest.TestCase):
+    """What the agent's UDP port does with each kind of address: (send to, bind)."""
+
+    def test_loopback_sends_to_gcs_software_on_this_computer(self):  # the default, as ever
+        self.assertEqual(mr.udp_plan("127.0.0.1", 14550, own=True), (("127.0.0.1", 14550), ("127.0.0.1", 0)))
+        self.assertEqual(mr.udp_plan("", 14550), (("127.0.0.1", 14550), ("127.0.0.1", 0)))
+        self.assertEqual(mr.udp_plan("::1", 14550), (("::1", 14550), ("::1", 0)))
+
+    def test_all_addresses_or_one_of_this_computer_listen(self):  # as the TCP port does
+        self.assertEqual(mr.udp_plan("0.0.0.0", 14550), (None, ("0.0.0.0", 14550)))
+        self.assertEqual(mr.udp_plan("::", 14550), (None, ("::", 14550)))
+        self.assertEqual(mr.udp_plan("192.168.2.178", 14550, own=True), (None, ("192.168.2.178", 14550)))
+
+    def test_another_computer_is_sent_to(self):
+        self.assertEqual(mr.udp_plan("192.168.2.50", 14550), (("192.168.2.50", 14550), ("0.0.0.0", 0)))
+
+    def test_own_addresses(self):
+        self.assertTrue(mr.is_own_address("127.0.0.1"))
+        self.assertFalse(mr.is_own_address("192.0.2.1"))  # TEST-NET-1: nobody's
+        self.assertFalse(mr.is_own_address("relay.example.com"))  # names are resolved before
+        lan = mr.lan_address()
+        if lan is not None:
+            self.assertTrue(mr.is_own_address(lan))
+
+
 class VersionTest(unittest.TestCase):
     def test_one_version_for_everything(self):
         # the firmware and the PC and server side always carry the same number
@@ -582,6 +607,109 @@ class LiveTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.relay.tcp.clients, set())
         writer.close()
         self.relay.tcp.server.close()
+
+    def gcs_socket(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        s.setblocking(False)
+        self.addCleanup(s.close)
+        return s
+
+    async def telemetry_flows(self, vehicle):
+        """Until the relay passes the vehicle's telemetry on to a GCS agent: one not only watching."""
+        await self.until(lambda: vehicle.is_connected and any(not s.watching for s in self.relay.gcs_sessions()))
+
+    async def received(self, sock, timeout=3.0):
+        end = time.monotonic() + timeout
+        while True:
+            try:
+                return sock.recvfrom(4096)
+            except BlockingIOError:
+                if time.monotonic() > end:
+                    self.fail("nothing received")
+                await asyncio.sleep(0.02)
+
+    async def test_agent_listens_on_udp_for_gcs_software_on_any_computer(self):
+        vehicle = self.client(mr.ROLE_VEHICLE)
+        agent = mr.GcsAgent(("127.0.0.1", self.port), KEY_G)
+        self.tasks.append(asyncio.ensure_future(agent.run()))
+        self.addCleanup(agent.close_ports)
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        await agent.start_udp(("0.0.0.0", port))  # 0.0.0.0: it listens, as the TCP port does
+        udp = agent.udp
+        self.assertEqual((udp.target, udp.local), (None, ("0.0.0.0", port)))
+        self.assertFalse(agent.watching)
+        thief = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(thief.close)
+        with self.assertRaises(OSError):
+            thief.bind(("127.0.0.1", port))  # the port is the agent's alone
+
+        laptop, phone = self.gcs_socket(), self.gcs_socket()  # GCS software (Mission Planner: UDPCl) on two computers
+        for gcs in (laptop, phone):
+            gcs.sendto(v2_frame(0, bytes(9), 1), ("127.0.0.1", port))  # a heartbeat says it is there
+        await self.until(lambda: udp.gcs_count() == 2)
+        await self.telemetry_flows(vehicle)
+        vehicle.send_data(v2_frame(30, bytes(28), 7))
+        for gcs in (laptop, phone):
+            data, addr = await self.received(gcs)
+            self.assertEqual((data, addr[1]), (v2_frame(30, bytes(28), 7), port))  # from the port it sends to
+        phone.sendto(v2_frame(76, bytes(33), 2), ("127.0.0.1", port))
+        await self.until(lambda: v2_frame(76, bytes(33), 2) in vehicle.inbox)
+
+        udp.PEER_TIMEOUT = 0.5  # the laptop goes quiet; the phone does not
+        await asyncio.sleep(0.6)
+        phone.sendto(v2_frame(0, bytes(9), 3), ("127.0.0.1", port))
+        await self.until(lambda: udp.gcs_count(within=0.3) == 1)
+        vehicle.send_data(v2_frame(30, bytes(28), 8))
+        self.assertEqual((await self.received(phone))[0], v2_frame(30, bytes(28), 8))
+        await asyncio.sleep(0.2)
+        with self.assertRaises(BlockingIOError):
+            laptop.recvfrom(4096)  # nothing for a GCS that left
+        self.assertEqual(len(udp.peers), 1)
+
+        await agent.start_udp(("0.0.0.0", port))  # on again at once: the same port is free for it
+        self.assertEqual(agent.udp.local, ("0.0.0.0", port))
+
+    async def test_agent_udp_port_problems_are_reported(self):
+        agent = mr.GcsAgent(("127.0.0.1", self.port), KEY_G)
+        busy = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        busy.bind(("127.0.0.1", 0))  # another program has the port
+        self.addCleanup(busy.close)
+        with self.assertRaises(OSError):
+            await agent.start_udp(("0.0.0.0", busy.getsockname()[1]))
+        with self.assertRaises(socket.gaierror):
+            await agent.start_udp(("10.0.0..1", 14550))  # a mistyped address
+        self.assertIsNone(agent.udp)
+        self.assertTrue(agent.watching)
+        lan = mr.lan_address()
+        if lan is not None:  # this computer's own address: it listens there
+            await agent.start_udp((lan, 0))
+            self.addCleanup(agent.close_ports)
+            self.assertEqual((agent.udp.target, agent.udp.local[0]), (None, lan))
+
+    async def test_agent_udp_to_gcs_software_on_this_computer(self):  # the default: Mission Planner on 14550
+        vehicle = self.client(mr.ROLE_VEHICLE)
+        agent = mr.GcsAgent(("127.0.0.1", self.port), KEY_G)
+        self.tasks.append(asyncio.ensure_future(agent.run()))
+        self.addCleanup(agent.close_ports)
+        planner, stranger = self.gcs_socket(), self.gcs_socket()
+        await agent.start_udp(("localhost", planner.getsockname()[1]))
+        self.assertEqual(agent.udp.target, ("127.0.0.1", planner.getsockname()[1]))  # as its answers show it
+        await self.telemetry_flows(vehicle)
+        vehicle.send_data(v2_frame(30, bytes(28), 1))
+        data, agent_addr = await self.received(planner)
+        planner.sendto(v2_frame(0, bytes(9), 1), agent_addr)
+        stranger.sendto(v2_frame(0, bytes(9), 2), agent_addr)
+        await self.until(lambda: len(vehicle.inbox) == 2)
+        vehicle.send_data(v2_frame(30, bytes(28), 2))
+        self.assertEqual((await self.received(planner))[0], v2_frame(30, bytes(28), 2))  # once, not twice
+        await asyncio.sleep(0.2)
+        for sock in (planner, stranger):  # telemetry goes to the address set, and to no one else
+            with self.assertRaises(BlockingIOError):
+                sock.recvfrom(4096)
 
 
 if __name__ == "__main__":

@@ -269,6 +269,15 @@ server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
   round trip), packet loss and traffic, and ☰ → Show log the details.
 - In Mission Planner pick **UDP**, port **14550**, or **TCP**, host **127.0.0.1**, port **5760**.
   QGroundControl finds UDP 14550 by itself.
+- **From another computer, a tablet or a phone** on the same network: switch the port off, set
+  its IP to **0.0.0.0** and switch it on again. It then listens on all of this PC's addresses,
+  and the card shows the one to use (192.168.2.178, say). **TCP**: connect to that address and
+  port. **UDP**: in Mission Planner pick **UDPCl** and enter that address and port; in
+  QGroundControl add a UDP comm link with that address and port as its server. Several can
+  connect at once. Or put the other computer's own address on the UDP card: MavLTE then sends
+  there, to Mission Planner listening on UDP (14550). Anyone on that network can reach the
+  aircraft through a port open like this, so do it only on networks you trust (with MAVLink
+  signing, above, the flight controller ignores commands that are not signed).
 - With both switches off the app only watches: the Available LEDs keep working, but the aircraft
   holds its telemetry back, so it uses almost no mobile data.
 - **Position**, in the *Aircraft* panel, is where the LTE module's own GNSS puts the aircraft,
@@ -449,6 +458,7 @@ missed while the app was closed) travel over your laptop's internet.
 | Relay log says `... has the wrong key` | The key in the firmware (or agent) differs from `vehicle_key` (or `gcs_key`) in `mavrelay.ini`. |
 | Relay log is silent when the aircraft is on | The UDP port is closed in a firewall, or the host or port in the firmware is wrong. |
 | Agent connects, Mission Planner shows nothing | Mission Planner's port must match `--udp` (default 14550). Check `SERIALn_PROTOCOL` and `SERIALn_BAUD`, and that TX and RX are crossed. |
+| Another computer or phone cannot connect | The MavLTE card's IP must be 0.0.0.0 ([section 5](#5-mavlte-app-and-mission-planner)); for UDP, Mission Planner there connects with UDPCl, not UDP. The first time a port listens, Windows asks whether to let MavLTE through its firewall: tick the kind of network you are on (Windows often calls a home Wi-Fi *Public*). |
 | Mission Planner connects but commands are ignored | Signing is on and this Mission Planner does not have the key. |
 | Data use higher than expected | Mission Planner raised the stream rates: set the "Ignore Streamrate" option and the rates, then reboot the flight controller. |
 | `No photo: the aircraft has no camera` | DIP switch CAM on, the camera's ribbon cable seated in its connector (contacts the right way round), *Camera* on in menuconfig. The ESP32 log says why. |

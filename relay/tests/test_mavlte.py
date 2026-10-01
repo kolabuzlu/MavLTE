@@ -225,6 +225,43 @@ class GuiTest(unittest.TestCase):
         app.toggle(app.tcp_card, True)
         self.assertIn("1 to 65535", self.text(app.tcp_card.status))
 
+    def test_udp_port_problems_are_reported(self):
+        app = self.app
+        busy = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        busy.bind(("127.0.0.1", 0))
+        self.addCleanup(busy.close)
+        app.udp_card.host.set("0.0.0.0")
+        app.udp_card.port.set(str(busy.getsockname()[1]))
+        app.toggle(app.udp_card, True)
+        self.assertFalse(app.udp_card.switch.on)
+        self.assertIn(f"UDP port {busy.getsockname()[1]} is in use", self.text(app.udp_card.status))
+        app.udp_card.host.set("10.0.0..1")
+        app.toggle(app.udp_card, True)
+        self.assertFalse(app.udp_card.switch.on)
+        self.assertTrue(self.text(app.udp_card.status).startswith("cannot find 10.0.0..1"))
+        self.assertTrue(app.runner.agent.watching)
+
+    def test_udp_for_gcs_software_on_other_computers(self):
+        app = self.app
+        port = free_port()
+        app.udp_card.host.set("0.0.0.0")  # as for TCP: it listens (Mission Planner on any computer: UDPCl)
+        app.udp_card.port.set(str(port))
+        self.pump(lambda: app.udp_card.available.color == mavlte.GREEN, what="aircraft available")
+        app.toggle(app.udp_card, True)
+        self.assertTrue(app.udp_card.switch.on)
+        here = mr.lan_address() or "this computer's address"  # what to type on the other computer
+        self.pump(lambda: self.text(app.udp_card.status) == f"Waiting for Mission Planner: UDPCl, {here}, port {port}",
+                  what="UDP waits for GCS software")
+        planner = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        planner.bind(("127.0.0.1", 0))
+        planner.settimeout(3)
+        self.addCleanup(planner.close)
+        planner.sendto(v2_frame(0, bytes(9), 1), ("127.0.0.1", port))  # its heartbeat: here I am
+        self.pump(lambda: self.text(app.udp_card.status) == "1 GCS connected", what="GCS counted")
+        data, addr = planner.recvfrom(4096)
+        self.assertEqual((data[:1], addr[1]), (b"\xfd", port))
+        self.assertEqual(mavlte.Settings.load(self.config).udp, f"0.0.0.0:{port}")
+
     def test_starts_with_both_switches_off(self):
         # even though the settings file (from an earlier version) says they were on
         self.pump(lambda: self.text(self.app.relay_text).startswith("Connected to the relay"), what="initial state")
