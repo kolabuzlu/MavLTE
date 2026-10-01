@@ -230,7 +230,7 @@ static esp_err_t answer_line(uint8_t *data, size_t len)
     if (strstr(answer, "\nOK") || strncmp(answer, "OK", 2) == 0) {
         return ESP_OK;
     }
-    if (strstr(answer, "ERROR")) {
+    if (strstr(answer, "ERROR") || strstr(answer, "NO CARRIER")) {
         return ESP_FAIL;
     }
     return ESP_ERR_TIMEOUT; /* more to come */
@@ -368,6 +368,7 @@ static bool configure(void)
     char out[ESP_MODEM_C_API_STR_BUF_SIZE];
     esp_modem_set_echo(dce, false);
     esp_modem_at(dce, "AT+CMEE=2", out, 1000); /* readable error messages in the log */
+    esp_modem_at(dce, "AT+COPS=3,0", out, 1000); /* the operator's name in AT+COPS?, not its number */
     if (!check_sim()) {
         return false;
     }
@@ -526,7 +527,8 @@ static bool dial(void)
         if (esp_modem_set_mode(dce, ESP_MODEM_MODE_CMUX) != ESP_OK) {
             if (esp_modem_get_mode(dce) != ESP_MODEM_MODE_CMUX) { /* the multiplexer did not start */
                 cmux_failed();
-            } else { /* it did, but the data call did not */
+            } else { /* it did, but the data call did not: hang_up() closes the multiplexer */
+                in_cmux = true;
                 ESP_LOGW(TAG, "the modem did not accept the data call (APN \"%s\")", CONFIG_BRIDGE_APN);
             }
             return false;
@@ -711,7 +713,12 @@ static void modem_task(void *arg)
         if (!sync_modem(30000)) {
             leave_cmux();
             if (sync_modem(5000)) {
-                ESP_LOGI(TAG, "the modem was still multiplexed (CMUX) from before the ESP32 restarted");
+                /* Its data call from then lives on, and it refuses new ones until it restarts (seen on
+                 * the A7670E: ATH does not end it). Only with DIP switch "4G" on: otherwise the ESP32's
+                 * restart cuts the modem's power too. */
+                ESP_LOGI(TAG, "the modem was still multiplexed (CMUX) from before the ESP32 restarted; restarting it");
+                hard_reset();
+                continue;
             } else {
                 ESP_LOGE(TAG, "the modem does not answer on its UART");
                 failures++;
