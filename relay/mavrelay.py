@@ -25,6 +25,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import socket
 import struct
@@ -34,7 +35,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.5.2"
+__version__ = "1.5.3"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -70,6 +71,7 @@ PING_FLAG_WATCHING = 0x01  # GCS agent: only watching the vehicle's link, send i
 PING_FLAG_SPEAKING = 0x02  # vehicle: its locator voice sounds
 PING_FLAG_VOICE_FAILED = 0x04  # vehicle: asked to sound, but its modem does not play it
 STATUS_VEHICLE_ONLINE = 0x01
+IDLE_CAPPED = 0xFFFE  # STATUS idle_ms tops out here: the relay last heard the vehicle 65.5 s ago or more
 STATUS_VOICE_ON = 0x02  # the relay has the locator voice switched on
 STATUS_SPEAKING = 0x04  # the vehicle said in its last PING that it sounds
 STATUS_VOICE_FAILED = 0x08  # ... that it cannot
@@ -371,7 +373,8 @@ class LinkStatus(NamedTuple):
         if not self.connected:
             return "vehicle: not connected to the server" + voice
         if not self.online:
-            return f"vehicle: OFFLINE, last heard {self.idle_ms / 1000:.1f} s ago" + voice
+            heard = "over a minute ago" if self.idle_ms >= IDLE_CAPPED else f"{self.idle_ms / 1000:.1f} s ago"
+            return f"vehicle: OFFLINE, last heard {heard}" + voice
         parts = ["vehicle: online"]
         if self.rat != RAT_UNKNOWN or self.rssi_dbm != RSSI_UNKNOWN:
             radio = RAT_NAMES.get(self.rat, "") if self.rat != RAT_UNKNOWN else ""
@@ -1344,7 +1347,7 @@ class RelayServer(asyncio.DatagramProtocol):
             U16_UNKNOWN if up is None else up,
             v.peer_loss,
             v.rssi_dbm,
-            min(U16_UNKNOWN - 1, int(idle * 1000)),
+            min(IDLE_CAPPED, int(idle * 1000)),
         )
 
     def summary(self, now: float) -> str:
@@ -2187,6 +2190,7 @@ class GcsAgent:
         self.on_status = on_status
         self.status: Optional[LinkStatus] = None
         self.status_time = 0.0
+        self.heard_at: Optional[float] = None  # when the relay last heard the aircraft (monotonic), from STATUS
         self.udp: Optional[LocalUdp] = None
         self.tcp: Optional[LocalTcp] = None
         self.to_gcs_bytes = 0  # MAVLink from the aircraft, handed to GCS software
@@ -2221,8 +2225,20 @@ class GcsAgent:
             return None
         return self.status
 
+    def vehicle_silence(self) -> Optional[float]:
+        """Seconds since the relay last heard the aircraft, counted on past the 65.5 s where STATUS's idle_ms
+        tops out; None without an aircraft at the relay, or when it was already that long silent when this
+        agent first heard of it (only "over a minute" is known then)."""
+        return None if self.heard_at is None else time.monotonic() - self.heard_at
+
     def _got_status(self, status: LinkStatus) -> None:
         self.status, self.status_time = status, time.monotonic()
+        if not status.connected:
+            self.heard_at = None
+        elif status.idle_ms < IDLE_CAPPED:
+            self.heard_at = self.status_time - status.idle_ms / 1000
+        elif self.heard_at is not None and self.status_time - self.heard_at < IDLE_CAPPED / 1000:
+            self.heard_at = None  # it cannot have been heard that recently: what we knew is out of date
         if self.voice_request is not None:
             if status.voice_on == self.voice_request:
                 self.voice_request = None
@@ -2350,13 +2366,15 @@ class GcsAgent:
         return True
 
     async def start_tcp(self, bind: Tuple[str, int]) -> None:
-        """Raises OSError if the port is taken."""
+        """Raises OSError if the port is taken, socket.gaierror if the name does not resolve."""
         self._close_tcp()
         host = bind[0] or "127.0.0.1"
         tcp = LocalTcp(self._from_gcs)
         try:
             await tcp.start(host, bind[1])
             self.tcp = tcp
+        except UnicodeError as exc:  # a name the IDNA codec refuses (a doubled dot, say), as in start_udp
+            raise socket.gaierror(f"{host}: {exc}") from None
         finally:
             self._update_watching()
         glog.info("listening on tcp %s (Mission Planner: connect TCP, %s, port %d)", fmt_addr((host, bind[1])),
@@ -2408,7 +2426,7 @@ async def run_gcs(opts) -> None:
         try:
             await agent.start_tcp(opts.tcp)
         except OSError as exc:
-            glog.warning("cannot listen on tcp port %d: %s", opts.tcp[1], exc)
+            glog.warning("cannot use tcp %s: %s", fmt_addr(opts.tcp), exc)
     await agent.run()
 
 
@@ -2465,11 +2483,23 @@ async def run_vehicle(opts) -> None:
 def load_config(path: Optional[str], section: str) -> Dict[str, str]:
     if not path:
         return {}
-    # interpolation=None: values are read as written, so a '%' (in a vehicle name, say) is just a '%'
-    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None)
-    if not parser.read(path, encoding="utf-8"):
-        raise SystemExit(f"cannot read config file {path}")
+    # interpolation=None: values are read as written, so a '%' (in a vehicle name, say) is just a '%'.
+    # strict=False: a section or key written twice counts once, the later value winning (before 1.5.3,
+    # update_config wrote a second [gcs] after a header line with a comment on it)
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None, strict=False)
+    try:
+        if not parser.read(path, encoding="utf-8"):
+            raise SystemExit(f"cannot read config file {path}")
+    except (configparser.Error, UnicodeDecodeError) as exc:
+        raise SystemExit(f"cannot read config file {path}: {exc}") from None
     return dict(parser[section]) if parser.has_section(section) else {}
+
+
+def ini_section(line: str) -> Optional[str]:
+    """The section a line of an INI file opens, as load_config reads it ("[gcs]  # laptop" -> "gcs"), or None."""
+    text = re.split(r"(?:^|\s)[#;]", line, maxsplit=1)[0].strip()
+    m = configparser.ConfigParser.SECTCRE.match(text)
+    return m.group("header") if m else None
 
 
 def update_config(path: str, section: str, values: Dict[str, str], remove=()) -> None:
@@ -2480,14 +2510,13 @@ def update_config(path: str, section: str, values: Dict[str, str], remove=()) ->
             lines = f.read().splitlines()
     except FileNotFoundError:
         lines = []
-    header = f"[{section}]".lower()
-    start = next((i for i, line in enumerate(lines) if line.strip().lower() == header), None)
+    start = next((i for i, line in enumerate(lines) if ini_section(line) == section), None)
     if start is None:
         if lines and lines[-1].strip():
             lines.append("")
         lines.append(f"[{section}]")
         start = len(lines) - 1
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].strip().startswith("[")), len(lines))
+    end = next((i for i in range(start + 1, len(lines)) if ini_section(lines[i]) is not None), len(lines))
     pending = {k.lower(): v for k, v in values.items()}
     drop = {k.lower() for k in remove}
     for i in range(start + 1, end):

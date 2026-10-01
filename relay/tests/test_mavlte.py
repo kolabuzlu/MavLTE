@@ -241,6 +241,14 @@ class GuiTest(unittest.TestCase):
         self.assertTrue(self.text(app.udp_card.status).startswith("cannot find 10.0.0..1"))
         self.assertTrue(app.runner.agent.watching)
 
+    def test_tcp_typo_is_reported(self):  # the 1.5.2 review: it gave an "Unexpected error" box
+        app = self.app
+        app.tcp_card.host.set("10.0.0..1")
+        app.toggle(app.tcp_card, True)
+        self.assertFalse(app.tcp_card.switch.on)
+        self.assertTrue(self.text(app.tcp_card.status).startswith("cannot find 10.0.0..1"))
+        self.assertTrue(app.runner.agent.watching)
+
     def test_udp_for_gcs_software_on_other_computers(self):
         app = self.app
         port = free_port()
@@ -479,6 +487,52 @@ class SettingsFileTest(unittest.TestCase):
             self.assertIsNone(mavlte.name_problem(fine), fine)
         for cut_short in ("UAV #2", "#1 UAV", "Plane ;blue"):  # the INI file would read a comment there
             self.assertIsNotNone(mavlte.name_problem(cut_short), cut_short)
+
+    def test_a_commented_header_survives_saving(self):
+        """The 1.5.2 review: "[gcs]  # ..." got a second [gcs] on saving, and MavLTE did not start again."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "mavrelay.ini")
+        with open(path, "w") as f:
+            f.write("[gcs]  # laptop agent\nserver = relay.example.com:14650\nkey = %s\n" % KEY_G.hex())
+        settings = mavlte.Settings.load(path)
+        settings.tcp = "127.0.0.1:5761"
+        settings.save(path, ("tcp", "udp"))  # as closing the app does
+        again = mavlte.Settings.load(path)
+        self.assertEqual((again.server, again.tcp, again.problem), ("relay.example.com:14650", "127.0.0.1:5761", ""))
+        with open(path) as f:
+            self.assertEqual(f.read().count("[gcs]"), 1)
+        with open(path, "a") as f:  # a file 1.5.2 had already spoilt: read all the same
+            f.write("\n[gcs]\nudp = 127.0.0.1:14551\n")
+        self.assertEqual(mavlte.Settings.load(path).udp, "127.0.0.1:14551")
+
+    def test_an_unreadable_file_does_not_stop_the_app(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "mavrelay.ini")
+        with open(path, "wb") as f:
+            f.write("[gcs]\nname = Kuş\nserver = relay.example.com:14650\n".encode("cp1254"))  # Turkish ANSI
+        settings = mavlte.Settings.load(path)
+        self.assertEqual(settings.server, "")
+        self.assertIn("cannot read config file", settings.problem)
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            with mock.patch.object(mavlte.messagebox, "showwarning") as warn, \
+                    mock.patch.object(mavlte.App, "open_settings"):
+                app = mavlte.App(root, config_path=path)  # it starts, says why, and closes
+                end = time.time() + 2
+                while not warn.called and time.time() < end:
+                    root.update()
+                    time.sleep(0.02)
+                app.close()
+            self.assertIn("cannot read config file", warn.call_args[0][1])
+        finally:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+            gc.collect()
 
 
 @unittest.skipUnless("mavlte" in sys.modules, "needs tkinter")

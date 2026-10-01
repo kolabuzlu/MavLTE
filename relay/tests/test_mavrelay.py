@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -92,6 +93,25 @@ class ProtocolTest(unittest.TestCase):
         short = mr.LinkStatus.unpack(b"\x01")  # an older server sending fewer fields
         self.assertTrue(short.online)
         self.assertEqual(short.rssi_dbm, mr.RSSI_UNKNOWN)
+
+    def test_silence_counts_on_past_65_5_s(self):
+        """STATUS's idle_ms tops out at 65.5 s; the relay keeps the session for 120 s. The 1.5.2 review found
+        MavLTE showing "last heard 66 s ago" all that time."""
+        status = lambda idle: mr.LinkStatus.unpack(mr.STATUS_BODY.pack(0, 7, 85, 3, 0, -71, idle))  # noqa: E731
+        self.assertEqual(status(mr.IDLE_CAPPED).describe(), "vehicle: OFFLINE, last heard over a minute ago")
+        agent = mr.GcsAgent(("127.0.0.1", 9), KEY_G)
+        with mock.patch.object(mr.time, "monotonic", return_value=1000.0):
+            agent._got_status(status(60000))
+            self.assertAlmostEqual(agent.vehicle_silence(), 60.0)
+        with mock.patch.object(mr.time, "monotonic", return_value=1030.0):
+            agent._got_status(status(mr.IDLE_CAPPED))  # 90 s silent; STATUS says 65.5
+            self.assertAlmostEqual(agent.vehicle_silence(), 90.0)
+        with mock.patch.object(mr.time, "monotonic", return_value=1061.0):
+            agent._got_status(mr.LinkStatus.unpack(mr.NO_VEHICLE_STATUS))  # the relay has dropped it
+            self.assertIsNone(agent.vehicle_silence())
+        late = mr.GcsAgent(("127.0.0.1", 9), KEY_G)  # connects when the aircraft is already long silent
+        late._got_status(status(mr.IDLE_CAPPED))
+        self.assertIsNone(late.vehicle_silence())  # only "over a minute" is known
 
 
 class ReplayWindowTest(unittest.TestCase):
@@ -288,6 +308,43 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(text, "# notes\n[server]\nlisten = 0.0.0.0:14650  # port\n\n[gcs]\n# the relay\n"
                                "server = new:2\nudp = off\nkey = k1\n\n[vehicle]\nkey = abc\n")
         self.assertEqual(fresh, "[gcs]\nkey = k2\n")
+
+    def test_a_header_with_a_comment(self):
+        """The 1.5.2 review found update_config adding a second [gcs] after "[gcs]  # ..." (read fine), after
+        which MavLTE did not start any more."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mavrelay.ini")
+            with open(path, "w") as f:
+                f.write("[gcs]  # laptop agent\nserver = a:1\n\n[vehicle] ; the plane\nkey = abc\n")
+            mr.update_config(path, "gcs", {"tcp": "127.0.0.1:5760"})
+            mr.update_config(path, "vehicle", {"key": "def"})
+            with open(path) as f:
+                text = f.read()
+            conf = mr.load_config(path, "gcs")
+        self.assertEqual(text, "[gcs]  # laptop agent\nserver = a:1\ntcp = 127.0.0.1:5760\n\n[vehicle] ; the plane\n"
+                               "key = def\n")
+        self.assertEqual(conf, {"server": "a:1", "tcp": "127.0.0.1:5760"})
+        self.assertEqual([mr.ini_section(line) for line in ("[gcs]", "  [gcs] # x", "[gcs]#x", "# [gcs]", "key = [x]")],
+                         ["gcs", "gcs", "gcs", None, None])  # as configparser reads them
+
+    def test_a_section_written_twice_is_read(self):  # as 1.5.2 could leave it: the later value wins
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mavrelay.ini")
+            with open(path, "w") as f:
+                f.write("[gcs]  # laptop agent\nserver = a:1\ntcp = 10.1.1.1:1\n\n[gcs]\ntcp = 127.0.0.1:5760\n")
+            self.assertEqual(mr.load_config(path, "gcs"), {"server": "a:1", "tcp": "127.0.0.1:5760"})
+
+    def test_an_unreadable_file_says_why(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            broken, ansi = os.path.join(tmp, "broken.ini"), os.path.join(tmp, "ansi.ini")
+            with open(broken, "w") as f:
+                f.write("[gcs]\nserver = a:1\nthis line means nothing\n")
+            with open(ansi, "wb") as f:
+                f.write("[gcs]\nname = Kuş\n".encode("cp1254"))  # saved as Turkish ANSI, not UTF-8
+            for path in (broken, ansi):
+                with self.assertRaises(SystemExit) as caught:
+                    mr.load_config(path, "gcs")
+                self.assertIn(f"cannot read config file {path}: ", str(caught.exception))
 
     def test_values_are_read_as_written(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -683,6 +740,10 @@ class LiveTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(socket.gaierror):
             await agent.start_udp(("10.0.0..1", 14550))  # a mistyped address
         self.assertIsNone(agent.udp)
+        self.assertTrue(agent.watching)
+        with self.assertRaises(socket.gaierror):  # the same on TCP (it raised UnicodeEncodeError until 1.5.3)
+            await agent.start_tcp(("10.0.0..1", 5760))
+        self.assertIsNone(agent.tcp)
         self.assertTrue(agent.watching)
         lan = mr.lan_address()
         if lan is not None:  # this computer's own address: it listens there

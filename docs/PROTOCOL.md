@@ -57,7 +57,8 @@ so fields can be appended in later versions.
 STATUS describes the vehicle's link: flag bit 0 means the vehicle was heard within the last
 3 s, `rtt_ms`, `down_loss_permille`, `rssi_dbm` and `rat` are what the vehicle reported in its
 last PING, `up_loss_permille` is measured by the server, and `idle_ms` is the time since the
-server last heard from the vehicle.
+server last heard from the vehicle. It tops out at 65534 (65.5 s or more): a GCS agent that saw it
+count up to there goes on counting by itself, until the server drops the session (120 s by default).
 
 ## Session setup
 

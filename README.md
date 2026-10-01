@@ -541,6 +541,7 @@ missed while the app was closed) travel over your laptop's internet.
 | Agent connects, Mission Planner shows nothing | Mission Planner's port must match `--udp` (default 14550). Check `SERIALn_PROTOCOL` and `SERIALn_BAUD`, and that TX and RX are crossed. |
 | Another computer or phone cannot connect | The MavLTE card's IP must be 0.0.0.0 ([section 5](#5-mavlte-app-and-mission-planner)); for UDP, Mission Planner there connects with UDPCl, not UDP. The first time a port listens, Windows asks whether to let MavLTE through its firewall: tick the kind of network you are on (Windows often calls a home Wi-Fi *Public*). |
 | Mission Planner connects but commands are ignored | Signing is on and this Mission Planner does not have the key. |
+| MavLTE says it cannot read its settings file | A line in `mavrelay.ini` it cannot make sense of, or the file saved in an encoding other than UTF-8; the message names the line. Fix it, or delete the file (`%LOCALAPPDATA%\MavLTE\mavrelay.ini` for `MavLTE.exe`) and enter the relay and key again. |
 | Data use higher than expected | Mission Planner raised the stream rates: set the "Ignore Streamrate" option and the rates, then reboot the flight controller. |
 | `No photo: the aircraft has no camera` | DIP switch CAM on, the camera's ribbon cable seated in its connector (contacts the right way round), *Camera* on in menuconfig. The ESP32 log says why. |
 | `No photo: the camera could not take the photo` | The ESP32 log says why; for *Large*, too little free memory: take *Medium*. |

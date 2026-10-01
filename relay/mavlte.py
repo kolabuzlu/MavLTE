@@ -106,14 +106,16 @@ class Settings:
     udp: str = "127.0.0.1:14550"
     photo_dir: str = ""  # empty: Pictures\MavLTE
     photo_size: str = "medium"
+    problem: str = ""  # why the settings file could not be read: the app then starts without it
 
     @classmethod
     def load(cls, path: str) -> "Settings":
         s = cls()
         try:
             conf = mr.load_config(path, "gcs") if os.path.exists(path) else {}
-        except SystemExit:
+        except SystemExit as exc:  # unreadable (a broken line, another encoding): start, and say why
             conf = {}
+            s.problem = str(exc)
         s.name = conf.get("name", "").strip() or s.name
         s.server = conf.get("server", "").strip()
         s.key = conf.get("key", "").strip()
@@ -865,6 +867,11 @@ class App:
         self.poll()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.report_callback_exception = self._report
+        if self.settings.problem:
+            log.warning("%s", self.settings.problem)
+            root.after(200, lambda: messagebox.showwarning(
+                APP, f"{self.settings.problem}\n\nMavLTE starts without those settings. Set the relay and key "
+                     "again (☰ → Settings), or fix that file, or delete it, and start MavLTE again."))
         if not (self.settings.server and self.settings.key):
             root.after(300, self.open_settings)
 
@@ -1077,7 +1084,7 @@ class App:
         self.settings.tcp, self.settings.udp = self.tcp_card.text(), self.udp_card.text()
         try:
             self.settings.save(self.config_path, ("tcp", "udp") + fields)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:  # ValueError: a file in another encoding (the app still closes)
             log.warning("cannot save settings: %s", exc)
 
     def apply_settings(self, name: str, server: str, key: str) -> None:
@@ -1321,7 +1328,9 @@ class App:
             self._set(self.craft_state, "Not connected to the relay (yet)")
         else:
             self.craft_led.set(RED)
-            self._set(self.craft_state, f"Offline, last heard {status.idle_ms / 1000:.0f} s ago")
+            silence = agent.vehicle_silence()  # counts on where STATUS tops out (65.5 s)
+            heard = f"{silence:.0f} s ago" if silence is not None else "over a minute ago"
+            self._set(self.craft_state, f"Offline, last heard {heard}")
         online = bool(status and status.online)
         self.craft_bars.set(self._bars(status) if online else None)
         if online:  # the aircraft's radio and its round trip to the relay, on one line
