@@ -61,7 +61,7 @@ bool battery_read(uint16_t *mv, uint8_t *pct)
     if (!read_register(REG_VCELL, &vcell) || !read_register(REG_SOC, &soc)) {
         return false;
     }
-    *mv = (uint16_t)((uint32_t)vcell * 78125 / 1000000);
+    *mv = (uint16_t)((uint32_t)vcell * 5 / 64); /* 78.125 uV = 5/64 mV (vcell * 78125 overflowed above 4.295 V) */
     unsigned whole = soc >> 8;
     *pct = (uint8_t)(whole > 100 ? 100 : whole);
     return true;

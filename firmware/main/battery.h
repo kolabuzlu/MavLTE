@@ -10,8 +10,10 @@
 /* Sets up the bus and looks for the gauge. */
 void battery_start(void);
 
-/* The cell's voltage (mV) and charge (0-100 %); false if the gauge does not answer. Without a cell,
- * it reads what the charger holds the cell's contacts at. */
+/* The cell's voltage (mV) and charge (0-100 %); false if the gauge does not answer. The gauge sits on
+ * the board's supply rail (VBAT), not on the cell itself: while USB or the 5V pin powers the board, it
+ * reads the converter that feeds that rail (about 4.3 V on a V2 board), and only on the cell alone
+ * (after a crash, say) the cell. */
 bool battery_read(uint16_t *mv, uint8_t *pct);
 
 /* The I2C port of the gauge's bus, for the camera to share on V2 boards; -1 if there is no bus. */
