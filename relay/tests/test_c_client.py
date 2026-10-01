@@ -128,7 +128,7 @@ class CVehicleTest(unittest.IsolatedAsyncioTestCase):
                             on_photo=lambda path, info: saved.append((path, info)))
         for task in (asyncio.ensure_future(ticker()), asyncio.ensure_future(agent.run())):
             self.addCleanup(task.cancel)
-        proc = await asyncio.create_subprocess_exec(self.harness, "127.0.0.1", str(port), KEY_V.hex(), "8",
+        proc = await asyncio.create_subprocess_exec(self.harness, "127.0.0.1", str(port), KEY_V.hex(), "12",
                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await self.until(lambda: relay.vehicle is not None and agent.client.is_connected)
         await asyncio.sleep(0.5)
@@ -151,10 +151,18 @@ class CVehicleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pos.temp, 41)  # the harness's chip
         self.assertTrue(pos.fc_is_silent)
 
-        out, err = await asyncio.wait_for(proc.communicate(), 15)
+        # its locator voice: the agent's switch, kept by the relay and passed on in its PONGs; the C vehicle
+        # says it speaks in its PINGs
+        self.assertTrue(agent.set_voice(True))
+        await self.until(lambda: agent.status.voice_on and agent.status.speaking)
+        self.assertTrue(agent.set_voice(False))
+        await self.until(lambda: not (agent.status.voice_on or agent.status.speaking))
+
+        out, err = await asyncio.wait_for(proc.communicate(), 20)
         self.assertEqual(proc.returncode, 0, err.decode())
         stats = dict(item.split("=") for item in out.decode().split())
         self.assertEqual((stats["photos"], stats["bad"]), ("1", "0"))
+        self.assertIn("harness: voice on\nharness: voice off", err.decode())
 
 
 if __name__ == "__main__":

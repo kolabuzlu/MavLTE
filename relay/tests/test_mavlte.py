@@ -379,6 +379,53 @@ class GuiTest(unittest.TestCase):
         report(mr.TEMP_UNKNOWN)  # an aircraft from before 1.4.0
         self.pump(lambda: self.text(chip) == "", what="no temperature")
 
+    def test_locator_voice(self):
+        app = self.app
+        row = app.voice
+        modem = {"answer": "speaks"}
+
+        async def voice():  # the aircraft, as the firmware: says whether it speaks while the relay asks it to
+            while True:
+                await asyncio.sleep(0.05)
+                flags = {"speaks": mr.PING_FLAG_SPEAKING, "refuses": mr.PING_FLAG_VOICE_FAILED,
+                         "before 1.5.0": 0}[modem["answer"]] if self.vehicle.voice_on else 0
+                if flags != self.vehicle.ping_flags:
+                    self.vehicle.ping_flags = flags
+                    self.vehicle.ping_now()
+
+        self.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(voice()))
+        self.pump(lambda: app.camera.enabled, what="aircraft online")
+        self.pump(lambda: self.text(row.status).startswith("Off:"), what="voice off")
+        self.assertFalse(row.switch.on)
+
+        app.toggle_voice(True)
+        self.assertTrue(row.switch.on)
+        self.pump(lambda: self.text(row.status) == "On: the aircraft is speaking", what="speaking")
+        self.assertEqual(row.status.cget("fg"), mavlte.GREEN)
+        self.assertTrue(self.relay.voice.on and self.vehicle.voice_on)
+
+        modem["answer"] = "refuses"
+        self.pump(lambda: row.status.cget("fg") == mavlte.RED, what="cannot speak")
+        self.assertEqual(self.text(row.status), "On, but the aircraft cannot speak")
+
+        app.toggle_voice(False)
+        self.pump(lambda: self.text(row.status).startswith("Off:"), what="off again")
+        self.assertFalse(row.switch.on or self.relay.voice.on)
+        self.pump(lambda: not self.vehicle.voice_on, what="the aircraft told")
+
+        modem["answer"] = "before 1.5.0"  # firmware that knows nothing of the voice
+        with mock.patch.object(mavlte.App, "VOICE_ANSWER_S", 0.5):
+            app.toggle_voice(True)
+            self.pump(lambda: "before 1.5.0" in self.text(row.status), what="hint at old firmware")
+
+        modem["answer"] = "speaks"
+        self.pump(lambda: self.text(row.status) == "On: the aircraft is speaking", what="speaking again")
+        self.vehicle_quiet = True  # the aircraft drops off the air
+        self.loop.call_soon_threadsafe(self.vehicle_task.cancel)
+        self.pump(lambda: self.text(row.status).startswith("On: it was speaking when last heard"), timeout=10,
+                  what="speaking while offline")
+        self.assertTrue(row.switch.on)  # the relay keeps the switch
+
     def test_wrong_key_says_no_answer(self):
         app = self.app
         app.apply_settings(app.settings.name, app.settings.server, KEY_V.hex())  # not the GCS key: no answer

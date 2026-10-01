@@ -7,7 +7,10 @@ the switches; Connected (blue, next to the switch) while it is online and that p
 switches start off. With both off the app only watches: the aircraft holds its telemetry back.
 Snapshot asks the aircraft for a photo from its camera, whatever the switches; photos are kept in
 Pictures\\MavLTE, each with a .json beside it saying when and where it was taken. Position shows
-where the LTE module's own GNSS puts the aircraft, live or last known, with a map link.
+where the LTE module's own GNSS puts the aircraft, live or last known, with a map link. The Voice
+switch (the locator voice) makes the aircraft speak through the speaker on its board until it is
+switched off, to find it in the last metres; the relay keeps the switch, also while the aircraft
+is offline.
 
     python mavlte.py            (or double-click MavLTE.pyw, or run MavLTE.exe: build_release.py)
 
@@ -277,6 +280,13 @@ class AgentRunner:
 
         return self._call(go())
 
+    def set_voice(self, on: bool) -> bool:
+        """Switches the aircraft's locator voice. False while there is no session with the relay."""
+        async def go() -> bool:
+            return self.agent is not None and self.agent.set_voice(on)
+
+        return self._call(go())
+
     @staticmethod
     def _ended(task: asyncio.Task) -> None:
         if not task.cancelled() and task.exception() is not None:
@@ -405,6 +415,23 @@ def dark_title_bar(window: tk.Misc) -> None:
                 break
     except (AttributeError, OSError):
         pass
+
+
+def place_on_screen(window: tk.Tk, scale: float) -> None:
+    """Opens a window at the top of the screen when where Windows would put it hides its bottom behind the
+    taskbar (a 1080p laptop at 125% has 1020 pixels above the taskbar)."""
+    if sys.platform != "win32":
+        return
+    try:
+        from ctypes import wintypes
+        area = wintypes.RECT()
+        if not ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(area), 0):  # SPI_GETWORKAREA
+            return
+    except (AttributeError, OSError):
+        return
+    window.update_idletasks()
+    if window.winfo_reqheight() + round(100 * scale) > area.bottom - area.top:  # its title bar, and Windows' offset
+        window.geometry(f"+{area.left + round(24 * scale)}+{area.top}")
 
 
 class ChannelCard(tk.Frame):
@@ -586,6 +613,23 @@ class CameraRow(tk.Frame):
         if enabled != self.enabled:
             self.enabled = enabled
             self.button.state(["!disabled"] if enabled else ["disabled"])
+
+
+class VoiceRow(tk.Frame):
+    """The locator voice, a line of the Aircraft card: while it is on, the aircraft says its phrase through
+    the speaker on its board, again and again, to be found in the last metres. The relay keeps the switch."""
+
+    def __init__(self, app: "App", master: tk.Misc) -> None:
+        super().__init__(master, bg=SURFACE)
+        s = app.scale
+        self.switch = Switch(self, s * 0.7, SURFACE, app.toggle_voice)  # no taller than a line of text
+        self.switch.pack(side="left")
+        self.status = tk.Label(self, text="", bg=SURFACE, fg=DIM, font=app.font, anchor="w", justify="left")
+        self.status.pack(side="left", padx=(round(6 * s), 0))
+
+    def show(self, text: str, color: str = DIM) -> None:
+        if self.status.cget("text") != text or self.status.cget("fg") != color:
+            self.status.configure(text=text, fg=color)
 
 
 class PhotoViewer(tk.Toplevel):
@@ -816,6 +860,7 @@ class App:
         setup_style(root)
         self._build()
         dark_title_bar(root)
+        place_on_screen(root, self.scale)
         self._connect()
         self.poll()
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -892,8 +937,12 @@ class App:
         grid = tk.Frame(craft, bg=SURFACE)
         grid.pack(fill="x", padx=pad, pady=(0, pad))
         self.craft_values = {}
-        for row, label in enumerate(("Link", "Packet loss", "Traffic", "Position", "Module")):
+        for row, label in enumerate(("Link", "Packet loss", "Traffic", "Position", "Module", "Voice")):
             tk.Label(grid, text=label, bg=SURFACE, fg=MUTED, font=self.font).grid(row=row, column=0, sticky="w")
+            if label == "Voice":  # the locator voice: the board's speaker, for the last metres to the aircraft
+                self.voice = VoiceRow(self, grid)
+                self.voice.grid(row=row, column=1, sticky="w", padx=(12, 0))
+                continue
             cell = tk.Frame(grid, bg=SURFACE)
             cell.grid(row=row, column=1, sticky="w", padx=(12, 0))
             value = tk.Label(cell, text="-", bg=SURFACE, fg=TEXT, font=self.font, anchor="w")
@@ -906,6 +955,7 @@ class App:
                 self.chip_temp = tk.Label(cell, text="", bg=SURFACE, fg=TEXT, font=self.font, anchor="w", padx=0)
                 self.chip_temp.pack(side="left")
         self.shown_fix: Optional[mr.Position] = None  # the position Map and Copy use
+        self.voice_waiting_at: Optional[float] = None  # voice on, aircraft online, not speaking yet: since when
         self.camera = CameraRow(self, craft)
         self.camera.pack(fill="x")
         newest = photo_files(self.settings.photo_folder())
@@ -954,6 +1004,12 @@ class App:
             log.info("asking the aircraft for a photo (%s, %d×%d)", SIZE_NAMES[size], *mr.SNAP_SIZES[size])
         else:
             self.camera.show("Not connected to the relay", RED)
+
+    def toggle_voice(self, on: bool) -> None:
+        if self.runner.running and self.runner.set_voice(on):
+            self.voice.switch.set(on)  # the relay confirms within a second or two (_show_voice)
+        else:
+            self.voice.show("Not connected to the relay", RED)
 
     def choose_size(self, index: int) -> None:
         self.settings.photo_size = SIZE_NAMES[index]
@@ -1111,6 +1167,7 @@ class App:
                     where = f"UDP, port {port}" if mr.is_loopback(host) else f"UDP {host}, port {port}"
                 self.udp_card.show(*self._port_status(online, gcs, where))
         self._show_aircraft(agent, status, now)
+        self._show_voice(agent, status, now)
         self._take_photos(now)
         self._show_camera(agent, online, now)
         self.poll_job = self.root.after(self.POLL_MS, self.poll)
@@ -1175,6 +1232,43 @@ class App:
             card.show(self.SIZE_HINTS[card.size.selected])
         card.set_enabled(connected and online and not busy)
         card.size.set_enabled(not busy)
+
+    VOICE_ANSWER_S = 10.0  # an aircraft that has not said it speaks by then may not know the voice
+
+    def _show_voice(self, agent, status: Optional[mr.LinkStatus], now: float) -> None:
+        """The switch shows the relay's: it keeps it, whoever switched it, also while the aircraft is away."""
+        row = self.voice
+        if agent is None or not agent.client.session:
+            row.switch.set(False)
+            row.show("Not connected to the relay")
+            return
+        pending = agent.voice_request
+        if pending is not None:  # sent, and not yet in the relay's STATUS
+            row.switch.set(pending)
+            row.show("Switching on…" if pending else "Switching off…", TEXT)
+            return
+        if status is None:
+            return
+        row.switch.set(status.voice_on)
+        waiting = status.voice_on and status.online and not (status.speaking or status.voice_failed)
+        if not waiting:
+            self.voice_waiting_at = None
+        elif self.voice_waiting_at is None:
+            self.voice_waiting_at = now
+        if not status.voice_on:
+            row.show("Off: switch on to make the aircraft talk")
+        elif status.voice_failed:
+            row.show("On, but the aircraft cannot speak", RED)  # its modem refuses
+        elif status.speaking and status.online:
+            row.show("On: the aircraft is speaking", GREEN)
+        elif status.speaking:  # and it goes on without the relay
+            row.show("On: it was speaking when last heard", AMBER)
+        elif not status.online:
+            row.show("On: speaks once the aircraft is back", AMBER)
+        elif now - self.voice_waiting_at < self.VOICE_ANSWER_S:
+            row.show("On: waiting for the aircraft…", TEXT)
+        else:  # it does not say whether it speaks
+            row.show("On, but no answer: firmware before 1.5.0?", AMBER)
 
     def _reached_at(self, host: str, now: float) -> str:
         """The address GCS software connects to, for a port on `host`. On all of them (0.0.0.0): this

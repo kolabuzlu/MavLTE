@@ -309,6 +309,32 @@ class PlaneTest(unittest.TestCase):
         p.call(p.set_cell, False)  # the cell out as well: now it is gone
         wait_for(self, lambda: p.modem is None, "module off")
 
+    def test_locator_voice(self):
+        """MavLTE's Locator voice switch, through the relay: the module speaks, also where it has no coverage,
+        until the switch is off again."""
+        p, g = self.plane, self.ground
+
+        async def switch(on):
+            g.gcs.send_packet(mr.VOICE, mr.VOICE_BODY.pack(1 if on else 0))
+
+        p.call(p.set_cell, True)  # down, on its cell
+        p.call(p.set_lte, True)
+        wait_for(self, lambda: self.session() != 0, "module connected")
+        self.assertFalse(p.modem.voice)
+        with self.assertLogs("mavrelay.plane", "INFO") as logs:
+            g.run(switch(True))
+            wait_for(self, lambda: p.modem.voice, "the module speaks")
+        self.assertIn("locator voice on", " ".join(logs.output))
+        wait_for(self, lambda: g.relay.vehicle.speaking, "the relay hears that it speaks")
+
+        p.call(p.set_network, plane_sim.NO_CONNECTION)  # in a valley: no coverage
+        time.sleep(1.5)
+        self.assertTrue(p.modem.voice)  # it goes on speaking
+        p.call(p.set_network, plane_sim.NET_LTE)
+        g.run(switch(False))
+        wait_for(self, lambda: not p.modem.voice, "the module stops speaking", timeout=15)
+        wait_for(self, lambda: not g.relay.vehicle.speaking, "the relay hears that it stopped")
+
     def test_chip_temperature(self):
         """The module's chip: the air in the fuselage, plus its own heat while it runs, followed with a lag;
         in the sun hot enough for MavLTE's amber, then red."""
@@ -494,6 +520,17 @@ class WindowTest(unittest.TestCase):
                 wait_for(self, lambda: text(win.camera_text) == "Off: the aircraft answers that it has no camera",
                          "camera off", pump=root.update)
                 self.assertFalse(plane.camera)
+
+                voice = win.lte_values["Voice"]  # what the board's speaker would be saying
+                self.assertEqual(text(voice), "Off (MavLTE: Voice switch)")
+
+                async def switch_voice():
+                    ground.gcs.send_packet(mr.VOICE, mr.VOICE_BODY.pack(1))
+
+                ground.run(switch_voice())
+                wait_for(self, lambda: text(voice) == "Speaking: “Mav L T E here.” again and again", "voice shown",
+                         pump=root.update)
+                self.assertEqual(voice.cget("fg"), ui.GREEN)
                 win.toggle_lte(False)
                 wait_for(self, lambda: text(win.lte_values["State"]) == "Off", "module off", pump=root.update)
                 self.assertEqual(win.lte_led.color, ui.LED_OFF)

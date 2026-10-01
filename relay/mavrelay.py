@@ -34,7 +34,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.4.3"
+__version__ = "1.5.0"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -65,8 +65,14 @@ U16_UNKNOWN = 0xFFFF
 RSSI_UNKNOWN = 0x7FFF
 RAT_UNKNOWN = 0xFF
 PONG_GCS_PRESENT = 0x01
+PONG_VOICE = 0x02  # to the vehicle: the locator voice is on, speak
 PING_FLAG_WATCHING = 0x01  # GCS agent: only watching the vehicle's link, send it STATUS but no telemetry
+PING_FLAG_SPEAKING = 0x02  # vehicle: its locator voice speaks
+PING_FLAG_VOICE_FAILED = 0x04  # vehicle: asked to speak, but its modem does not
 STATUS_VEHICLE_ONLINE = 0x01
+STATUS_VOICE_ON = 0x02  # the relay has the locator voice switched on
+STATUS_SPEAKING = 0x04  # the vehicle said in its last PING that it speaks
+STATUS_VOICE_FAILED = 0x08  # ... that it cannot
 REJECT_UNKNOWN_SESSION = 1
 NO_VEHICLE_STATUS = STATUS_BODY.pack(0, RAT_UNKNOWN, U16_UNKNOWN, U16_UNKNOWN, U16_UNKNOWN, RSSI_UNKNOWN, U16_UNKNOWN)
 
@@ -333,18 +339,38 @@ class LinkStatus(NamedTuple):
     down_loss: int
     rssi_dbm: int
     idle_ms: int
+    voice_on: bool = False  # the relay has the locator voice switched on
+    speaking: bool = False  # the vehicle said it speaks (when last heard)
+    voice_failed: bool = False  # the vehicle said it cannot
 
     @classmethod
     def unpack(cls, body: bytes) -> "LinkStatus":
         body = body[: STATUS_BODY.size] + NO_VEHICLE_STATUS[len(body):]  # missing fields: unknown
         flags, rat, rtt, up, down, rssi, idle = STATUS_BODY.unpack(body)
-        return cls(bool(flags & STATUS_VEHICLE_ONLINE), rat, rtt, up, down, rssi, idle)
+        return cls(bool(flags & STATUS_VEHICLE_ONLINE), rat, rtt, up, down, rssi, idle, bool(flags & STATUS_VOICE_ON),
+                   bool(flags & STATUS_SPEAKING), bool(flags & STATUS_VOICE_FAILED))
+
+    @property
+    def connected(self) -> bool:
+        """The vehicle has a session with the server (online, or recently)."""
+        return self.online or self.idle_ms != U16_UNKNOWN
+
+    def voice_text(self) -> str:
+        """The locator voice: 'off', or what the aircraft makes of it."""
+        if not self.voice_on:
+            return "off"
+        if self.voice_failed:
+            return "on, but the aircraft cannot speak"
+        if self.speaking:
+            return "on, the aircraft speaks" if self.online else "on, the aircraft was speaking when last heard"
+        return "on, waiting for the aircraft"
 
     def describe(self) -> str:
-        if self.idle_ms == U16_UNKNOWN and not self.online:
-            return "vehicle: not connected to the server"
+        voice = f"; locator voice {self.voice_text()}" if self.voice_on else ""
+        if not self.connected:
+            return "vehicle: not connected to the server" + voice
         if not self.online:
-            return f"vehicle: OFFLINE, last heard {self.idle_ms / 1000:.1f} s ago"
+            return f"vehicle: OFFLINE, last heard {self.idle_ms / 1000:.1f} s ago" + voice
         parts = ["vehicle: online"]
         if self.rat != RAT_UNKNOWN or self.rssi_dbm != RSSI_UNKNOWN:
             radio = RAT_NAMES.get(self.rat, "") if self.rat != RAT_UNKNOWN else ""
@@ -354,7 +380,7 @@ class LinkStatus(NamedTuple):
         if self.rtt_ms != U16_UNKNOWN:
             parts.append(f"rtt to server {self.rtt_ms} ms")
         parts.append(f"loss up {fmt_permille(self.up_loss)} down {fmt_permille(self.down_loss)}")
-        return ", ".join(parts)
+        return ", ".join(parts) + voice
 
 
 # ---------------------------------------------------------------------------------------------
@@ -615,6 +641,10 @@ TEMP_UNKNOWN = -128
 TEMP_WARM = 70  # getting hot
 TEMP_HOT = 80  # too hot: give the board air, out of the sun
 
+# The locator voice: the board's speaker, switched on and off by GCS agents (docs/PROTOCOL.md, "Locator voice")
+VOICE = 14
+VOICE_BODY = struct.Struct("<B")  # bit 0: on
+
 
 class Position(NamedTuple):
     gnss_time: int = 0
@@ -689,6 +719,8 @@ class Session:
         self.peer_loss = U16_UNKNOWN
         self.rssi_dbm = RSSI_UNKNOWN
         self.rat = RAT_UNKNOWN
+        self.speaking = False  # a vehicle's locator voice speaks (PING_FLAG_SPEAKING)
+        self.voice_failed = False  # it was asked to, but its modem does not
 
     def describe(self) -> str:
         info = f" ({self.info})" if self.info else ""
@@ -992,6 +1024,43 @@ class LocatorStore:
             slog.warning("cannot save the aircraft's position: %s", exc)
 
 
+class VoiceSwitch:
+    """The locator voice as GCS agents switch it (VOICE). While it is on, every PONG to the aircraft asks it
+    to speak through the speaker on its board, until an agent switches it off. Kept in `path`, so that a
+    relay restart does not silence an aircraft that someone is looking for."""
+
+    def __init__(self, path: Optional[str]) -> None:
+        self.path = path
+        self.on = False
+        self.since = 0  # unix seconds, when it was last switched
+        if path:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    meta = json.load(f)
+                self.on, self.since = bool(meta["on"]), int(meta.get("since", 0))
+                if self.on:
+                    slog.info("the locator voice is on (switched on %s ago)", fmt_age(time.time() - self.since))
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                slog.warning("cannot read %s: %s", path, exc)
+
+    def switch(self, on: bool, by: "Session") -> None:
+        if on == self.on:
+            return
+        self.on, self.since = on, int(time.time())
+        slog.info("%s switched the locator voice %s", by.describe(), "on" if on else "off")
+        if not self.path:
+            return
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+            with open(self.path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump({"on": on, "since": self.since}, f)
+            os.replace(self.path + ".tmp", self.path)
+        except OSError as exc:
+            slog.warning("cannot save the locator voice switch: %s", exc)
+
+
 class RelayServer(asyncio.DatagramProtocol):
     """Forwards MAVLink between the vehicle session and all GCS sessions (and plain TCP clients)."""
 
@@ -1009,6 +1078,7 @@ class RelayServer(asyncio.DatagramProtocol):
         self.max_gcs = max_gcs
         self.photos = PhotoStore(self, photo_folder, photo_days)
         self.locator = LocatorStore(self, os.path.join(state_dir, "locator.json") if state_dir else None)
+        self.voice = VoiceSwitch(os.path.join(state_dir, "voice.json") if state_dir else None)
         self.sessions: Dict[int, Session] = {}
         self.vehicle: Optional[Session] = None
         self.tcp: Optional[TcpGcsPort] = None
@@ -1072,6 +1142,9 @@ class RelayServer(asyncio.DatagramProtocol):
         elif pkt.type == POSITION:
             if sess.role == ROLE_VEHICLE:
                 self.locator.from_vehicle(pkt.body, now)
+        elif pkt.type == VOICE:
+            if sess.role == ROLE_GCS and len(pkt.body) >= VOICE_BODY.size:
+                self.voice.switch(bool(pkt.body[0] & 0x01), sess)
         elif SNAP_REQ <= pkt.type <= SNAP_SYNC:
             self.photos.on_packet(sess, pkt.type, pkt.body, now)
 
@@ -1161,12 +1234,26 @@ class RelayServer(asyncio.DatagramProtocol):
             return
         if len(body) >= PING_BODY.size:
             _, sess.rtt_ms, sess.peer_loss, sess.rssi_dbm, sess.rat, ping_flags = PING_BODY.unpack_from(body)
-            watching = sess.role == ROLE_GCS and bool(ping_flags & PING_FLAG_WATCHING)
-            if watching != sess.watching:
-                sess.watching = watching
-                slog.info("%s %s", sess.describe(), "is only watching" if watching else "wants telemetry")
+            if sess.role == ROLE_GCS:
+                watching = bool(ping_flags & PING_FLAG_WATCHING)
+                if watching != sess.watching:
+                    sess.watching = watching
+                    slog.info("%s %s", sess.describe(), "is only watching" if watching else "wants telemetry")
+            else:
+                self._vehicle_voice(sess, bool(ping_flags & PING_FLAG_SPEAKING),
+                                    bool(ping_flags & PING_FLAG_VOICE_FAILED))
         flags = PONG_GCS_PRESENT if self.gcs_present(time.monotonic()) else 0
+        if sess.role == ROLE_VEHICLE and self.voice.on:
+            flags |= PONG_VOICE
         self._send(sess, PONG, body[:4] + bytes([flags]))
+
+    @staticmethod
+    def _vehicle_voice(sess: Session, speaking: bool, failed: bool) -> None:
+        if speaking != sess.speaking:
+            slog.info("the aircraft %s (locator voice)", "speaks" if speaking else "has stopped speaking")
+        if failed and not sess.voice_failed:
+            slog.warning("the aircraft cannot speak: its modem refuses the locator voice")
+        sess.speaking, sess.voice_failed = speaking, failed
 
     def _reject(self, pkt: Packet, key: bytes, addr, now: float) -> None:
         if now - self._last_reject.get(pkt.session, -1e9) < 1.0:
@@ -1219,13 +1306,15 @@ class RelayServer(asyncio.DatagramProtocol):
             self.photos.prune(time.time())
 
     def status_body(self, now: float) -> bytes:
+        voice = STATUS_VOICE_ON if self.voice.on else 0
         v = self.vehicle
         if v is None:
-            return NO_VEHICLE_STATUS
+            return bytes([voice]) + NO_VEHICLE_STATUS[1:]
         idle = now - v.last_rx
         up = v.loss.permille()
         return STATUS_BODY.pack(
-            STATUS_VEHICLE_ONLINE if idle < self.ONLINE_TIMEOUT else 0,
+            (STATUS_VEHICLE_ONLINE if idle < self.ONLINE_TIMEOUT else 0) | voice
+            | (STATUS_SPEAKING if v.speaking else 0) | (STATUS_VOICE_FAILED if v.voice_failed else 0),
             v.rat,
             v.rtt_ms,
             U16_UNKNOWN if up is None else up,
@@ -1244,7 +1333,8 @@ class RelayServer(asyncio.DatagramProtocol):
         extra = ", ".join(f"{k} {n}" for k, n in sorted(self.counters.items()))
         gcs = self.gcs_sessions()
         watching = sum(s.watching for s in gcs)
-        return f"status: {vs}; {len(gcs)} GCS agent(s) ({watching} only watching), {tcp} TCP client(s)" + (
+        voice = f"; locator voice on for {fmt_age(time.time() - self.voice.since)}" if self.voice.on else ""
+        return f"status: {vs}; {len(gcs)} GCS agent(s) ({watching} only watching), {tcp} TCP client(s)" + voice + (
             f"; {extra}" if extra else ""
         )
 
@@ -1344,6 +1434,9 @@ class TunnelClient(asyncio.DatagramProtocol):
         self.nonce = b""
         self.rtt_ms = U16_UNKNOWN
         self.gcs_present = True  # until the server says otherwise
+        # vehicle: the server's last PONG asked for the locator voice; kept without a session, so that an
+        # aircraft keeps speaking where it has no coverage
+        self.voice_on = False
         self.last_rx = 0.0
         self.last_ping = 0.0
         self.last_hello = 0.0
@@ -1508,6 +1601,7 @@ class TunnelClient(asyncio.DatagramProtocol):
                 t_ms, flags = PONG_BODY.unpack_from(pkt.body)
                 self.rtt_ms = min(U16_UNKNOWN - 1, (mono_ms() - t_ms) & 0xFFFFFFFF)
                 self.gcs_present = bool(flags & PONG_GCS_PRESENT)
+                self.voice_on = bool(flags & PONG_VOICE)
         elif pkt.type == STATUS and self.on_status is not None:
             self.on_status(LinkStatus.unpack(pkt.body))
         elif pkt.type >= SNAP_REQ and self.on_packet is not None:
@@ -2036,7 +2130,7 @@ class StatusPrinter:
 
     def __call__(self, status: LinkStatus) -> None:
         now = time.monotonic()
-        state = (status.online, status.idle_ms == U16_UNKNOWN)
+        state = (status.online, status.idle_ms == U16_UNKNOWN, status.voice_text())
         if state != self.state or now - self.last >= self.interval:
             where = self.where() if self.where else ""
             glog.info("%s%s", status.describe(), f"; {where}" if where else "")
@@ -2082,6 +2176,9 @@ class GcsAgent:
         self.last_fix: Optional[Position] = None
         self.module_hot = False  # its chip reached TEMP_HOT, and has not cooled below TEMP_WARM since
         self.client.on_packet = self._on_packet
+        # the locator voice: the switch asked for, sent again until the relay's STATUS shows it
+        self.voice_request: Optional[bool] = None
+        self.voice_until = 0.0
 
     @property
     def watching(self) -> bool:
@@ -2101,8 +2198,32 @@ class GcsAgent:
 
     def _got_status(self, status: LinkStatus) -> None:
         self.status, self.status_time = status, time.monotonic()
+        if self.voice_request is not None:
+            if status.voice_on == self.voice_request:
+                self.voice_request = None
+            elif self.status_time < self.voice_until:
+                self._send_voice()
+            else:
+                glog.warning("the relay did not switch the locator voice %s (is it older than 1.5.0?)",
+                             "on" if self.voice_request else "off")
+                self.voice_request = None
         if self.on_status is not None:
             self.on_status(status)
+
+    VOICE_TRIES_FOR = 10.0  # seconds
+
+    def set_voice(self, on: bool) -> bool:
+        """Switches the aircraft's locator voice on or off. The relay keeps the switch and passes it on to
+        the aircraft, now or whenever it connects. False without a session with the relay."""
+        if not self.client.is_connected:
+            return False
+        self.voice_request, self.voice_until = on, time.monotonic() + self.VOICE_TRIES_FOR
+        glog.info("switching the aircraft's locator voice %s", "on" if on else "off")
+        self._send_voice()
+        return True
+
+    def _send_voice(self) -> None:
+        self.client.send_packet(VOICE, VOICE_BODY.pack(1 if self.voice_request else 0))
 
     def _on_packet(self, ptype: int, body: bytes) -> None:
         if ptype == POSITION:
@@ -2288,7 +2409,18 @@ async def run_vehicle(opts) -> None:
             if chunk:
                 send(chunk)
 
+    async def voice() -> None:  # no speaker here: it reports that it speaks, as the ESP32 does
+        on = False
+        while True:
+            await asyncio.sleep(0.2)
+            if client.voice_on != on:
+                on = client.voice_on
+                vlog.info("locator voice %s", "on (this vehicle has no speaker: it only says it speaks)" if on else "off")
+                client.ping_flags = PING_FLAG_SPEAKING if on else 0
+                client.ping_now()
+
     asyncio.ensure_future(flusher())
+    asyncio.ensure_future(voice())
     vlog.info("connecting to relay %s:%d", *opts.server)
     await client.run()
 
@@ -2435,8 +2567,8 @@ def resolve_options(args: argparse.Namespace) -> argparse.Namespace:
         allow = o.get("tcp_allow", "127.0.0.1/32, ::1/128")
         out.tcp_allow = [ipaddress.ip_network(n.strip(), strict=False) for n in allow.split(",") if n.strip()]
         out.session_timeout = float(o.get("session_timeout", 120))
-        # photos and the aircraft's last known position: in systemd's StateDirectory (/var/lib/mavrelay)
-        # when run as the service
+        # photos, the aircraft's last known position and the locator voice switch: in systemd's StateDirectory
+        # (/var/lib/mavrelay) when run as the service
         home = os.environ.get("STATE_DIRECTORY") or os.path.dirname(os.path.abspath(getattr(args, "config", None)
                                                                                       or "mavrelay.ini"))
         out.state_dir = home

@@ -20,6 +20,13 @@ void bridge_set_radio(int16_t rssi_dbm, uint8_t rat);
  * CONFIG_BRIDGE_LOCATOR_INTERVAL seconds), or NULL when the GNSS cannot be read during the data call. */
 void bridge_set_gnss(const gnss_fix_t *fix);
 
+/* The locator voice: whether the relay last asked for it. That holds while the relay is out of reach,
+ * so an aircraft whose voice is on keeps speaking where it has no coverage. */
+bool bridge_voice_wanted(void);
+
+/* What the modem makes of it, for the relay (in every PING): speaking, or asked to but it does not. */
+void bridge_set_voice(bool speaking, bool failed);
+
 /* Milliseconds since the relay was last heard from, or since mobile data came up if later. */
 uint32_t bridge_relay_silence_ms(void);
 

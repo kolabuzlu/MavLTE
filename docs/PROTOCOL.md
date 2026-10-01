@@ -37,16 +37,17 @@ corrupts the frames around it.
 | 1    | HELLO   | C → S | 0 / 0 | nonce (8 bytes), then optional UTF-8 info text (≤ 64 bytes) |
 | 2    | WELCOME | S → C | new session / 0 | the 8-byte nonce from the HELLO |
 | 3    | DATA    | C ↔ S | session / seq | MAVLink bytes (whole frames), ≤ 1172 bytes |
-| 4    | PING    | C → S | session / seq | `t_ms u32, rtt_ms u16, rx_loss_permille u16, rssi_dbm i16, rat u8, flags u8` (bit 0, GCS only: watching) |
-| 5    | PONG    | S → C | session / seq | `t_ms u32` (echo), `flags u8` (bit 0: a GCS is connected) |
+| 4    | PING    | C → S | session / seq | `t_ms u32, rtt_ms u16, rx_loss_permille u16, rssi_dbm i16, rat u8, flags u8` (GCS: bit 0 watching; vehicle: bit 1 speaking, bit 2 cannot speak) |
+| 5    | PONG    | S → C | session / seq | `t_ms u32` (echo), `flags u8` (bit 0: a GCS is connected; to the vehicle, bit 1: speak) |
 | 6    | REJECT  | S → C | the rejected session / 0 | `reason u8` (1 = unknown or expired session) |
-| 7    | STATUS  | S → GCS | session / seq | `flags u8, rat u8, rtt_ms u16, up_loss_permille u16, down_loss_permille u16, rssi_dbm i16, idle_ms u16` |
+| 7    | STATUS  | S → GCS | session / seq | `flags u8, rat u8, rtt_ms u16, up_loss_permille u16, down_loss_permille u16, rssi_dbm i16, idle_ms u16` (flags: bit 0 vehicle online, bits 1-3 the [locator voice](#locator-voice)) |
 | 8    | SNAP_REQ  | GCS → S → V | session / seq | `photo_id u32, size u8` (see [Snapshots](#snapshots)) |
 | 9    | SNAP_INFO | V → S → GCS | session / seq | `photo_id u32, bytes u32, width u16, height u16, lat i32, lon i32, alt_mm i32, heading_cdeg u16, status u8, time u32` |
 | 10   | SNAP_DATA | V → S → GCS | session / seq | `photo_id u32, chunk u16`, then the chunk (1024 bytes, the last one shorter) |
 | 11   | SNAP_ACK  | GCS → S → V | session / seq | `photo_id u32, flags u8` (bit 0: all there, bit 1: have the SNAP_INFO), then a bitmap of the chunks received |
 | 12   | SNAP_SYNC | GCS → S | session / seq | `newest_photo_id u32` |
 | 13   | POSITION  | V → S → GCS | session / seq | `gnss_time u32, lat i32, lon i32, alt_mm i32, speed_cms u16, course_cdeg u16, hdop u16, sats u8, fix u8, flags u8, fc_silent_s u16, battery_mv u16, battery_pct u8, time u32, chip_c i8` (see [Locator](#locator)) |
+| 14   | VOICE     | GCS → S | session / seq | `flags u8` (bit 0: on) (see [Locator voice](#locator-voice)) |
 
 Unknown values are `0xFFFF` for u16 fields, `0x7FFF` for `rssi_dbm` and `0xFF` for `rat`.
 `rat` uses the 3GPP TS 27.007 access technology numbers (0 GSM, 3 EDGE, 7 LTE, ...).
@@ -179,6 +180,23 @@ the module has power.
   connects later still learns the last known position.
 - A GCS agent treats a POSITION whose `time` is 15 s old or more as the last known position, not
   a live one.
+
+## Locator voice
+
+For the last metres to a crashed aircraft: while the voice is on, the aircraft says a phrase through
+the speaker on its board, again and again (the ESP32 firmware: the modem's own text-to-speech).
+
+1. A GCS agent switches it with VOICE (bit 0: on). The server keeps the switch, on disk so that it
+   survives a restart, until an agent switches it again: the aircraft does not have to be online.
+2. The server sets PONG flag bit 1 in every PONG to the vehicle while the voice is on. The vehicle
+   keeps the last state it was told while it has no session, so an aircraft whose voice is on keeps
+   speaking where it has no coverage, and one switched on while it was away starts at its first PONG.
+3. The vehicle says in each PING what it makes of it: flag bit 1, it speaks; bit 2, it was asked to
+   but cannot (its modem refuses). The server passes these on in STATUS, as they were in the
+   vehicle's last PING (also while it is offline), together with its own switch: STATUS flag bit 1,
+   the voice is on; bit 2, the vehicle speaks; bit 3, it cannot.
+4. A GCS agent sends VOICE again, once a second, until STATUS shows the switch it asked for, for at
+   most 10 s (a server older than 1.5.0 ignores VOICE and never shows it).
 
 ## Not provided
 

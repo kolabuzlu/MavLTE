@@ -7,7 +7,8 @@
  * connected and echoes every frame it receives back to the server. Its camera takes the same
  * photo every time: PHOTO_BYTES bytes, byte i = (i * 13 + 7) & 0xFF, over Istanbul at 120 m, heading
  * 45 degrees. Its locator reports, once a second, a GNSS fix at the same place (11 satellites), with the
- * flight controller silent for 42 s. Prints its statistics on exit. Used by relay/tests/test_c_client.py. */
+ * flight controller silent for 42 s, and its locator voice speaks whenever the relay switches it on.
+ * Prints its statistics on exit. Used by relay/tests/test_c_client.py. */
 #define _POSIX_C_SOURCE 200809L
 
 #include <netdb.h>
@@ -153,6 +154,7 @@ int main(int argc, char **argv)
     uint32_t start = now_ms(), last_frame = start, last_position = start, counter = 0;
     uint32_t duration = (uint32_t)atoi(argv[4]) * 1000;
     uint8_t rx[2048];
+    bool voice = false;
     while ((uint32_t)(now_ms() - start) < duration) {
         fd_set fds;
         FD_ZERO(&fds);
@@ -170,6 +172,11 @@ int main(int argc, char **argv)
         }
         uint32_t now = now_ms();
         tun_poll(&tun, now);
+        if (tun.voice_on != voice) { /* the locator voice, as the relay asks: it speaks at once */
+            voice = tun.voice_on;
+            fprintf(stderr, "harness: voice %s\n", voice ? "on" : "off");
+            tun_set_ping_flags(&tun, voice ? TUN_PING_SPEAKING : 0);
+        }
         if (tun_connected(&tun) && (uint32_t)(now - last_frame) >= 5) {
             uint8_t frame[32];
             last_frame = now;

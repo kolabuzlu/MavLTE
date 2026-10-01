@@ -497,9 +497,17 @@ static void test_tunnel(void)
     n = tun_encode(&k, pkt, TUN_PONG, TUN_ROLE_SERVER, 0x1234, 3, pong, 5);
     tun_input(&t, pkt, n, now + 90);
     CHECK(t.gcs_present);
+    CHECK(!t.voice_on);
 
-    /* PINGs once a second carry rtt and radio state */
+    /* the locator voice: switched on in a PONG */
+    pong[4] = TUN_PONG_GCS_PRESENT | TUN_PONG_VOICE;
+    n = tun_encode(&k, pkt, TUN_PONG, TUN_ROLE_SERVER, 0x1234, 4, pong, 5);
+    tun_input(&t, pkt, n, now + 90);
+    CHECK(t.voice_on && t.gcs_present && t.rtt_ms == 90);
+
+    /* PINGs once a second carry rtt, radio state and flags */
     tun_set_radio(&t, -71, 7);
+    tun_set_ping_flags(&t, TUN_PING_SPEAKING);
     f.nsent = 0;
     tun_poll(&t, now + 999);
     CHECK(f.nsent == 0);
@@ -508,6 +516,7 @@ static void test_tunnel(void)
     CHECK(f.sent[0][16] == 90 && f.sent[0][17] == 0);            /* rtt 90 ms */
     CHECK((int16_t)(f.sent[0][20] | f.sent[0][21] << 8) == -71); /* rssi */
     CHECK(f.sent[0][22] == 7);                                   /* LTE */
+    CHECK(f.sent[0][23] == TUN_PING_SPEAKING);
 
     /* REJECT for another session is ignored, for ours it starts over */
     n = tun_encode(&k, pkt, TUN_REJECT, TUN_ROLE_SERVER, 0x4321, 0, (const uint8_t *)"\x01", 1);
@@ -518,6 +527,7 @@ static void test_tunnel(void)
     CHECK(!tun_connected(&t));
     CHECK(f.events[f.nevents - 1] == TUN_EVENT_REJECTED);
     CHECK(!tun_send_data(&t, (const uint8_t *)"x", 1));
+    CHECK(t.voice_on); /* kept without a session: the aircraft goes on speaking where it has no coverage */
     f.nsent = 0;
     tun_poll(&t, now + 1101); /* HELLO right away, with a fresh nonce */
     CHECK(f.nsent == 1 && f.sent[0][2] == TUN_HELLO && memcmp(f.sent[0] + 12, nonce, 8) != 0);

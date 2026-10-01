@@ -153,6 +153,11 @@ void tun_set_radio(tun_client_t *t, int16_t rssi_dbm, uint8_t rat)
     t->rat = rat;
 }
 
+void tun_set_ping_flags(tun_client_t *t, uint8_t flags)
+{
+    t->ping_flags = flags;
+}
+
 static bool send_packet(tun_client_t *t, uint8_t type, const uint8_t *body, size_t body_len)
 {
     uint32_t seq = 0;
@@ -196,7 +201,7 @@ static void send_ping(tun_client_t *t, uint32_t now_ms)
     put_u16(body + 6, tun_loss_permille(t));
     put_u16(body + 8, (uint16_t)t->rssi_dbm);
     body[10] = t->rat;
-    body[11] = 0;
+    body[11] = t->ping_flags;
     t->last_ping = now_ms;
     send_packet(t, TUN_PING, body, sizeof(body));
 }
@@ -304,6 +309,7 @@ void tun_input(tun_client_t *t, const uint8_t *pkt, size_t len, uint32_t now_ms)
         uint32_t rtt = now_ms - get_u32(body);
         t->rtt_ms = rtt < TUN_U16_UNKNOWN ? (uint16_t)rtt : TUN_U16_UNKNOWN - 1;
         t->gcs_present = (body[4] & TUN_PONG_GCS_PRESENT) != 0;
+        t->voice_on = (body[4] & TUN_PONG_VOICE) != 0;
     } else if (type >= TUN_SNAP_REQ && t->cfg.on_packet) {
         t->cfg.on_packet(t->cfg.ctx, type, body, body_len);
     }

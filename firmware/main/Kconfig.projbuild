@@ -119,6 +119,26 @@ menu "MavLTE"
         range 2 300
         default 5
 
+    config BRIDGE_LOCATOR_VOICE
+        bool "Locator voice: the board's speaker, switched on and off in MavLTE"
+        depends on BRIDGE_LOCATOR
+        default y
+        help
+            MavLTE's Voice switch makes the modem say a phrase through the speaker on the board's
+            speaker header, again and again until the switch is off: for finding the aircraft in
+            the last metres (tall grass, crops, bushes) once its position has brought you close.
+            The relay keeps the switch, and the aircraft keeps speaking where it has no coverage.
+            The modem's own text-to-speech, over its multiplexer (CMUX) like the GNSS.
+
+    config BRIDGE_LOCATOR_VOICE_TEXT
+        string "Locator voice: what it says"
+        depends on BRIDGE_LOCATOR_VOICE
+        default "Mav L T E here."
+        help
+            English. Letters with spaces between them are said one by one, so are digits: a phone
+            number written "0 5 3 2 ..." tells whoever finds the aircraft whom to call. Quotes and
+            characters other than ASCII are left out.
+
     config BRIDGE_CAMERA
         bool "Camera: a photo when MavLTE asks for one (Snapshot)"
         default y

@@ -55,6 +55,9 @@ static bool fast_baud_failed; /* the modem took AT+IPR but did not answer at tha
 static bool cmux_off;         /* data calls without the multiplexer (it failed, or no locator) */
 static bool in_cmux;          /* this data call runs over CMUX: AT commands still work during it */
 static int baud = BOOT_BAUD;
+#if CONFIG_BRIDGE_LOCATOR_VOICE
+static bool voice_ready; /* the modem's audio is set up for the locator voice since it last (re)started */
+#endif
 
 static uint32_t now_ms(void)
 {
@@ -151,6 +154,9 @@ static bool create_dce(void)
     const esp_modem_dce_config_t dce_config = ESP_MODEM_DCE_DEFAULT_CONFIG(CONFIG_BRIDGE_APN);
     dce = esp_modem_new_dev(ESP_MODEM_DCE_SIM7600, &dte_config, &dce_config, ppp_netif);
     baud = BOOT_BAUD;
+#if CONFIG_BRIDGE_LOCATOR_VOICE
+    voice_ready = false; /* perhaps a restarted modem: its audio settings are back to their defaults */
+#endif
     if (!dce) {
         ESP_LOGE(TAG, "cannot set up the modem UART");
         return false;
@@ -436,6 +442,104 @@ static int16_t signal_dbm(void)
     return (int16_t)(-113 + 2 * rssi); /* AT+CSQ scale */
 }
 
+#if CONFIG_BRIDGE_LOCATOR_VOICE
+/* ---- the locator voice: the modem's text-to-speech on the board's speaker, while the relay asks for it */
+
+#define VOICE_EVERY_MS 3000   /* a phrase at most this often: the default one takes about 2 s */
+#define VOICE_FAILED_MS 15000 /* asked for this long and no phrase taken: the modem does not speak */
+
+static bool voice_asked;  /* the relay asks for the voice, as last seen here */
+static bool voice_spoke;  /* the modem has taken a phrase since then */
+static bool voice_failed; /* reported as unable to speak */
+static uint32_t voice_asked_ms, voice_try_ms, voice_ok_ms;
+
+/* AT+CTTS=2,"<text>": ASCII text; quotes and anything else that would end the command are left out */
+static const char *voice_command(void)
+{
+    static char at[sizeof(CONFIG_BRIDGE_LOCATOR_VOICE_TEXT) + 16];
+    if (!at[0]) {
+        size_t n = (size_t)snprintf(at, sizeof(at), "AT+CTTS=2,\"");
+        for (const char *p = CONFIG_BRIDGE_LOCATOR_VOICE_TEXT; *p && n < 11 + 500; p++) {
+            if (*p >= ' ' && *p <= '~' && *p != '"') {
+                at[n++] = *p;
+            }
+        }
+        memcpy(at + n, "\"\r", 3);
+    }
+    return at;
+}
+
+/* About once a second wherever the modem takes AT commands: in command mode, and on the CMUX command
+ * channel during a data call (`usable` false where it cannot: a data call without CMUX). While the
+ * modem is still saying a phrase it refuses the next one (ERROR), which only means "later". */
+static void voice_tick(bool usable)
+{
+    uint32_t now = now_ms();
+    if (!bridge_voice_wanted()) {
+        if (voice_asked) {
+            voice_asked = false;
+            if (usable) {
+                command("AT+CTTS=0\r", 2000); /* stops it mid-phrase */
+            }
+            ESP_LOGI(TAG, "locator voice off");
+            bridge_set_voice(false, false);
+        }
+        return;
+    }
+    if (!voice_asked) {
+        voice_asked = true;
+        voice_spoke = voice_failed = false;
+        voice_ready = false; /* set the audio up again: the modem may have changed it since */
+        voice_asked_ms = now;
+        voice_try_ms = now - VOICE_EVERY_MS;
+        ESP_LOGI(TAG, "locator voice on: \"%s\" through the board's speaker", CONFIG_BRIDGE_LOCATOR_VOICE_TEXT);
+    }
+    if (usable && (uint32_t)(now - voice_try_ms) >= VOICE_EVERY_MS) {
+        voice_try_ms = now;
+        if (!voice_ready) {
+            /* as tried on the A7670E-FASE: the speaker phone path and the highest volumes */
+            command("AT+CSDVC=3\r", 2000);
+            command("AT+COUTGAIN=7\r", 2000);
+            command("AT+CTTSPARAM=2,3,0,1,1\r", 2000); /* volume, system volume, digits, pitch, speed */
+            voice_ready = true;
+        }
+        if (command(voice_command(), 3000) == ESP_OK) {
+            voice_spoke = true;
+            voice_ok_ms = now;
+        }
+    }
+    bool speaking = voice_spoke && (uint32_t)(now - voice_ok_ms) < VOICE_FAILED_MS;
+    bool failed = !speaking && (uint32_t)(now - (voice_spoke ? voice_ok_ms : voice_asked_ms)) >= VOICE_FAILED_MS;
+    if (failed && !voice_failed) {
+        if (usable) {
+            ESP_LOGW(TAG, "the locator voice is on, but the modem does not speak (it refuses AT+CTTS)");
+        } else {
+            ESP_LOGW(TAG, "the locator voice needs the modem's multiplexer (CMUX), which it did not take");
+        }
+    }
+    voice_failed = failed;
+    bridge_set_voice(speaking, failed);
+}
+#else
+static void voice_tick(bool usable)
+{
+    (void)usable;
+}
+#endif
+
+/* Waits; meanwhile the locator voice goes on if the modem takes commands (esp_modem calls command mode
+ * UNDEF until the first data call, and again after a CMUX one). */
+static void pause_ms(uint32_t ms)
+{
+    for (uint32_t start = now_ms(), waited; (waited = now_ms() - start) < ms;) {
+        vTaskDelay(pdMS_TO_TICKS(ms - waited < 1000 ? ms - waited : 1000));
+        esp_modem_dce_mode_t mode = esp_modem_get_mode(dce);
+        if (dce && (mode == ESP_MODEM_MODE_COMMAND || mode == ESP_MODEM_MODE_UNDEF)) {
+            voice_tick(true);
+        }
+    }
+}
+
 static bool wait_registration(uint32_t timeout_ms)
 {
     uint32_t start = now_ms(), last_log = start;
@@ -458,7 +562,7 @@ static bool wait_registration(uint32_t timeout_ms)
                 ESP_LOGI(TAG, "searching for the network (signal %d dBm)", dbm);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        pause_ms(2000);
     }
     ESP_LOGW(TAG, "not registered with a network after %" PRIu32 " s", timeout_ms / 1000);
     return false;
@@ -679,6 +783,7 @@ static link_end_t stay_online(void)
             ESP_LOGW(TAG, "nothing from the relay for %d minutes; redialling", RELAY_SILENCE_LIMIT_MS / 60000);
             return LINK_RELAY_SILENT;
         }
+        voice_tick(in_cmux);
         if (!in_cmux) {
             continue;
         }
@@ -703,7 +808,7 @@ static void modem_task(void *arg)
             unsigned wait_s = failures < 6 ? failures * 5 : 30;
             status_set_modem(STATUS_MODEM_ERROR);
             ESP_LOGI(TAG, "trying again in %u s", wait_s);
-            vTaskDelay(pdMS_TO_TICKS(wait_s * 1000));
+            pause_ms(wait_s * 1000);
         }
         status_set_modem(STATUS_MODEM_STARTING);
         if (!dce && !create_dce()) {

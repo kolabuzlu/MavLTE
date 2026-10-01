@@ -37,6 +37,10 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
   flight controller does. After a crash that kills the flight controller, the module keeps
   reporting as long as it has power (an 18650 cell on the board), and says the flight controller
   has gone silent. The relay keeps the last known position; the app shows it with a map link.
+- **Locator voice**: switch it on in the MavLTE app and the board's speaker says "MavLTE here"
+  again and again, to find the aircraft in tall grass or crops once its position has brought you
+  close. The relay keeps the switch: switched on while the aircraft is out of reach, it starts as
+  soon as the aircraft is back, and the aircraft keeps speaking where it has no coverage.
 
 | Folder | What |
 |---|---|
@@ -79,7 +83,8 @@ logs every connection, address change and link loss as it happens.
 
 The aircraft's photos are kept in `/var/lib/mavrelay/snapshots` for 7 days (`snapshot_dir` and
 `snapshot_days` in `mavrelay.ini`), each as a `.jpg` with a `.json` beside it. Its last known
-position is in `/var/lib/mavrelay/locator.json`. Updating an older
+position is in `/var/lib/mavrelay/locator.json`, the locator voice switch in `voice.json` beside
+it. Updating an older
 relay: run the installer again, which also installs the new service file (it gives the service
 that folder); your keys stay.
 
@@ -106,6 +111,7 @@ the chip to tell them apart and prints `board version V1` or `V2` at start-up.
 | Board version, flight controller pins | leave on detect / `-1` |
 | Flight controller baud rate | `115200` |
 | Locator | on, every 5 s |
+| Locator voice | on; what it says: `Mav L T E here.` (letters and digits written apart are said one by one: a phone number written `0 5 3 2 ...` tells whoever finds the aircraft whom to call) |
 | Camera | on (off, or no camera fitted: the aircraft answers that it has none) |
 
 The rest (modem UART speed, batching, sending with no GCS connected, JPEG quality) can stay as
@@ -245,6 +251,12 @@ from the flight controller's GPS.
 **Camera.** It sits on the board's own connector, so it needs no wiring. Mount the board (or the
 camera on an extension cable) looking where you want your photos, away from the propeller.
 
+**Speaker**, for the locator voice: the small speaker that comes with the board, on its speaker
+header. The header is wired straight to the modem's earpiece output (V2 schematic: no amplifier
+on the board), so it is loud enough for the last metres to the aircraft, not to be heard across
+a field. Mount it where the fuselage does not muffle it: behind an opening, or under a thin
+covering.
+
 ## 4. ArduPilot parameters
 
 The examples use TELEM2, which is `SERIAL2`; use the number of the port you wired.
@@ -319,6 +331,13 @@ server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
   talks to the module, in red when it has gone silent (a crash, say) while the module still
   reports, the module's battery when it has a cell, and the temperature of its ESP32-S3 chip:
   in amber from 70 °C, in red from 80 °C (see *Heat* in section 3).
+- **Voice**, the locator voice, in the *Aircraft* panel: switched on, the aircraft says "MavLTE
+  here" through the speaker on its board every three seconds until you switch it off, to find it
+  in the last metres once *Position* has brought you close. The relay keeps the switch, so it also
+  works with the aircraft offline: switched on while it is out of reach, the aircraft starts
+  speaking as soon as it is back; switched on before it lost coverage, it keeps speaking. Beside
+  the switch: speaking (green), speaking when last heard (amber), or that it cannot speak (red:
+  its modem refuses). A second MavLTE, on another laptop, shows the same switch.
 - **Snapshot**, at the bottom of the *Aircraft* panel, asks the aircraft for a photo, whatever the
   switches: pick **Small** (320×240, about 5–10 KB), **Medium** (640×480, 10–30 KB) or **Large**
   (1024×768, 25–80 KB) beside it. The line below shows the photo arriving; it then opens in a
@@ -454,6 +473,8 @@ section of `mavrelay.ini`.
   off in flight to stage a crash: the flight controller dies, the module runs on and keeps
   reporting where the plane came down, and MavLTE shows the flight controller silent (red).
   Take the cell out as well, and the plane is gone: MavLTE keeps its last known position.
+- **Voice** shows what the board's speaker would be saying when MavLTE's *Voice* switch is on,
+  also with *No connection*: a module that was switched on keeps speaking.
 - The module's chip temperature (top right of its panel) follows the air in the fuselage plus
   its own heat. **In the sun** heats the fuselage to 65 °C: within a minute or two MavLTE shows
   the chip in amber, then in red.
@@ -519,6 +540,9 @@ missed while the app was closed) travel over your laptop's internet.
 | MavLTE shows the module's chip temperature in amber or red | The board is too warm: in the sun, or without airflow (see *Heat* in section 3). Above 65 °C of air around it, V2 boards are outside their chip's rating. |
 | Position says `GNSS searching` for minutes | The GNSS antenna on the board's GNSS connector, flat and with open sky above it; not under carbon fibre or metal. Indoors it hardly ever gets a fix. |
 | Position says `the LTE module cannot read its GNSS` | The modem did not take its multiplexer (CMUX), which reading the GNSS during the data call needs; the ESP32 log says so. The link works without it. To try again: erase the flash (`pio run -t erase`) and upload. |
+| MavLTE's *Voice*: `On, but the aircraft cannot speak` | The modem refuses its text-to-speech (`AT+CTTS`), or did not take its multiplexer (CMUX), which the voice needs during the data call like the GNSS; the ESP32 log says which. Tried and heard on an A7670E-FASE with modem firmware A7670M7_V1.11.1. |
+| MavLTE's *Voice*: `On, but no answer: firmware before 1.5.0?` | The aircraft's firmware is older than 1.5.0: update it. |
+| *Voice* says the aircraft is speaking, but nothing to hear | The speaker plugged into the board's speaker header; the fuselage muffling it (see *Speaker* in section 3). |
 
 ## Development
 

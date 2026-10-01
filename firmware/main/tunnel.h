@@ -28,6 +28,9 @@ enum { TUN_ROLE_SERVER = 0, TUN_ROLE_VEHICLE = 1, TUN_ROLE_GCS = 2 };
 #define TUN_RSSI_UNKNOWN 0x7FFF
 #define TUN_RAT_UNKNOWN 0xFF
 #define TUN_PONG_GCS_PRESENT 0x01
+#define TUN_PONG_VOICE 0x02        /* the locator voice is switched on: speak */
+#define TUN_PING_SPEAKING 0x02     /* vehicle: the locator voice speaks */
+#define TUN_PING_VOICE_FAILED 0x04 /* vehicle: asked to speak, but the modem does not */
 
 typedef enum {
     TUN_EVENT_CONNECTED, /* session established */
@@ -81,6 +84,9 @@ typedef struct {
     bool hello_due;
     uint8_t hellos; /* HELLOs sent without an answer */
     bool gcs_present; /* from the server's last PONG; true until known */
+    bool voice_on;    /* the server's last PONG asked for the locator voice; kept without a session, so an
+                         aircraft keeps speaking where it has no coverage */
+    uint8_t ping_flags; /* TUN_PING_*, sent in every PING */
     uint16_t rtt_ms;
     int16_t rssi_dbm;
     uint8_t rat;
@@ -103,6 +109,8 @@ bool tun_send_data(tun_client_t *t, const uint8_t *data, size_t len);
 bool tun_send_packet(tun_client_t *t, uint8_t type, const uint8_t *body, size_t len);
 /* Radio state reported to the server in PINGs. */
 void tun_set_radio(tun_client_t *t, int16_t rssi_dbm, uint8_t rat);
+/* Flags reported to the server in PINGs (TUN_PING_*). */
+void tun_set_ping_flags(tun_client_t *t, uint8_t flags);
 /* Downlink loss in per mille over the last seconds, or TUN_U16_UNKNOWN. */
 uint16_t tun_loss_permille(const tun_client_t *t);
 

@@ -475,6 +475,26 @@ void bridge_set_radio(int16_t rssi_dbm, uint8_t rat)
     }
 }
 
+bool bridge_voice_wanted(void)
+{
+    bool on = false;
+    if (lock) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        on = tun.voice_on;
+        xSemaphoreGive(lock);
+    }
+    return on;
+}
+
+void bridge_set_voice(bool speaking, bool failed)
+{
+    if (lock) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        tun_set_ping_flags(&tun, (speaking ? TUN_PING_SPEAKING : 0) | (failed ? TUN_PING_VOICE_FAILED : 0));
+        xSemaphoreGive(lock);
+    }
+}
+
 static bool parse_key(const char *hex, uint8_t *out, size_t len)
 {
     if (strlen(hex) != 2 * len) {
