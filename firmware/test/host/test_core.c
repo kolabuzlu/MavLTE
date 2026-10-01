@@ -930,6 +930,13 @@ static void test_gnss_parse(void)
     CHECK(f.fix == GNSS_FIX_NONE && f.lat == LOCATOR_UNKNOWN_I32); /* a "fix" at 0, 0 */
     CHECK(gnss_parse("+CGNSSINFO: 3,08,,,,530.500000,N,2859.259258,E,010126,000000.0,11.0,0.0,0.0,1.0,1.0,1.0", &f));
     CHECK(f.lat == 55083333 && f.lon == 289876543); /* degrees and minutes without the leading zero */
+    /* this project's first board (A7670E-FASE, A7670M7_V1.11.1, 2026-10-01; position replaced): decimal
+     * degrees, four satellite fields with one empty, no course, a field at the end */
+    CHECK(gnss_parse("+CGNSSINFO: 3,10,,00,00,41.1234567,N,28.9876543,E,011026,145023.00,128.6,5.516,,5.48,4.36,"
+                     "3.32,04", &f));
+    CHECK(f.fix == GNSS_FIX_3D && f.sats == 10 && f.lat == 411234567 && f.lon == 289876543);
+    CHECK(f.alt_mm == 128600 && f.speed == 283 && f.course == LOCATOR_U16_UNKNOWN && f.hdop == 436);
+    CHECK(f.time == gnss_unix_time(2026, 10, 1, 14, 50, 23));
 
     /* a longitude west of Greenwich by less than a degree, in NMEA form (leading zeros) */
     CHECK(gnss_parse("+CGNSSINFO: 3,08,,,5130.000000,N,00007.500000,W,010126,000000.0,11.0,0.0,0.0,1.0,1.0,1.0", &f));

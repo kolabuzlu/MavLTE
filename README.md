@@ -145,20 +145,21 @@ exposure settle first. The largest size (1024×768) needs about 150 KB of the ES
 while it is taken and sent; should that ever be short, the aircraft answers that the photo could
 not be taken, and the smaller sizes still work.
 
-**A healthy start** takes about 20–40 s and logs (shortened):
+**A healthy start** takes about 15–40 s. A V2 board with a Turkcell SIM logged this (shortened;
+the relay's address and the position replaced by examples):
 
 ```
-I (512) board: Waveshare ESP32-S3-A7670E-4G, board version V2
-I (522) bridge: flight controller: ESP32 TX GPIO2 -> FC RX, ESP32 RX GPIO3 <- FC TX, 115200 baud; relay ...
-I (532) modem: modem power on (GPIO21)
-I (9870) modem: modem UART at 921600 baud
-I (10120) modem: modem A7670E-FASE, firmware A7670M7_V1.11.1
-I (14210) modem: registered with Turkcell, LTE, signal -75 dBm
-I (16150) bridge: mobile data up, address 10.83.12.4
-I (16420) bridge: relay relay.example.com is 203.0.113.10, port 14650
-I (16530) bridge: connected to the relay (session 5c1e0a77)
-I (47120) modem: GNSS: 3,06,03,02,4107.407402,N,02859.259258,E,300926,120000.00,150.5,0.0,0.0,1.2,0.9,0.8
-I (47125) modem: GNSS: position 41.123457, 28.987654 from 11 satellites
+I (368) board: Waveshare ESP32-S3-A7670E-4G, board version V2
+I (373) bridge: flight controller: ESP32 TX GPIO2 -> FC RX, ESP32 RX GPIO3 <- FC TX, 115200 baud; relay ...
+I (385) modem: modem power on (GPIO21)
+I (9221) modem: modem UART at 921600 baud
+I (10260) modem: modem A7670E-FASE, firmware A7670M7_V1.11.1
+I (12299) modem: registered with Turkcell, LTE, signal -59 dBm
+I (12661) bridge: mobile data up, address 10.57.136.162
+I (12662) bridge: relay relay.example.com is 203.0.113.10, port 14650
+I (13706) bridge: connected to the relay (session 1380896e)
+I (96469) modem: GNSS: 3,10,,00,00,41.1234567,N,28.9876543,E,011026,145023.00,128.6,5.516,,5.48,4.36,3.32,04
+I (96469) modem: GNSS: position 41.123456, 28.987654 from 10 satellites
 ```
 
 After the whole board has been without power, the GNSS starts cold: it needs half a minute or so
