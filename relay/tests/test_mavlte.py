@@ -400,13 +400,13 @@ class GuiTest(unittest.TestCase):
 
         app.toggle_voice(True)
         self.assertTrue(row.switch.on)
-        self.pump(lambda: self.text(row.status) == "On: the aircraft is speaking", what="speaking")
+        self.pump(lambda: self.text(row.status) == "On: the aircraft's speaker is sounding", what="sounding")
         self.assertEqual(row.status.cget("fg"), mavlte.GREEN)
         self.assertTrue(self.relay.voice.on and self.vehicle.voice_on)
 
         modem["answer"] = "refuses"
         self.pump(lambda: row.status.cget("fg") == mavlte.RED, what="cannot speak")
-        self.assertEqual(self.text(row.status), "On, but the aircraft cannot speak")
+        self.assertEqual(self.text(row.status), "On, but the aircraft cannot play it")
 
         app.toggle_voice(False)
         self.pump(lambda: self.text(row.status).startswith("Off:"), what="off again")
@@ -419,11 +419,11 @@ class GuiTest(unittest.TestCase):
             self.pump(lambda: "before 1.5.0" in self.text(row.status), what="hint at old firmware")
 
         modem["answer"] = "speaks"
-        self.pump(lambda: self.text(row.status) == "On: the aircraft is speaking", what="speaking again")
+        self.pump(lambda: self.text(row.status) == "On: the aircraft's speaker is sounding", what="sounding again")
         self.vehicle_quiet = True  # the aircraft drops off the air
         self.loop.call_soon_threadsafe(self.vehicle_task.cancel)
-        self.pump(lambda: self.text(row.status).startswith("On: it was speaking when last heard"), timeout=10,
-                  what="speaking while offline")
+        self.pump(lambda: self.text(row.status).startswith("On: it was sounding when last heard"), timeout=10,
+                  what="sounding while offline")
         self.assertTrue(row.switch.on)  # the relay keeps the switch
 
     def test_wrong_key_says_no_answer(self):

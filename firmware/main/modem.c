@@ -21,6 +21,7 @@
 
 #include "board.h"
 #include "bridge.h"
+#include "alarm.h"
 #include "locator.h"
 #include "status.h"
 
@@ -58,6 +59,7 @@ static int baud = BOOT_BAUD;
 #if CONFIG_BRIDGE_LOCATOR_VOICE
 static bool voice_ready; /* the modem's audio is set up for the locator voice since it last (re)started */
 #endif
+static void voice_prepare(void);
 
 static uint32_t now_ms(void)
 {
@@ -404,6 +406,7 @@ static bool configure(void)
     }
     command("AT+CGNSSTST=0\r", 2000);
 #endif
+    voice_prepare(); /* in command mode, before the data call */
     return true;
 }
 
@@ -443,15 +446,94 @@ static int16_t signal_dbm(void)
 }
 
 #if CONFIG_BRIDGE_LOCATOR_VOICE
-/* ---- the locator voice: the modem's text-to-speech on the board's speaker, while the relay asks for it */
+/* ---- the locator voice: the board's speaker (on the modem's earpiece output), while the relay asks for it */
 
-#define VOICE_EVERY_MS 3000   /* a phrase at most this often: the default one takes about 2 s */
-#define VOICE_FAILED_MS 15000 /* asked for this long and no phrase taken: the modem does not speak */
+#define VOICE_FAILED_MS 15000 /* asked for this long and nothing played: the modem does not */
+#define VOICE_RETRY_MS 1000   /* after a refusal: the modem still busy with the last one, say */
 
-static bool voice_asked;  /* the relay asks for the voice, as last seen here */
-static bool voice_spoke;  /* the modem has taken a phrase since then */
-static bool voice_failed; /* reported as unable to speak */
-static uint32_t voice_asked_ms, voice_try_ms, voice_ok_ms;
+#if CONFIG_BRIDGE_LOCATOR_SOUND_ALARM
+/* The two-tone alarm (alarm.h), a WAV file in the modem's own flash: each command plays it 15 times (30 s) */
+#define ALARM_FILE "mavlte_alarm1.wav" /* on its C: drive; another sound would get another name */
+#define VOICE_EVERY_MS (15 * ALARM_WAV_MS + 500)
+#define VOICE_STOP "AT+CCMXSTOP\r"
+#define VOICE_WHAT "the two-tone alarm"
+
+static const char *voice_command(void)
+{
+    return "AT+CCMXPLAY=\"c:/" ALARM_FILE "\",0,14\r"; /* 14 repeats */
+}
+
+/* Reads the modem's UART itself until `pass` or `fail` comes: while none of its own commands waits,
+ * esp_modem leaves what arrives unread. */
+static bool uart_expect(const char *pass, const char *fail, uint32_t timeout_ms)
+{
+    char seen[96];
+    size_t n = 0;
+    for (uint32_t start = now_ms(); (uint32_t)(now_ms() - start) < timeout_ms;) {
+        uint8_t c;
+        if (uart_read_bytes(MODEM_UART, &c, 1, pdMS_TO_TICKS(20)) != 1) {
+            continue;
+        }
+        if (n == sizeof(seen) - 1) { /* keep the newest half */
+            memmove(seen, seen + sizeof(seen) / 2, n - sizeof(seen) / 2);
+            n -= sizeof(seen) / 2;
+        }
+        seen[n++] = (char)c;
+        seen[n] = '\0';
+        if (strstr(seen, pass)) {
+            return true;
+        }
+        if (strstr(seen, fail)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool alarm_stored(void)
+{
+    char size[16];
+    return command("AT+FSATTRI=" ALARM_FILE "\r", 2000) == ESP_OK &&
+           atoi(answer_field("+FSATTRI:", size, sizeof(size))) == ALARM_WAV_BYTES;
+}
+
+/* Puts the alarm's WAV file into the modem's own flash, unless it is there: once per modem. In command
+ * mode only, before a data call. The file goes over the UART as raw bytes after the modem's ">" prompt,
+ * which esp_modem's commands cannot carry, so this writes and reads the UART itself. */
+static void voice_prepare(void)
+{
+    if (command("AT+FSCD=C:\r", 2000) == ESP_OK && alarm_stored()) {
+        return;
+    }
+    command("AT+FSDEL=" ALARM_FILE "\r", 2000); /* one cut short: AT+CFTRANRX does not overwrite */
+    char at[64];
+    int n = snprintf(at, sizeof(at), "AT+CFTRANRX=\"c:/%s\",%d\r", ALARM_FILE, ALARM_WAV_BYTES);
+    uart_flush_input(MODEM_UART);
+    uart_write_bytes(MODEM_UART, at, (size_t)n);
+    bool ok = uart_expect(">", "ERROR", 5000);
+    if (ok) {
+        static uint8_t chunk[256];
+        for (size_t done = 0; done < ALARM_WAV_BYTES; done += sizeof(chunk)) {
+            size_t len = ALARM_WAV_BYTES - done < sizeof(chunk) ? ALARM_WAV_BYTES - done : sizeof(chunk);
+            alarm_wav(chunk, done, len);
+            uart_write_bytes(MODEM_UART, chunk, len);
+            uart_wait_tx_done(MODEM_UART, pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(10)); /* time for the modem to write its flash (SIMCom's advice) */
+        }
+        ok = uart_expect("OK", "ERROR", 10000);
+    }
+    if (ok && alarm_stored()) {
+        ESP_LOGI(TAG, "locator voice: the alarm is stored on the modem");
+    } else {
+        ESP_LOGW(TAG, "locator voice: could not store the alarm on the modem; trying again before the next data "
+                      "call");
+    }
+}
+#else
+/* The spoken phrase: the modem's text-to-speech, about 2 s for the default one */
+#define VOICE_EVERY_MS 3000
+#define VOICE_STOP "AT+CTTS=0\r"
+#define VOICE_WHAT "\"" CONFIG_BRIDGE_LOCATOR_VOICE_TEXT "\""
 
 /* AT+CTTS=2,"<text>": ASCII text; quotes and anything else that would end the command are left out */
 static const char *voice_command(void)
@@ -469,9 +551,20 @@ static const char *voice_command(void)
     return at;
 }
 
+static void voice_prepare(void)
+{
+}
+#endif
+
+static bool voice_asked;   /* the relay asks for the voice, as last seen here */
+static bool voice_playing; /* the modem took the last command */
+static bool voice_spoke;   /* it has taken one since the voice was asked for */
+static bool voice_failed;  /* reported as unable to play */
+static uint32_t voice_asked_ms, voice_try_ms, voice_ok_ms;
+
 /* About once a second wherever the modem takes AT commands: in command mode, and on the CMUX command
- * channel during a data call (`usable` false where it cannot: a data call without CMUX). While the
- * modem is still saying a phrase it refuses the next one (ERROR), which only means "later". */
+ * channel during a data call (`usable` false where it cannot: a data call without CMUX). A modem still busy
+ * with the last command refuses the next one (ERROR), which only means "a second later". */
 static void voice_tick(bool usable)
 {
     uint32_t now = now_ms();
@@ -479,7 +572,7 @@ static void voice_tick(bool usable)
         if (voice_asked) {
             voice_asked = false;
             if (usable) {
-                command("AT+CTTS=0\r", 2000); /* stops it mid-phrase */
+                command(VOICE_STOP, 2000); /* stops it at once */
             }
             ESP_LOGI(TAG, "locator voice off");
             bridge_set_voice(false, false);
@@ -488,31 +581,34 @@ static void voice_tick(bool usable)
     }
     if (!voice_asked) {
         voice_asked = true;
-        voice_spoke = voice_failed = false;
+        voice_playing = voice_spoke = voice_failed = false;
         voice_ready = false; /* set the audio up again: the modem may have changed it since */
         voice_asked_ms = now;
         voice_try_ms = now - VOICE_EVERY_MS;
-        ESP_LOGI(TAG, "locator voice on: \"%s\" through the board's speaker", CONFIG_BRIDGE_LOCATOR_VOICE_TEXT);
+        ESP_LOGI(TAG, "locator voice on: %s through the board's speaker", VOICE_WHAT);
     }
-    if (usable && (uint32_t)(now - voice_try_ms) >= VOICE_EVERY_MS) {
+    if (usable && (uint32_t)(now - voice_try_ms) >= (voice_playing ? VOICE_EVERY_MS : VOICE_RETRY_MS)) {
         voice_try_ms = now;
         if (!voice_ready) {
             /* as tried on the A7670E-FASE: the speaker phone path and the highest volumes */
             command("AT+CSDVC=3\r", 2000);
             command("AT+COUTGAIN=7\r", 2000);
+#if CONFIG_BRIDGE_LOCATOR_SOUND_PHRASE
             command("AT+CTTSPARAM=2,3,0,1,1\r", 2000); /* volume, system volume, digits, pitch, speed */
+#endif
             voice_ready = true;
         }
-        if (command(voice_command(), 3000) == ESP_OK) {
+        voice_playing = command(voice_command(), 3000) == ESP_OK;
+        if (voice_playing) {
             voice_spoke = true;
             voice_ok_ms = now;
         }
     }
-    bool speaking = voice_spoke && (uint32_t)(now - voice_ok_ms) < VOICE_FAILED_MS;
+    bool speaking = voice_spoke && (uint32_t)(now - voice_ok_ms) < VOICE_EVERY_MS + VOICE_FAILED_MS;
     bool failed = !speaking && (uint32_t)(now - (voice_spoke ? voice_ok_ms : voice_asked_ms)) >= VOICE_FAILED_MS;
     if (failed && !voice_failed) {
         if (usable) {
-            ESP_LOGW(TAG, "the locator voice is on, but the modem does not speak (it refuses AT+CTTS)");
+            ESP_LOGW(TAG, "the locator voice is on, but the modem does not play it (%s)", answer);
         } else {
             ESP_LOGW(TAG, "the locator voice needs the modem's multiplexer (CMUX), which it did not take");
         }
@@ -521,6 +617,10 @@ static void voice_tick(bool usable)
     bridge_set_voice(speaking, failed);
 }
 #else
+static void voice_prepare(void)
+{
+}
+
 static void voice_tick(bool usable)
 {
     (void)usable;

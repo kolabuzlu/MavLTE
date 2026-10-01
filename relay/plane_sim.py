@@ -120,7 +120,7 @@ GNSS_TTFF = 25.0
 GNSS_TTFF_QUICK = 3.0
 GNSS_ERROR_M = 2.0
 LOCATOR_INTERVAL = 5.0  # seconds between the module's position reports, as the firmware sends them
-VOICE_TEXT = "Mav L T E here."  # what the board's locator voice says (the firmware's default)
+VOICE_SOUND = "the two-tone alarm"  # what the board's locator voice plays (the firmware's default)
 # The 18650 cell in the board's holder keeps the module on without the flight battery: a 3000 mAh cell at
 # about 150 mA (ESP32, the modem idling between reports, GNSS) lasts some 20 hours.
 CELL_HOURS = 20.0
@@ -453,7 +453,7 @@ class Modem:
         self.photos: Optional[mr.PhotoOutbox] = None
         self.gnss = Gnss(self.started, gnss_ttff)
         self.position: Optional[mr.Position] = None  # the last one reported
-        self.voice = False  # its locator voice speaks: the relay asks for it in its PONGs
+        self.voice = False  # its locator voice sounds: the relay asks for it in its PONGs
 
     def send(self, chunk: bytes) -> None:
         if self.client is not None and self.client.gcs_present:  # like the firmware: held back without a GCS
@@ -735,7 +735,7 @@ class Plane:
             m.photos.pump(now)
             if m.client.voice_on != m.voice:  # the locator voice, kept while the relay is out of reach
                 m.voice = m.client.voice_on
-                log.info("LTE module: locator voice %s", f"on: “{VOICE_TEXT}” through its speaker, again and again"
+                log.info("LTE module: locator voice %s", f"on: {VOICE_SOUND} through its speaker, again and again"
                          if m.voice else "off")
                 m.client.ping_flags = mr.PING_FLAG_SPEAKING if m.voice else 0
                 m.client.ping_now()
@@ -1105,12 +1105,12 @@ class SimWindow:
         self.poll_job = self.root.after(self.POLL_MS, self.poll)
 
     def _show_voice(self) -> None:
-        """What the board's speaker would be saying: MavLTE's Voice switch turns it on and off."""
+        """What the board's speaker would be playing: MavLTE's Voice switch turns it on and off."""
         m = self.plane.modem
         if m is None:
             text, color = "-", ui.TEXT
         elif m.voice:
-            text, color = f"Speaking: “{VOICE_TEXT}” again and again", ui.GREEN
+            text, color = "Sounding: a two-tone alarm, again and again", ui.GREEN
         else:
             text, color = "Off (MavLTE: Voice switch)", ui.MUTED
         label = self.lte_values["Voice"]

@@ -34,7 +34,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -65,13 +65,13 @@ U16_UNKNOWN = 0xFFFF
 RSSI_UNKNOWN = 0x7FFF
 RAT_UNKNOWN = 0xFF
 PONG_GCS_PRESENT = 0x01
-PONG_VOICE = 0x02  # to the vehicle: the locator voice is on, speak
+PONG_VOICE = 0x02  # to the vehicle: the locator voice is on, sound the speaker
 PING_FLAG_WATCHING = 0x01  # GCS agent: only watching the vehicle's link, send it STATUS but no telemetry
-PING_FLAG_SPEAKING = 0x02  # vehicle: its locator voice speaks
-PING_FLAG_VOICE_FAILED = 0x04  # vehicle: asked to speak, but its modem does not
+PING_FLAG_SPEAKING = 0x02  # vehicle: its locator voice sounds
+PING_FLAG_VOICE_FAILED = 0x04  # vehicle: asked to sound, but its modem does not play it
 STATUS_VEHICLE_ONLINE = 0x01
 STATUS_VOICE_ON = 0x02  # the relay has the locator voice switched on
-STATUS_SPEAKING = 0x04  # the vehicle said in its last PING that it speaks
+STATUS_SPEAKING = 0x04  # the vehicle said in its last PING that it sounds
 STATUS_VOICE_FAILED = 0x08  # ... that it cannot
 REJECT_UNKNOWN_SESSION = 1
 NO_VEHICLE_STATUS = STATUS_BODY.pack(0, RAT_UNKNOWN, U16_UNKNOWN, U16_UNKNOWN, U16_UNKNOWN, RSSI_UNKNOWN, U16_UNKNOWN)
@@ -340,7 +340,7 @@ class LinkStatus(NamedTuple):
     rssi_dbm: int
     idle_ms: int
     voice_on: bool = False  # the relay has the locator voice switched on
-    speaking: bool = False  # the vehicle said it speaks (when last heard)
+    speaking: bool = False  # the vehicle said its speaker sounds (when last heard)
     voice_failed: bool = False  # the vehicle said it cannot
 
     @classmethod
@@ -360,9 +360,10 @@ class LinkStatus(NamedTuple):
         if not self.voice_on:
             return "off"
         if self.voice_failed:
-            return "on, but the aircraft cannot speak"
+            return "on, but the aircraft cannot play it"
         if self.speaking:
-            return "on, the aircraft speaks" if self.online else "on, the aircraft was speaking when last heard"
+            return ("on, the aircraft's speaker sounds" if self.online
+                    else "on, the aircraft's speaker was sounding when last heard")
         return "on, waiting for the aircraft"
 
     def describe(self) -> str:
@@ -719,7 +720,7 @@ class Session:
         self.peer_loss = U16_UNKNOWN
         self.rssi_dbm = RSSI_UNKNOWN
         self.rat = RAT_UNKNOWN
-        self.speaking = False  # a vehicle's locator voice speaks (PING_FLAG_SPEAKING)
+        self.speaking = False  # a vehicle's locator voice sounds (PING_FLAG_SPEAKING)
         self.voice_failed = False  # it was asked to, but its modem does not
 
     def describe(self) -> str:
@@ -1026,7 +1027,7 @@ class LocatorStore:
 
 class VoiceSwitch:
     """The locator voice as GCS agents switch it (VOICE). While it is on, every PONG to the aircraft asks it
-    to speak through the speaker on its board, until an agent switches it off. Kept in `path`, so that a
+    to sound the speaker on its board, until an agent switches it off. Kept in `path`, so that a
     relay restart does not silence an aircraft that someone is looking for."""
 
     def __init__(self, path: Optional[str]) -> None:
@@ -1250,9 +1251,9 @@ class RelayServer(asyncio.DatagramProtocol):
     @staticmethod
     def _vehicle_voice(sess: Session, speaking: bool, failed: bool) -> None:
         if speaking != sess.speaking:
-            slog.info("the aircraft %s (locator voice)", "speaks" if speaking else "has stopped speaking")
+            slog.info("the aircraft's speaker %s (locator voice)", "sounds" if speaking else "has stopped")
         if failed and not sess.voice_failed:
-            slog.warning("the aircraft cannot speak: its modem refuses the locator voice")
+            slog.warning("the aircraft cannot play the locator voice: its modem refuses it")
         sess.speaking, sess.voice_failed = speaking, failed
 
     def _reject(self, pkt: Packet, key: bytes, addr, now: float) -> None:
@@ -1435,7 +1436,7 @@ class TunnelClient(asyncio.DatagramProtocol):
         self.rtt_ms = U16_UNKNOWN
         self.gcs_present = True  # until the server says otherwise
         # vehicle: the server's last PONG asked for the locator voice; kept without a session, so that an
-        # aircraft keeps speaking where it has no coverage
+        # aircraft keeps sounding where it has no coverage
         self.voice_on = False
         self.last_rx = 0.0
         self.last_ping = 0.0
@@ -2409,13 +2410,13 @@ async def run_vehicle(opts) -> None:
             if chunk:
                 send(chunk)
 
-    async def voice() -> None:  # no speaker here: it reports that it speaks, as the ESP32 does
+    async def voice() -> None:  # no speaker here: it reports that it sounds, as the ESP32 does
         on = False
         while True:
             await asyncio.sleep(0.2)
             if client.voice_on != on:
                 on = client.voice_on
-                vlog.info("locator voice %s", "on (this vehicle has no speaker: it only says it speaks)" if on else "off")
+                vlog.info("locator voice %s", "on (this vehicle has no speaker: it only says it sounds)" if on else "off")
                 client.ping_flags = PING_FLAG_SPEAKING if on else 0
                 client.ping_now()
 

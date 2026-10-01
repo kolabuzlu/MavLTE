@@ -124,15 +124,33 @@ menu "MavLTE"
         depends on BRIDGE_LOCATOR
         default y
         help
-            MavLTE's Voice switch makes the modem say a phrase through the speaker on the board's
-            speaker header, again and again until the switch is off: for finding the aircraft in
-            the last metres (tall grass, crops, bushes) once its position has brought you close.
-            The relay keeps the switch, and the aircraft keeps speaking where it has no coverage.
-            The modem's own text-to-speech, over its multiplexer (CMUX) like the GNSS.
+            MavLTE's Voice switch makes the speaker on the board's speaker header sound, again and
+            again until the switch is off: for finding the aircraft in the last metres (tall grass,
+            crops, bushes) once its position has brought you close. The relay keeps the switch, and
+            the aircraft keeps sounding where it has no coverage. The modem plays it, commanded
+            over its multiplexer (CMUX) like the GNSS.
+
+    choice BRIDGE_LOCATOR_SOUND
+        prompt "Locator voice: what the speaker plays"
+        depends on BRIDGE_LOCATOR_VOICE
+        default BRIDGE_LOCATOR_SOUND_ALARM
+
+        config BRIDGE_LOCATOR_SOUND_ALARM
+            bool "A two-tone alarm"
+            help
+                Beeps of 2.4 and 3 kHz in turn, where small speakers and ears are at their best and
+                which is easy to walk towards. The firmware stores it in the modem's own flash once
+                (a 32 KB file), and the modem plays it from there.
+
+        config BRIDGE_LOCATOR_SOUND_PHRASE
+            bool "A spoken phrase"
+            help
+                The modem's own text-to-speech says the phrase below every three seconds.
+    endchoice
 
     config BRIDGE_LOCATOR_VOICE_TEXT
-        string "Locator voice: what it says"
-        depends on BRIDGE_LOCATOR_VOICE
+        string "Locator voice: the phrase"
+        depends on BRIDGE_LOCATOR_SOUND_PHRASE
         default "Mav L T E here."
         help
             English. Letters with spaces between them are said one by one, so are digits: a phone

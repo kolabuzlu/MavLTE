@@ -528,7 +528,7 @@ class WindowTest(unittest.TestCase):
                     ground.gcs.send_packet(mr.VOICE, mr.VOICE_BODY.pack(1))
 
                 ground.run(switch_voice())
-                wait_for(self, lambda: text(voice) == "Speaking: “Mav L T E here.” again and again", "voice shown",
+                wait_for(self, lambda: text(voice) == "Sounding: a two-tone alarm, again and again", "voice shown",
                          pump=root.update)
                 self.assertEqual(voice.cget("fg"), ui.GREEN)
                 win.toggle_lte(False)

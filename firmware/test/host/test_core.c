@@ -1,9 +1,11 @@
-/* Host tests for the portable firmware core (sha256, mavframe, tunnel, snapshot, mavpos, locator).
+/* Host tests for the portable firmware core (sha256, mavframe, tunnel, snapshot, mavpos, locator, alarm).
  * Build and run: make test */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "alarm.h"
 #include "locator.h"
 #include "mavframe.h"
 #include "mavpos.h"
@@ -1012,6 +1014,40 @@ static void test_locator_packet(void)
     CHECK(body[34] == 0xFB);
 }
 
+/* The locator alarm: the WAV file the user picked by ear (made then by a Python script): the same header,
+ * and every sample within 1 of that script's, which works in double precision */
+static void test_alarm(void)
+{
+    static uint8_t wav[ALARM_WAV_BYTES];
+    alarm_wav(wav, 0, 100); /* in pieces, as the firmware uploads it */
+    alarm_wav(wav + 100, 100, sizeof(wav) - 100);
+    char hex[2 * 44 + 1];
+    for (int i = 0; i < 44; i++) {
+        sprintf(hex + 2 * i, "%02x", wav[i]);
+    }
+    CHECK(strcmp(hex, "52494646247d000057415645666d74201000000001000100401f0000803e00000200100064617461007d0000") == 0);
+    int worst = 0;
+    for (int i = 0; i < 16000; i++) {
+        int beep = i / 2000, k = i % 2000;
+        double env = k >= 1600 ? 0.0 : fmin(1.0, fmin(k / 40.0, (1599 - k) / 40.0));
+        int expect = (int)(32000 * env * sin(2 * 3.141592653589793 * (beep % 2 ? 3000 : 2400) * k / 8000));
+        int got = (int16_t)(wav[44 + 2 * i] | wav[45 + 2 * i] << 8);
+        worst = abs(got - expect) > worst ? abs(got - expect) : worst;
+    }
+    CHECK(worst <= 1);
+    /* a few of the script's own values */
+    static const struct {
+        int i, v;
+    } known[] = {{1, 760}, {2, -940}, {39, -29672}, {41, 30433}, {1999, 0}, {2001, 565}, {2041, 22627}};
+    for (size_t j = 0; j < sizeof(known) / sizeof(known[0]); j++) {
+        int got = (int16_t)(wav[44 + 2 * known[j].i] | wav[45 + 2 * known[j].i] << 8);
+        CHECK(abs(got - known[j].v) <= 1);
+    }
+    uint8_t piece[3];
+    alarm_wav(piece, 44 + 2 * 41 - 1, 3); /* across a sample's two bytes */
+    CHECK(piece[1] == wav[44 + 2 * 41] && piece[2] == wav[45 + 2 * 41] && piece[0] == wav[43 + 2 * 41]);
+}
+
 int main(void)
 {
     test_sha256();
@@ -1027,6 +1063,7 @@ int main(void)
     test_position();
     test_gnss_parse();
     test_locator_packet();
+    test_alarm();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

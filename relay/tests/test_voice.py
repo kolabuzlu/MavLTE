@@ -26,12 +26,12 @@ class VoiceStatusTest(unittest.TestCase):
     def test_flags(self):
         st = status(mr.STATUS_VEHICLE_ONLINE | mr.STATUS_VOICE_ON | mr.STATUS_SPEAKING)
         self.assertEqual((st.online, st.voice_on, st.speaking, st.voice_failed), (True, True, True, False))
-        self.assertEqual(st.voice_text(), "on, the aircraft speaks")
-        self.assertTrue(st.describe().endswith("; locator voice on, the aircraft speaks"))
+        self.assertEqual(st.voice_text(), "on, the aircraft's speaker sounds")
+        self.assertTrue(st.describe().endswith("; locator voice on, the aircraft's speaker sounds"))
         st = status(mr.STATUS_VEHICLE_ONLINE | mr.STATUS_VOICE_ON | mr.STATUS_VOICE_FAILED)
-        self.assertEqual(st.voice_text(), "on, but the aircraft cannot speak")
+        self.assertEqual(st.voice_text(), "on, but the aircraft cannot play it")
         self.assertEqual(status(mr.STATUS_VOICE_ON | mr.STATUS_SPEAKING, idle=40000).voice_text(),
-                         "on, the aircraft was speaking when last heard")
+                         "on, the aircraft's speaker was sounding when last heard")
         self.assertEqual(status(mr.STATUS_VEHICLE_ONLINE | mr.STATUS_VOICE_ON).voice_text(), "on, waiting for the aircraft")
 
     def test_off_and_old_relays(self):
@@ -113,7 +113,7 @@ class RelayVoiceTest(unittest.TestCase):
 
         with self.assertLogs("mavrelay.relay", "INFO") as logs:  # the aircraft says it speaks
             self.ping(mr.ROLE_VEHICLE, plane, self.PLANE, mr.PING_FLAG_SPEAKING)
-        self.assertIn("the aircraft speaks", logs.output[0])
+        self.assertIn("the aircraft's speaker sounds", logs.output[0])
         self.assertTrue(self.last_status(self.LAPTOP).speaking)
         with self.assertLogs("mavrelay.relay", "WARNING"):  # ... or that it cannot
             self.ping(mr.ROLE_VEHICLE, plane, self.PLANE, mr.PING_FLAG_VOICE_FAILED)

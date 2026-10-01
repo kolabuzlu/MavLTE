@@ -8,9 +8,9 @@ switches start off. With both off the app only watches: the aircraft holds its t
 Snapshot asks the aircraft for a photo from its camera, whatever the switches; photos are kept in
 Pictures\\MavLTE, each with a .json beside it saying when and where it was taken. Position shows
 where the LTE module's own GNSS puts the aircraft, live or last known, with a map link. The Voice
-switch (the locator voice) makes the aircraft speak through the speaker on its board until it is
-switched off, to find it in the last metres; the relay keeps the switch, also while the aircraft
-is offline.
+switch (the locator voice) sounds the speaker on the aircraft's board (a two-tone alarm) until it
+is switched off, to find it in the last metres; the relay keeps the switch, also while the
+aircraft is offline.
 
     python mavlte.py            (or double-click MavLTE.pyw, or run MavLTE.exe: build_release.py)
 
@@ -616,8 +616,8 @@ class CameraRow(tk.Frame):
 
 
 class VoiceRow(tk.Frame):
-    """The locator voice, a line of the Aircraft card: while it is on, the aircraft says its phrase through
-    the speaker on its board, again and again, to be found in the last metres. The relay keeps the switch."""
+    """The locator voice, a line of the Aircraft card: while it is on, the speaker on the aircraft's board
+    sounds again and again, to find it in the last metres. The relay keeps the switch."""
 
     def __init__(self, app: "App", master: tk.Misc) -> None:
         super().__init__(master, bg=SURFACE)
@@ -955,7 +955,7 @@ class App:
                 self.chip_temp = tk.Label(cell, text="", bg=SURFACE, fg=TEXT, font=self.font, anchor="w", padx=0)
                 self.chip_temp.pack(side="left")
         self.shown_fix: Optional[mr.Position] = None  # the position Map and Copy use
-        self.voice_waiting_at: Optional[float] = None  # voice on, aircraft online, not speaking yet: since when
+        self.voice_waiting_at: Optional[float] = None  # voice on, aircraft online, not sounding yet: since when
         self.camera = CameraRow(self, craft)
         self.camera.pack(fill="x")
         newest = photo_files(self.settings.photo_folder())
@@ -1233,7 +1233,7 @@ class App:
         card.set_enabled(connected and online and not busy)
         card.size.set_enabled(not busy)
 
-    VOICE_ANSWER_S = 10.0  # an aircraft that has not said it speaks by then may not know the voice
+    VOICE_ANSWER_S = 10.0  # an aircraft that has not said it sounds by then may not know the voice
 
     def _show_voice(self, agent, status: Optional[mr.LinkStatus], now: float) -> None:
         """The switch shows the relay's: it keeps it, whoever switched it, also while the aircraft is away."""
@@ -1256,18 +1256,18 @@ class App:
         elif self.voice_waiting_at is None:
             self.voice_waiting_at = now
         if not status.voice_on:
-            row.show("Off: switch on to make the aircraft talk")
+            row.show("Off: switch on to hear the aircraft")
         elif status.voice_failed:
-            row.show("On, but the aircraft cannot speak", RED)  # its modem refuses
+            row.show("On, but the aircraft cannot play it", RED)  # its modem refuses
         elif status.speaking and status.online:
-            row.show("On: the aircraft is speaking", GREEN)
+            row.show("On: the aircraft's speaker is sounding", GREEN)
         elif status.speaking:  # and it goes on without the relay
-            row.show("On: it was speaking when last heard", AMBER)
+            row.show("On: it was sounding when last heard", AMBER)
         elif not status.online:
-            row.show("On: speaks once the aircraft is back", AMBER)
+            row.show("On: sounds once the aircraft is back", AMBER)
         elif now - self.voice_waiting_at < self.VOICE_ANSWER_S:
             row.show("On: waiting for the aircraft…", TEXT)
-        else:  # it does not say whether it speaks
+        else:  # it does not say whether it sounds
             row.show("On, but no answer: firmware before 1.5.0?", AMBER)
 
     def _reached_at(self, host: str, now: float) -> str:
