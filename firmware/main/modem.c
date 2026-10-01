@@ -37,8 +37,10 @@
 
 #if CONFIG_BRIDGE_NETWORK_LTE_ONLY
 #define NETWORK_MODE 38 /* AT+CNMP: LTE only */
+#define SET_NETWORK_MODE "AT+CNMP=38\r"
 #else
 #define NETWORK_MODE 2 /* AT+CNMP: automatic */
+#define SET_NETWORK_MODE "AT+CNMP=2\r"
 #endif
 
 static const char *TAG = "modem";
@@ -85,6 +87,15 @@ static void on_ppp_status(void *arg, esp_event_base_t base, int32_t id, void *da
 
 static void power_init(void)
 {
+    /* DTR held asserted (low): the modem never ends a data call over it, whatever its AT&D setting */
+    const gpio_config_t dtr = {
+        .pin_bit_mask = 1ULL << BOARD_MODEM_DTR_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    };
+    gpio_set_level((gpio_num_t)BOARD_MODEM_DTR_GPIO, 0);
+    gpio_config(&dtr);
     const gpio_num_t pin = (gpio_num_t)board->modem_power_gpio;
     const gpio_config_t input = {
         .pin_bit_mask = 1ULL << pin,
@@ -281,10 +292,20 @@ static void remember_bad_pin(bool bad)
     nvs_close(nvs);
 }
 
+/* PIN tries the SIM card has left (AT+SPIC answers PIN1 first), or -1 if the modem does not say. */
+static int pin_tries_left(void)
+{
+    char field[24];
+    if (command("AT+SPIC\r", 2000) != ESP_OK || !answer_field("+SPIC:", field, sizeof(field))[0]) {
+        return -1;
+    }
+    return atoi(field);
+}
+
 static bool check_sim(void)
 {
     esp_modem_sim_pin_state_t state = ESP_MODEM_SIM_PIN_STATE_UNKNOWN;
-    for (int i = 0; i < 10; i++) { /* the SIM needs a few seconds after the modem boots */
+    for (int i = 0; i < 20; i++) { /* the SIM needs a few seconds after the modem boots */
         if (esp_modem_read_pin_state(dce, &state) == ESP_OK) {
             break;
         }
@@ -304,19 +325,34 @@ static bool check_sim(void)
                           "cannot lock itself. Set the right PIN, or remove the PIN with a phone.");
             return false;
         }
-        esp_err_t err = esp_modem_set_pin(dce, CONFIG_BRIDGE_SIM_PIN);
-        if (err != ESP_OK) {
-            pin_rejected = true; /* not again in this start either way */
-            if (err == ESP_FAIL) { /* the SIM answered with an error: a wrong PIN, which it counts */
-                remember_bad_pin(true);
-                ESP_LOGE(TAG, "the SIM card rejected the PIN from menuconfig");
-            } else {
-                ESP_LOGE(TAG, "no answer to the SIM PIN; not trying it again until the next start");
-            }
+        int left = pin_tries_left();
+        if (left >= 0 && left < 2) { /* the last try stays for a phone: a wrong PIN then locks the SIM */
+            pin_rejected = true;
+            ESP_LOGE(TAG, "the SIM card has %d PIN tr%s left: not trying the PIN from menuconfig, so that it cannot "
+                          "lock itself. Unlock the SIM with a phone.", left, left == 1 ? "y" : "ies");
             return false;
         }
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        return true;
+        /* The SIM may take up to 9 s to answer (A76XX AT manual): a late "wrong PIN" must not pass for
+         * no answer, or the PIN is sent again after each restart until the SIM locks. */
+        esp_err_t err = command("AT+CPIN=" CONFIG_BRIDGE_SIM_PIN "\r", 10000);
+        if (err == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            return true;
+        }
+        char reason[48];
+        answer_field("+CME ERROR:", reason, sizeof(reason));
+        if (err == ESP_FAIL && (strstr(reason, "SIM busy") || strcmp(reason, "14") == 0)) {
+            ESP_LOGW(TAG, "the SIM card is busy; its PIN goes again in a moment");
+            return false;
+        }
+        pin_rejected = true; /* not again in this start either way */
+        if (err == ESP_FAIL) { /* the SIM answered with an error: most likely a wrong PIN, which it counts */
+            remember_bad_pin(true);
+            ESP_LOGE(TAG, "the SIM card rejected the PIN from menuconfig (%s)", reason[0] ? reason : "ERROR");
+        } else {
+            ESP_LOGE(TAG, "no answer to the SIM PIN; not trying it again until the next start");
+        }
+        return false;
     }
     case ESP_MODEM_SIM_PIN_STATE_NEED_PUK:
         ESP_LOGE(TAG, "the SIM card is locked (PUK needed): unlock it in a phone");
@@ -338,11 +374,11 @@ static bool configure(void)
     if (esp_modem_at(dce, "AT+CNMP?", out, 1000) == ESP_OK) {
         const char *p = strstr(out, "+CNMP:");
         if (!p || atoi(p + 6) != NETWORK_MODE) {
-            esp_modem_set_network_mode(dce, NETWORK_MODE); /* the modem saves it */
+            command(SET_NETWORK_MODE, 10000); /* the modem saves it, which can take up to 10 s */
         }
     }
     static bool identified;
-    if (!identified && command("AT+SIMCOMATI\r", 2000) == ESP_OK) { /* the GNSS answers differ between them */
+    if (!identified && command("ATI\r", 2000) == ESP_OK) { /* the GNSS answers differ between them */
         identified = true;
         char model[40], revision[48];
         ESP_LOGI(TAG, "modem %s, firmware %s", answer_field("Model:", model, sizeof(model)),
@@ -350,9 +386,14 @@ static bool configure(void)
     }
 #if CONFIG_BRIDGE_LOCATOR
     /* The GNSS runs from now on, during data calls too, so that a fix is at hand whenever it is read
-     * (after its "+CGNSSPWR: READY!", 10-30 s later). Its NMEA stays off the UART, which carries PPP. */
-    if (command("AT+CGNSSPWR=1\r", 5000) != ESP_OK) {
-        ESP_LOGW(TAG, "the modem's GNSS did not start (%s)", answer);
+     * (after its "+CGNSSPWR: READY!", 10-30 s later). Started when it is off: this runs before every
+     * data call. Its NMEA stays off the UART, which carries PPP. */
+    char gnss_power[24];
+    if (command("AT+CGNSSPWR?\r", 2000) != ESP_OK ||
+        atoi(answer_field("+CGNSSPWR:", gnss_power, sizeof(gnss_power))) != 1) {
+        if (command("AT+CGNSSPWR=1\r", 9000) != ESP_OK) { /* up to 9 s (A76XX AT manual) */
+            ESP_LOGW(TAG, "the modem's GNSS did not start (%s)", answer);
+        }
     }
     command("AT+CGNSSTST=0\r", 2000);
 #endif
@@ -511,11 +552,14 @@ static bool dial(void)
  * esp_modem_sync() finds out whether it still answers. */
 static void hang_up(void)
 {
-    if (esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND) != ESP_OK && in_cmux) {
+    esp_err_t err = esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
+    if (err != ESP_OK && in_cmux) {
         /* The A7670 answers the multiplexer's close-down with a frame esp_modem does not accept: it
          * reports a failure, although both sides have left CMUX. Forget the mode, so that the next
          * data call is allowed to start it again. */
         esp_modem_set_mode(dce, ESP_MODEM_MODE_UNDEF);
+    } else if (err == ESP_OK && !in_cmux) {
+        command("ATH\r", 5000); /* "+++" leaves the packet data call up (A76XX AT manual): end it */
     }
     in_cmux = false;
 }
@@ -533,23 +577,30 @@ static void leave_cmux(void)
     }
 }
 
-/* Last resort: new esp_modem instance and, if we control it, a power cycle of the modem. */
+/* Last resort: a new esp_modem instance and a restart of the modem. One that still answers restarts
+ * itself (AT+CRESET): SIMCom warns that cutting the power of a running module may damage its flash.
+ * One that does not answer has its power cut, if the firmware controls it (DIP switch "4G" off). */
 static void hard_reset(void)
 {
     ESP_LOGW(TAG, "resetting the modem");
+    bool restarting = false;
     if (dce) {
         hang_up();
-        if (power_switchable) {
-            esp_modem_power_down(dce); /* AT+CPOF: lets the modem close its files first */
-        } else {
-            char out[ESP_MODEM_C_API_STR_BUF_SIZE];
-            esp_modem_at(dce, "AT+CRESET", out, 2000); /* the only reset we have with DIP "4G" on */
+        bool answers = sync_modem(3000);
+        if (!answers) {
+            leave_cmux(); /* still multiplexed from the data call? */
+            answers = sync_modem(3000);
+        }
+        if (answers) {
+            restarting = command("AT+CRESET\r", 9000) == ESP_OK; /* OK, then it restarts: UART back in ~8 s */
         }
         esp_modem_destroy(dce);
         dce = NULL;
     }
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    power_cycle();
+    if (!restarting) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        power_cycle();
+    }
 }
 
 typedef enum { LINK_PPP_LOST, LINK_RELAY_SILENT } link_end_t;

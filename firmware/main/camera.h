@@ -1,5 +1,6 @@
-/* The board's camera (an OV5640 on the 24-pin connector, powered with DIP switch CAM): started for
- * each photo and stopped once it is sent, so that between photos it takes no memory and no power. */
+/* The board's camera (an OV5640 on V2 boards, an OV2640 on V1, on the 24-pin connector, powered with DIP
+ * switch CAM): started for each photo and stopped once it is sent, so that between photos it takes no
+ * memory and no power. */
 #pragma once
 
 #include <stddef.h>

@@ -7,6 +7,7 @@
 
 #define BOARD_MODEM_TX_GPIO 18 /* ESP32 TX -> A7670E RXD, both versions */
 #define BOARD_MODEM_RX_GPIO 17 /* ESP32 RX <- A7670E TXD, both versions */
+#define BOARD_MODEM_DTR_GPIO 45 /* ESP32 -> A7670E DTR (low: asserted), both versions; a strapping pin */
 
 typedef struct {
     int version;          /* 1 or 2 */

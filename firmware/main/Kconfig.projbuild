@@ -123,7 +123,7 @@ menu "MavLTE"
         bool "Camera: a photo when MavLTE asks for one (Snapshot)"
         default y
         help
-            The board's OV5640 camera on its 24-pin connector, with DIP switch CAM on. It is
+            The board's camera (OV5640; OV2640 on V1 boards) on its 24-pin connector, with DIP switch CAM on. It is
             started for each photo and stopped after it: between photos it takes no memory and
             no power, and it never takes a photo nobody asked for. Without a camera (or with this
             off) the aircraft answers that it has none.

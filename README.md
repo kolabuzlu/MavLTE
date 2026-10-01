@@ -130,19 +130,20 @@ wired to the modem and never show up on the PC.)
 |---|---|
 | 1 CAM | ON: powers the camera (OFF: no camera, and the aircraft says so when asked for a photo) |
 | 2 HUB | OFF: the USB hub and CH343 only run while USB-C is plugged in |
-| 3 4G | OFF: the firmware switches the modem's power, so it can power-cycle a hung modem |
-| 4 USB | OFF: the modem's USB goes to the ESP32 (unused), not to your PC |
+| 3 4G | OFF: the firmware switches the modem's power, so it can restart a modem that hangs, or one that has switched itself off (too hot, or its supply too low) |
+| 4 USB | OFF: the modem's USB goes to the ESP32 (unused), not to your PC. ON only to update the modem's own firmware, or read its debug log, from a PC |
 
-With 4G ON the modem runs anyway, but the firmware can then only reset it by AT command; the
-log warns about it. On V2 boards the camera's clock line is on GPIO46, which the ESP32 reads
-while it starts: if flashing ever fails with the camera on, switch CAM off for the upload.
+With 4G ON the modem runs anyway, but the firmware can then only reset it by AT command, which
+does not reach a modem that has switched itself off; the log warns about it. On V2 boards the
+camera's clock line is on GPIO46, which the ESP32 reads while it starts: if flashing ever fails
+with the camera on, switch CAM off for the upload.
 
-**The camera** (the OV5640 that comes with the board, on its 24-pin connector) is started only
-when a photo is asked for and stopped once it is sent, so between photos it uses no memory and
-no power. It takes about two seconds per photo, letting the exposure settle first. The largest
-size (1024×768) needs about 150 KB of the ESP32's memory while it is taken and sent; should that
-ever be short, the aircraft answers that the photo could not be taken, and the smaller sizes
-still work.
+**The camera** (the OV5640 that comes with V2 boards, an OV2640 on V1 boards, on its 24-pin
+connector) is started only when a photo is asked for and stopped once it is sent, so between
+photos it uses no memory and no power. It takes about two seconds per photo, letting the
+exposure settle first. The largest size (1024×768) needs about 150 KB of the ESP32's memory
+while it is taken and sent; should that ever be short, the aircraft answers that the photo could
+not be taken, and the smaller sizes still work.
 
 **A healthy start** takes about 20–40 s and logs (shortened):
 
@@ -160,9 +161,11 @@ I (47120) modem: GNSS: 3,06,03,02,4107.407402,N,02859.259258,E,300926,120000.00,
 I (47125) modem: GNSS: position 41.123457, 28.987654 from 11 satellites
 ```
 
-The GNSS needs half a minute or so under open sky for its first position after power-up (the
-modem's GNSS keeps nothing while it has no power, so every power-up is a cold start). The first
-position is also logged as the modem wrote it: its form differs between modem firmware versions,
+After the whole board has been without power, the GNSS starts cold: it needs half a minute or so
+under open sky for its first position. When the firmware restarts only the modem, its GNSS keeps
+a backup supply from the board, so it should find its position again within seconds (SIMCom
+gives under 1 s for such a hot start, against under 40 s cold). The first position is also
+logged as the modem wrote it: its form differs between modem firmware versions,
 so that line and the modem's firmware line are worth including in a report if positions look wrong.
 
 Once a minute the bridge logs its counters: relay state, round-trip time, bytes each way.
@@ -190,13 +193,17 @@ green, blue. Green and blue match the Available and Connected LEDs in the MavLTE
 
 The pins are labelled on the board. Do not connect the flight controller's 5 V pin. The pin
 headers may come loose in the box and need soldering. If you need other pins, set them in
-menuconfig; never use GPIO17/18 (modem), 43/44 (USB-serial), 45/46 or, on V1, GPIO33 and
-on V2, GPIO21 (modem power).
+menuconfig; never use GPIO17/18 (the modem's UART, also on header pins 32 and 34: connect nothing
+there), 40 and 45 (the modem's RI and DTR), 43/44 (USB-serial), 46 (V1: the TF card, V2: the
+camera) or, on V1, GPIO33 and on V2, GPIO21 (modem power).
 
 **Power.** The modem draws current peaks of up to 2 A, so do not run the board from the
 flight controller. Either:
 
-- feed **5 V from its own BEC (2 A or more)** into the header's **5V** pin, or
+- feed **5 V from its own BEC (3 A or more)** into the header's **5V** pin. The modem's
+  transmitter takes up to 2 A in short bursts, and the board's charger up to 2 A more while it
+  charges the cell. Take a 5.0 V BEC, not a 5.5–6 V servo BEC: on V2 boards the 5V pin also
+  feeds the modem's USB supply, rated for 5.4 V at most. Or
 - run it from an **18650 cell** in the holder: it also keeps the link alive if the flight
   battery fails. Both together work as well; the BEC then charges the cell. With both, the
   **locator** keeps working after a crash that disconnects or destroys the flight battery: the
@@ -204,16 +211,25 @@ flight controller. Either:
   fuel gauge. On V2 boards the gauge shares the camera's bus, whose pull-up resistors take their
   power from the camera: with DIP switch CAM off, the charge may not be known.
 
+The bursts are strongest on 2G (GSM/EDGE), and the board has less buffer capacitance on the
+modem's supply than SIMCom asks for: keep the supply wires short and thick, and where LTE
+coverage is good, or when the board runs on its cell alone, choose *LTE only* in menuconfig.
+
 The 5V pin is wired straight to the USB-C port's power line. Unplug the BEC (or the flight
 battery) before you connect USB-C to a PC.
 
 **Heat.** The ESP32-S3R8 of V2 boards is rated for at most 65 °C of air around it (V1's
-ESP32-S3R2: 85 °C), and a closed fuselage parked in the summer sun gets that hot. Give the board
-some airflow, away from the motor and its ESC, and keep the aircraft in the shade on the ground.
-The module sends its chip's temperature with every position report and MavLTE shows it under
-*Module*. The chip reads warmer than the air around it (it heats itself, and the modem beside it
-heats the board), so take amber (70 °C) as a sign that the board is getting hot, and red (80 °C)
-as a sign to cool it down.
+ESP32-S3R2: 85 °C), and a closed fuselage parked in the summer sun gets that hot. The modem is
+rated for −30…+80 °C, warns beyond that and switches itself off above 85 °C; with DIP switch 4G
+off the firmware keeps restarting it, and it comes back once it has cooled down. Its own
+transmitter heats it further. Give the board some airflow, away from the motor and its ESC, and
+keep the aircraft in the shade on the ground. The module sends its chip's temperature with every
+position report and MavLTE shows it under *Module*. The chip reads warmer than the air around it
+(it heats itself, and the modem beside it heats the board), so take amber (70 °C) as a sign that
+the board is getting hot, and red (80 °C) as a sign to cool it down. The board charges its 18650
+cell whenever it has 5 V, without measuring the cell's temperature, while Li-ion cells are meant
+to be charged below about 45 °C: on a hot day, keep the aircraft in the shade, or charge the
+cell outside it.
 
 **Antennas and SIM.** Screw the LTE antenna onto the modem's main antenna connector, and the
 GNSS antenna (the small ceramic patch) onto the board's GNSS connector, for the locator: mount it
