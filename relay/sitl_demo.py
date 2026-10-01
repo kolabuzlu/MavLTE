@@ -11,6 +11,8 @@ One command starts all of it. Then, in Mission Planner, choose UDP, click Connec
     python sitl_demo.py --delay 80 --jitter 30 --loss 3    a mediocre mobile link
     python sitl_demo.py --server your-server:14650 --no-agent   through your relay server, for the
                                   MavLTE app (vehicle key: [vehicle] in mavrelay.ini, or --vehicle-key)
+    python sitl_demo.py --board COM9    SITL as the flight controller of the real board, over its USB
+                                  port (README, "SITL through the real board"); MavLTE does the rest
 
 Finds Mission Planner's copy of ArduPlane SITL by itself (or give --sitl). Runs SITL in its own
 folder, so Mission Planner's simulator settings are not touched. Stop with Ctrl+C.
@@ -29,6 +31,8 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -173,6 +177,86 @@ async def report(link: LinkEmulator, interval: float) -> None:
                  f" ({link.dropped} packets dropped so far)" if link.loss else "")
 
 
+def open_board(port: str, baud: int):
+    """The board's USB serial port; raises OSError if it is wrong or another program holds it."""
+    import serial  # pyserial
+
+    board = serial.Serial()
+    board.port, board.baudrate, board.timeout = port, baud, 0.05
+    board.dtr = board.rts = False  # the board's reset and boot lines stay as they are
+    board.open()
+    return board
+
+
+def board_link(fc: str, board, counts: dict) -> None:
+    """SITL's TELEM port and the real board's USB serial port, joined byte for byte both ways: SITL plays
+    the flight controller wired to the board, whose bench build listens for it on its USB pins. Runs
+    in threads of its own, for good."""
+    host, tcp_port = mr.parse_hostport(fc)
+    port, baud = board.port, board.baudrate
+    while True:
+        try:
+            sitl = socket.create_connection((host, tcp_port), timeout=5)
+        except OSError:
+            time.sleep(1.0)  # SITL is still starting
+            continue
+        sitl.settimeout(None)
+        log.info("SITL's TELEM port %s:%d <-> the board on %s, %d baud", host, tcp_port, port, baud)
+        done = threading.Event()
+
+        def board_to_sitl() -> None:
+            while not done.is_set():
+                data = board.read(4096)
+                if data:
+                    counts["from_board"] += len(data)
+                    try:
+                        sitl.sendall(data)
+                    except OSError:
+                        return
+
+        back = threading.Thread(target=board_to_sitl, daemon=True)
+        back.start()
+        try:
+            while True:
+                data = sitl.recv(4096)
+                if not data:
+                    break
+                counts["to_board"] += len(data)
+                board.write(data)
+        except OSError as exc:
+            log.warning("SITL's TELEM port: %s", exc)
+        finally:
+            done.set()
+            sitl.close()
+            back.join(1.0)
+        log.warning("SITL closed its TELEM port; connecting again")
+        time.sleep(1.0)
+
+
+async def report_board(counts: dict, interval: float) -> None:
+    to_board = from_board = 0
+    while True:
+        await asyncio.sleep(interval)
+        dt, df = counts["to_board"] - to_board, counts["from_board"] - from_board
+        to_board, from_board = counts["to_board"], counts["from_board"]
+        log.info("SITL -> board %.1f KB/s, board -> SITL %.2f KB/s", dt / interval / 1000, df / interval / 1000)
+
+
+async def run_board(args) -> None:
+    """SITL -> USB -> the real board -> mobile network -> your relay -> MavLTE."""
+    counts = {"to_board": 0, "from_board": 0}
+    board = open_board(args.board, args.board_baud)
+    threading.Thread(target=board_link, args=(args.fc, board, counts), daemon=True).start()
+    print("-" * 100)
+    print(f" SITL plane -> USB ({args.board}) -> your board -> mobile network -> your relay -> MavLTE")
+    print(" The board must run a bench build that listens for the flight controller on its USB pins")
+    print(" (README, \"SITL through the real board\"). Open the MavLTE app, switch UDP or TCP on, then")
+    print(" connect Mission Planner to MavLTE as usual. The telemetry uses your SIM's mobile data.")
+    print(f" The plane's USB port (SITL SERIAL0) is TCP 127.0.0.1 port {USB_PORT}. Stop with Ctrl+C.")
+    print("-" * 100, flush=True)
+    await report_board(counts, 10.0)
+
+
 async def run(args, keys) -> None:
     vehicle_key, gcs_key = keys
     tasks = []
@@ -250,7 +334,31 @@ def main(argv=None) -> None:
     p.add_argument("--udp", default="127.0.0.1:14550", help="where the GCS agent sends MAVLink (default 127.0.0.1:14550)")
     p.add_argument("--tcp", default="127.0.0.1:5760", help="TCP port of the GCS agent (default 127.0.0.1:5760)")
     p.add_argument("--batch-ms", type=float, default=50.0, help="telemetry batching, like the firmware (default 50)")
+    p.add_argument("--board", help="the real board's USB serial port (e.g. COM9): SITL becomes its flight "
+                                   "controller; the board, your relay and the MavLTE app do the rest")
+    p.add_argument("--board-baud", type=int, default=115200, help="the board's flight controller baud rate (115200)")
     args = p.parse_args(argv)
+
+    if args.board:  # no relay, vehicle or agent here: the board and MavLTE are the real ones
+        handler = logging.StreamHandler()
+        handler.setFormatter(RoleFormatter("%(asctime)s %(role)-8s %(message)s", datefmt="%H:%M:%S"))
+        logging.basicConfig(level=logging.INFO, handlers=[handler])
+        sitl = None if args.no_sitl else start_sitl(args)
+        try:
+            mr.run_async(run_board(args))
+        except KeyboardInterrupt:
+            pass
+        except OSError as exc:  # the COM port: wrong, or held by another program
+            log.error("%s (is the port right, and free: no serial monitor or MavLTE's flashing open on it?)", exc)
+        finally:
+            if sitl is not None and sitl.poll() is None:
+                sitl.terminate()
+                try:
+                    sitl.wait(5)
+                except subprocess.TimeoutExpired:
+                    sitl.kill()
+            log.info("stopped")
+        return
 
     if args.server and not args.vehicle_key:  # the key of the bench-test vehicle in mavrelay.ini
         conf = mr.load_config(args.config, "vehicle") if Path(args.config).exists() else {}

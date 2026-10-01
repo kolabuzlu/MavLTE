@@ -390,6 +390,23 @@ python sitl_demo.py --server your-server:14650 --no-agent
 It takes the vehicle key from the `[vehicle]` section of `mavrelay.ini` (`key = <vehicle key>`)
 or from `--vehicle-key`. Give the MavLTE app the server and the GCS key.
 
+**SITL through the real board**, before a flight controller is wired: SITL plays the flight
+controller of the real board, over its USB-C cable, and everything after it is real (the mobile
+network, your relay, the MavLTE app). It needs a bench build of the firmware that listens for
+the flight controller on the USB-serial pins: in menuconfig set the flight controller pins to
+**TX 43, RX 44**, then build and flash. The board's log stops on the USB port as soon as the
+firmware starts (those pins now carry MAVLink), and flashing works as always. Then, with the
+plane simulator closed (it uses the same SITL ports):
+
+```bash
+python sitl_demo.py --board COM9
+```
+
+with the board's COM port. Open the MavLTE app, switch UDP or TCP on and connect Mission Planner
+to it: the module reports "flight controller talking", and you fly the SITL plane through the
+board. **A bench build must not fly:** set the pins back to `-1` and flash again before you wire
+the real flight controller.
+
 **MavLTE Plane Simulator.** The same, as a window with the plane's power switches, both off at
 the start: double-click `PlaneSim.pyw` (or run `python plane_sim.py`). It uses the `[vehicle]`
 section of `mavrelay.ini`.
