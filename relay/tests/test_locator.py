@@ -54,6 +54,17 @@ class PositionTest(unittest.TestCase):
         self.assertEqual(mr.Position(flags=mr.POS_NO_GNSS).describe(), "no GNSS")
         self.assertEqual(mr.Position().fc_silent, mr.U16_UNKNOWN)  # not heard since the module started
 
+    def test_power(self):
+        """On V2 boards the gauge reads the supply rail: above what a Li-ion cell holds, that is external power."""
+        rail = mr.Position(battery_mv=4298, battery_pct=100)  # the first board on USB, no cell in it
+        self.assertEqual((rail.on_external_power, rail.power_text()), (True, "external power"))
+        cell = mr.Position(battery_mv=3950, battery_pct=78)
+        self.assertEqual((cell.on_external_power, cell.power_text()), (False, "battery 78%"))
+        self.assertTrue(mr.Position(battery_mv=mr.EXTERNAL_POWER_MV).on_external_power)
+        self.assertFalse(mr.Position(battery_mv=mr.EXTERNAL_POWER_MV - 1, battery_pct=100).on_external_power)
+        self.assertEqual(mr.Position(battery_pct=55).power_text(), "battery 55%")  # millivolts unknown
+        self.assertEqual(mr.Position().power_text(), "")  # no gauge
+
     def test_ages(self):
         self.assertEqual([mr.fmt_age(s) for s in (-3, 5, 60, 150, 3600, 3700, 86399, 86400, 3 * 86400)],
                          ["0 s", "5 s", "1 min", "2 min", "1 h", "1 h 1 min", "23 h 59 min", "1 day", "3 days"])
@@ -148,6 +159,21 @@ class RelayLocatorTest(unittest.TestCase):
             f.write("{not json")
         self.assertIsNone(self.new_relay().locator.last_fix)  # a broken file is not fatal
 
+    def test_power_changes(self):
+        """The flight battery goes (a crash, or unplugged): the module runs on its cell, and says so."""
+        plane = self.connect(mr.ROLE_VEHICLE, self.PLANE)
+        report = lambda mv, pct: self.packet(mr.ROLE_VEHICLE, plane, self.PLANE, mr.POSITION,  # noqa: E731
+                                             fix(battery_mv=mv, battery_pct=pct).pack())
+        with self.assertLogs("mavrelay.relay", "INFO") as logs:
+            report(4298, 100)  # the first report: nothing changes
+            report(4298, 100)
+            report(4105, 97)
+            report(4100, 97)
+            report(4298, 100)
+        power = [line for line in logs.output if "LTE module" in line]
+        self.assertEqual(power, ["WARNING:mavrelay.relay:the aircraft's LTE module runs on its own cell now (battery 97%)",
+                                 "INFO:mavrelay.relay:the aircraft's LTE module has external power again"])
+
     def test_saved_before_1_4_0(self):
         saved = dict(fix(time=1790000000)._asdict(), latitude=41.1234567, longitude=28.9876543)
         del saved["temp"]
@@ -208,6 +234,15 @@ class LiveLocatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(hot), 2)
         self.assertIn("WARNING:mavrelay.gcs:the aircraft's LTE module is hot: its chip is at 85 °C", hot[0])
         self.assertIn("cooled down to 65 °C", hot[1])
+
+        with self.assertLogs("mavrelay.gcs", "INFO") as logs:  # (so far on its cell:) the BEC, then a crash
+            for mv, pct in ((4298, 100), (4298, 100), (4120, 98)):
+                vehicle.send_packet(mr.POSITION, fix(battery_mv=mv, battery_pct=pct, gnss_time=int(time.time()) + mv
+                                                     + pct).pack())
+                await self.until(lambda: agent.position.battery_mv == mv)
+        power = [line for line in logs.output if "LTE module" in line]
+        self.assertEqual(power, ["INFO:mavrelay.gcs:the aircraft's LTE module has external power again",
+                                 "WARNING:mavrelay.gcs:the aircraft's LTE module runs on its own cell now (battery 98%)"])
 
         # an agent that connects later hears the last known one at once, even with the aircraft gone
         vehicle_task = self.tasks[0]

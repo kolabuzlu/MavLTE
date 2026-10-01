@@ -1377,8 +1377,9 @@ class App:
                 module, color = f"flight controller silent for {mr.fmt_age(pos.fc_silent)}", RED
             else:
                 module = "flight controller talking"
-            if pos.battery_pct != mr.BATTERY_UNKNOWN:
-                module += f" · battery {pos.battery_pct}%"
+            power = pos.power_text()  # external power (USB, the BEC), or the module's cell and its charge
+            if power:
+                module += f" · {power}"
             if pos.temp != mr.TEMP_UNKNOWN:
                 temp = f" · {pos.temp} °C"
                 temp_color = RED if pos.temp >= mr.TEMP_HOT else AMBER if pos.temp >= mr.TEMP_WARM else TEXT

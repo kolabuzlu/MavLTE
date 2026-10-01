@@ -168,7 +168,9 @@ the module has power.
   `0xFFFF`). `flags` bit 0: the flight controller has sent nothing for 10 s or more; bit 1: the
   module cannot read its GNSS. `fc_silent_s` is the time since the flight controller last sent
   anything (`0xFFFF`: nothing since the module started). The module's battery: millivolts and
-  percent (`0xFFFF`, `0xFF` unknown). `time` is 0. `chip_c` is the temperature of the module's
+  percent (`0xFFFF`, `0xFF` unknown), as its fuel gauge reads them. On V2 boards the gauge sits on
+  the board's supply rail: 4250 mV or more (more than a Li-ion cell holds) means external power
+  (USB or the 5V pin), and the percent then says nothing about the cell. `time` is 0. `chip_c` is the temperature of the module's
   ESP32-S3, from its own sensor, in °C (`-128` unknown). It reads warmer than the air around
   the board; MavLTE shows it in amber from 70 °C and in red from 80 °C.
 - Before version 1.4.0 the body ended after `time` (34 bytes). Each side reads the fields it

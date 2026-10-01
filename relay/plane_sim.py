@@ -120,6 +120,8 @@ GNSS_TTFF = 25.0
 GNSS_TTFF_QUICK = 3.0
 GNSS_ERROR_M = 2.0
 LOCATOR_INTERVAL = 5.0  # seconds between the module's position reports, as the firmware sends them
+# what a V2 board's fuel gauge reads while the flight battery (the BEC) powers it: its supply rail, not the cell
+RAIL_MV = 4298
 VOICE_SOUND = "the two-tone alarm"  # what the board's locator voice plays (the firmware's default)
 # The 18650 cell in the board's holder keeps the module on without the flight battery: a 3000 mAh cell at
 # about 150 mA (ESP32, the modem idling between reports, GNSS) lasts some 20 hours.
@@ -752,13 +754,16 @@ class Plane:
                     log.warning("LTE module: lost the relay session")
 
     def _position(self, m: Modem, now: float) -> mr.Position:
-        """The module's position report: its GNSS, how long the flight controller has been silent, its
-        cell, if it has one, and its chip's temperature."""
+        """The module's position report: its GNSS, how long the flight controller has been silent, its power
+        as the board's fuel gauge reads it (the supply rail while the flight battery powers it, else its
+        cell), and its chip's temperature."""
         heard = self.fc.last_rx
         silent = mr.U16_UNKNOWN if not heard else min(mr.U16_UNKNOWN - 1, int(now - heard))
         flags = mr.POS_FC_SILENT if heard and silent >= mr.FC_SILENT_S else 0
         pos = m.gnss.read(now, self.truth, moving=not flags)
-        if self.cell:
+        if self.battery:
+            pos = pos._replace(battery_pct=100, battery_mv=RAIL_MV)
+        elif self.cell:
             pct = int(round(self.cell_pct))
             pos = pos._replace(battery_pct=pct, battery_mv=3300 + 9 * pct)
         self._chip_update()

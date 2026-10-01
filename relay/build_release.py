@@ -82,6 +82,7 @@ def main() -> None:
     zip_path = HERE / "dist" / f"MavLTE-{app_version()}-windows.zip"
     print(f"Zipping -> {zip_path.name} ...")
     archive(payload, zip_path)
+    shutil.rmtree("build", ignore_errors=True)  # PyInstaller's work folder: about 100 MB, of no use now
 
     print("\nDone.")
     print(f"  Executable: {payload / 'MavLTE.exe'}  ({(payload / 'MavLTE.exe').stat().st_size / 1e6:.0f} MB)")

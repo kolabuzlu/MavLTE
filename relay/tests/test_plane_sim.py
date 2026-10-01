@@ -295,6 +295,7 @@ class PlaneTest(unittest.TestCase):
         self.assertLess(abs(pos.lat - 411234567) + abs(pos.lon - 289876543), 2000)  # within a few metres
         self.assertFalse(pos.fc_is_silent)
         self.assertEqual(pos.battery_pct, 100)
+        self.assertTrue(pos.on_external_power)  # the flight battery powers the board: its gauge reads the rail
         self.assertTrue(plane_sim.AIR_C <= pos.temp <= plane_sim.AIR_C + plane_sim.SELF_HEAT_C)  # its chip
 
         p.call(p.set_battery, False)
@@ -304,6 +305,7 @@ class PlaneTest(unittest.TestCase):
         self.assertTrue(last.has_fix)
         self.assertLess(abs(last.lat - 411234567) + abs(last.lon - 289876543), 2000)  # where it came down
         self.assertEqual(last.speed, 0)
+        self.assertFalse(last.on_external_power)  # on its cell, which the gauge reads now
         self.assertIsNotNone(p.modem)  # on its cell
 
         p.call(p.set_cell, False)  # the cell out as well: now it is gone

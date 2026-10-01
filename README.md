@@ -216,8 +216,12 @@ flight controller. Either:
   battery fails. Both together work as well; the BEC then charges the cell. With both, the
   **locator** keeps working after a crash that disconnects or destroys the flight battery: the
   module reports its position on the cell for many hours, and the cell's charge from the board's
-  fuel gauge. On V2 boards the gauge shares the camera's bus, whose pull-up resistors take their
-  power from the camera: with DIP switch CAM off, the charge may not be known.
+  fuel gauge. Running on USB and the cell at once does the board no harm: it runs from USB and
+  charges the cell on the side (up to 2 A, to 4.2 V, then it stops), and when USB goes the cell
+  takes over without a break. On V2 boards the gauge measures the board's supply rail, not the
+  cell: while USB or the BEC powers the board, the rail is about 4.3 V, which MavLTE shows as
+  *external power*; on the cell alone, it is the cell. The gauge shares the camera's bus, whose
+  pull-up resistors take their power from the camera: with DIP switch CAM off, it does not answer.
 
 The bursts are strongest on 2G (GSM/EDGE), and the board has less buffer capacitance on the
 modem's supply than SIMCom asks for: keep the supply wires short and thick, and where LTE
@@ -330,8 +334,10 @@ server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
   last known position and how long ago that was (in amber): the relay keeps it, so the app shows
   it even when it was closed at the time. **Module** says whether the flight controller still
   talks to the module, in red when it has gone silent (a crash, say) while the module still
-  reports, the module's battery when it has a cell, and the temperature of its ESP32-S3 chip:
-  in amber from 70 °C, in red from 80 °C (see *Heat* in section 3).
+  reports, its power: *external power* (USB or the BEC) or, on its own cell, the cell's charge
+  (after a crash that took the flight battery: the log says when it changes), and the
+  temperature of its ESP32-S3 chip: in amber from 70 °C, in red from 80 °C (see *Heat* in
+  section 3).
 - **Voice**, the locator voice, in the *Aircraft* panel: switched on, the speaker on the
   aircraft's board sounds a two-tone alarm (beeps of 2.4 and 3 kHz in turn) until you switch it
   off, to find the aircraft in the last metres once *Position* has brought you close. The relay

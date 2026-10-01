@@ -34,7 +34,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -635,6 +635,9 @@ POS_FC_SILENT = 0x01  # nothing from the flight controller for FC_SILENT_S or mo
 POS_NO_GNSS = 0x02  # the module cannot read its GNSS (fix fields unknown)
 FC_SILENT_S = 10
 BATTERY_UNKNOWN = 0xFF
+# On V2 boards the fuel gauge sits on the board's supply rail, not on the cell: while USB or the 5V pin (the
+# BEC) powers the board it reads the converter feeding that rail (about 4.3 V), more than a Li-ion cell holds
+EXTERNAL_POWER_MV = 4250
 TEMP_UNKNOWN = -128
 # The ESP32-S3's own sensor reads warmer than the air around the board. V2 boards' ESP32-S3R8 is rated
 # for 65 degrees C of air around it (V1's ESP32-S3R2: 85); its datasheet ties that to the chip's octal
@@ -681,6 +684,17 @@ class Position(NamedTuple):
     @property
     def fc_is_silent(self) -> bool:
         return bool(self.flags & POS_FC_SILENT)
+
+    @property
+    def on_external_power(self) -> bool:
+        """USB or the BEC powers the module (its percent then says nothing about the cell)."""
+        return self.battery_mv != U16_UNKNOWN and self.battery_mv >= EXTERNAL_POWER_MV
+
+    def power_text(self) -> str:
+        """'external power', 'battery 85%' (the module runs on its cell), or '' if it does not say."""
+        if self.on_external_power:
+            return "external power"
+        return f"battery {self.battery_pct}%" if self.battery_pct != BATTERY_UNKNOWN else ""
 
     def describe(self) -> str:
         """For the log: where, or why not."""
@@ -974,6 +988,7 @@ class LocatorStore:
         self.last_fix: Optional[Position] = None
         self.saved_at = -1e9
         self.fc_silent = False
+        self.on_cell: Optional[bool] = None  # the module runs on its own cell (False: on external power)
         if path:
             try:
                 with open(path, encoding="utf-8") as f:
@@ -999,6 +1014,14 @@ class LocatorStore:
                              pos.fc_silent)
             elif pos.fc_silent != U16_UNKNOWN:  # (unknown: not heard since the module started)
                 slog.info("the aircraft's flight controller talks again")
+        if pos.battery_mv != U16_UNKNOWN:
+            on_cell = not pos.on_external_power
+            if self.on_cell is not None and on_cell != self.on_cell:
+                if on_cell:
+                    slog.warning("the aircraft's LTE module runs on its own cell now (%s)", pos.power_text())
+                else:
+                    slog.info("the aircraft's LTE module has external power again")
+            self.on_cell = on_cell
         self.last = pos
         if pos.has_fix:
             self.last_fix = pos
@@ -2176,6 +2199,7 @@ class GcsAgent:
         self.position: Optional[Position] = None  # the newest: live, or the last known one from the relay
         self.last_fix: Optional[Position] = None
         self.module_hot = False  # its chip reached TEMP_HOT, and has not cooled below TEMP_WARM since
+        self.module_on_cell: Optional[bool] = None  # it runs on its own cell (False: on external power)
         self.client.on_packet = self._on_packet
         # the locator voice: the switch asked for, sent again until the relay's STATUS shows it
         self.voice_request: Optional[bool] = None
@@ -2256,6 +2280,14 @@ class GcsAgent:
             elif pos.temp < TEMP_WARM and self.module_hot:
                 self.module_hot = False
                 glog.info("the aircraft's LTE module has cooled down to %d °C", pos.temp)
+        if pos.battery_mv != U16_UNKNOWN and (not pos.time or age < self.POSITION_LIVE):
+            on_cell = not pos.on_external_power  # the flight battery (BEC) gone: a crash, or unplugged
+            if self.module_on_cell is not None and on_cell != self.module_on_cell:
+                if on_cell:
+                    glog.warning("the aircraft's LTE module runs on its own cell now (%s)", pos.power_text())
+                else:
+                    glog.info("the aircraft's LTE module has external power again")
+            self.module_on_cell = on_cell
 
     def position_text(self) -> str:
         """The aircraft's last known position for the log, or ''."""

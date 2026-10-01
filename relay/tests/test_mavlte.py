@@ -379,6 +379,20 @@ class GuiTest(unittest.TestCase):
         report(mr.TEMP_UNKNOWN)  # an aircraft from before 1.4.0
         self.pump(lambda: self.text(chip) == "", what="no temperature")
 
+    def test_module_power(self):
+        app = self.app
+        module = app.craft_values["Module"]
+
+        def report(mv, pct):
+            pos = mr.Position(gnss_time=int(time.time()), sats=3, fc_silent=0, battery_mv=mv, battery_pct=pct, temp=30)
+            self.loop.call_soon_threadsafe(self.vehicle.send_packet, mr.POSITION, pos.pack())
+
+        self.pump(lambda: app.camera.enabled, what="aircraft online")
+        report(4298, 100)  # USB or the BEC: the gauge reads the board's supply rail
+        self.pump(lambda: self.text(module) == "flight controller talking · external power", what="external power")
+        report(4012, 88)  # on its own cell
+        self.pump(lambda: self.text(module) == "flight controller talking · battery 88%", what="on the cell")
+
     def test_locator_voice(self):
         app = self.app
         row = app.voice
