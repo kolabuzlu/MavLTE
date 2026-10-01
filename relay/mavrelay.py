@@ -34,7 +34,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -964,7 +964,7 @@ class LocatorStore:
             if self.fc_silent:
                 slog.warning("the aircraft's flight controller is silent (%s s); its LTE module still reports",
                              pos.fc_silent)
-            else:
+            elif pos.fc_silent != U16_UNKNOWN:  # (unknown: not heard since the module started)
                 slog.info("the aircraft's flight controller talks again")
         self.last = pos
         if pos.has_fix:

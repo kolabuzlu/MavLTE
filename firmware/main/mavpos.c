@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#define CRC_EXTRA_HEARTBEAT 50
+#define HEARTBEAT_LEN 9
 #define CRC_EXTRA_GLOBAL_POSITION_INT 104
 #define GLOBAL_POSITION_INT_LEN 28
 #define MAV_IFLAG_SIGNED 0x01
@@ -48,12 +50,23 @@ static void frame_done(mav_position_t *p, const uint8_t *f, size_t n, uint32_t n
         msgid = f[5];
         compid = f[4];
     }
-    if (msgid != MAV_MSG_GLOBAL_POSITION_INT || compid != 1 || plen > GLOBAL_POSITION_INT_LEN) {
+    uint8_t extra;
+    if (compid != 1) {
+        return;
+    } else if (msgid == MAV_MSG_GLOBAL_POSITION_INT && plen <= GLOBAL_POSITION_INT_LEN) {
+        extra = CRC_EXTRA_GLOBAL_POSITION_INT;
+    } else if (msgid == MAV_MSG_HEARTBEAT && plen <= HEARTBEAT_LEN) {
+        extra = CRC_EXTRA_HEARTBEAT;
+    } else {
         return;
     }
-    uint8_t extra = CRC_EXTRA_GLOBAL_POSITION_INT;
     uint16_t crc = mav_crc(mav_crc(0xFFFF, f + 1, head - 1 + plen), &extra, 1);
     if (crc != ((uint16_t)f[head + plen] | (uint16_t)f[head + plen + 1] << 8)) {
+        return;
+    }
+    if (msgid == MAV_MSG_HEARTBEAT) {
+        p->heartbeat = true;
+        p->heartbeat_ms = now_ms;
         return;
     }
     uint8_t m[GLOBAL_POSITION_INT_LEN] = {0}; /* MAVLink 2 leaves out trailing zeros */

@@ -56,13 +56,11 @@ static struct sockaddr_in server;
 static const uint8_t *downlink; /* set by the tunnel's data callback while tun_input runs */
 static size_t downlink_len;
 static snap_outbox_t snap;       /* snapshots: photos from the camera on request (guarded by lock) */
-static mav_position_t position;  /* where the flight controller says the aircraft is (guarded by lock) */
+static mav_position_t position;  /* where the flight controller says the aircraft is, and its last HEARTBEAT (guarded by lock) */
 /* the locator (guarded by lock): the modem's GNSS, and when the flight controller was last heard */
 static gnss_fix_t gnss;
 static uint32_t gnss_ms;       /* when gnss was read */
 static int gnss_state;         /* 0: not read yet, 1: readable, -1: cannot be read (no CMUX) */
-static uint32_t fc_heard_ms;   /* last byte from the flight controller */
-static bool fc_heard;          /* since boot */
 static uint16_t battery_mv = LOCATOR_U16_UNKNOWN; /* the board's cell, from its fuel gauge */
 static uint8_t battery_pct = LOCATOR_BATTERY_UNKNOWN;
 #if CONFIG_BRIDGE_CAMERA
@@ -223,8 +221,6 @@ static void uart_task(void *arg)
         xSemaphoreTake(lock, portMAX_DELAY);
         if (n > 0) {
             stats.fc_rx_bytes += (uint32_t)n;
-            fc_heard_ms = now;
-            fc_heard = true;
             mav_batcher_feed(&batcher, buf, (size_t)n, now, batch_emit, NULL);
             mav_position_feed(&position, buf, (size_t)n, now); /* for the notes on a photo */
         }
@@ -317,8 +313,8 @@ static void send_position(uint32_t now)
         fix = &none;
     }
     uint16_t silent = LOCATOR_U16_UNKNOWN;
-    if (fc_heard) {
-        uint32_t s = (uint32_t)(now - fc_heard_ms) / 1000;
+    if (position.heartbeat) { /* the flight controller's last HEARTBEAT, not any byte: noise is not one */
+        uint32_t s = (uint32_t)(now - position.heartbeat_ms) / 1000;
         silent = s < LOCATOR_U16_UNKNOWN ? (uint16_t)s : LOCATOR_U16_UNKNOWN - 1;
         if (silent >= LOCATOR_FC_SILENT_S) {
             flags |= LOCATOR_FC_SILENT;

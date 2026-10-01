@@ -873,6 +873,26 @@ static void test_position(void)
     }
     CHECK(pos.valid && pos.when_ms == 1234);
     CHECK(pos.lat == 411234567 && pos.lon == 289876543 && pos.alt_mm == 120000 && pos.heading == 4500);
+    CHECK(pos.heartbeat && pos.heartbeat_ms == 1234); /* the HEARTBEAT: a flight controller talks */
+
+    /* noise on an unconnected RX pin is no flight controller, nor is a damaged HEARTBEAT, nor another
+     * component's */
+    mav_position_t quiet;
+    mav_position_init(&quiet);
+    mav_position_feed(&quiet, (const uint8_t *)"\x00\x13junk\xff", 7, 100);
+    uint8_t bad[32];
+    memcpy(bad, hb, n);
+    bad[12] ^= 0x01;
+    mav_position_feed(&quiet, bad, n, 200);
+    memcpy(bad, hb, n);
+    bad[6] = 2; /* component 2 (a camera, say), its CRC right */
+    uint16_t crc2 = mav_crc(mav_crc(0xFFFF, bad + 1, 18), &extra, 1);
+    bad[n - 2] = (uint8_t)crc2;
+    bad[n - 1] = (uint8_t)(crc2 >> 8);
+    mav_position_feed(&quiet, bad, n, 300);
+    CHECK(!quiet.heartbeat);
+    mav_position_feed(&quiet, hb, n, 400); /* and then the autopilot's own */
+    CHECK(quiet.heartbeat && quiet.heartbeat_ms == 400);
 
     fl = position_frame(frame, 1, -335000000, -704000000, -2000, 0); /* southern and western, below home */
     mav_position_feed(&pos, frame, fl, 2000);

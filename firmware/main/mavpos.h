@@ -1,6 +1,7 @@
-/* Where the aircraft is, read from the flight controller's MAVLink stream: GLOBAL_POSITION_INT of the
- * autopilot (component 1), for the notes on each photo. Checks the frame's CRC, for which it needs
- * this one message's CRC_EXTRA and nothing else. Platform independent. */
+/* What the flight controller's MAVLink stream says about it: GLOBAL_POSITION_INT of the autopilot
+ * (component 1), for the notes on each photo, and its HEARTBEAT, the proof that a flight controller
+ * talks (a byte of noise on an unconnected pin is not). Checks each frame's CRC, for which it needs
+ * these two messages' CRC_EXTRA and nothing else. Platform independent. */
 #pragma once
 
 #include <stdbool.h>
@@ -9,6 +10,7 @@
 
 #include "mavframe.h"
 
+#define MAV_MSG_HEARTBEAT 0
 #define MAV_MSG_GLOBAL_POSITION_INT 33
 
 typedef struct {
@@ -20,6 +22,8 @@ typedef struct {
     int32_t lat, lon; /* 1e-7 degrees */
     int32_t alt_mm;   /* relative_alt: above home */
     uint16_t heading; /* centidegrees, 0xFFFF if unknown */
+    bool heartbeat;          /* the autopilot's HEARTBEAT has come */
+    uint32_t heartbeat_ms;   /* when the last one came */
 } mav_position_t;
 
 void mav_position_init(mav_position_t *p);
