@@ -6,12 +6,15 @@
 #include <string.h>
 
 #include "alarm.h"
+#include "fileout.h"
 #include "locator.h"
+#include "logrow.h"
 #include "mavframe.h"
 #include "mavpos.h"
 #include "sha256.h"
 #include "snapshot.h"
 #include "tunnel.h"
+#include "usbproto.h"
 
 static int failures;
 static int checks;
@@ -1048,6 +1051,580 @@ static void test_alarm(void)
     CHECK(piece[1] == wav[44 + 2 * 41] && piece[2] == wav[45 + 2 * 41] && piece[0] == wav[43 + 2 * 41]);
 }
 
+/* ------------------------------------------------------------------ the flight controller's telemetry (the log) */
+
+static uint16_t get16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | p[1] << 8);
+}
+
+static void put16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static void put32(uint8_t *p, uint32_t v)
+{
+    for (int i = 0; i < 4; i++) {
+        p[i] = (uint8_t)(v >> (8 * i));
+    }
+}
+
+static void putf(uint8_t *p, float v)
+{
+    uint32_t u;
+    memcpy(&u, &v, 4);
+    put32(p, u);
+}
+
+/* A MAVLink 2 frame from the autopilot (system 1, component 1), its trailing zeros left out, with its CRC. */
+static size_t telemetry_frame(uint8_t *f, uint32_t msgid, uint8_t extra, const uint8_t *payload, size_t plen)
+{
+    while (plen > 1 && payload[plen - 1] == 0) {
+        plen--;
+    }
+    uint8_t head[10] = {0xFD, (uint8_t)plen, 0, 0, 7, 1, 1, (uint8_t)msgid, (uint8_t)(msgid >> 8), (uint8_t)(msgid >> 16)};
+    memcpy(f, head, 10);
+    memcpy(f + 10, payload, plen);
+    uint16_t crc = mav_crc(mav_crc(0xFFFF, f + 1, 9 + plen), &extra, 1);
+    f[10 + plen] = (uint8_t)crc;
+    f[11 + plen] = (uint8_t)(crc >> 8);
+    return 12 + plen;
+}
+
+/* An ArduPlane in FBWA, armed, on its battery, with its GPS, flying (all at now_ms). */
+static void fly(mav_position_t *p, uint32_t now_ms)
+{
+    uint8_t f[80], m[52];
+    memset(m, 0, sizeof(m));
+    put32(m, 5); /* FBWA */
+    m[4] = 1;    /* MAV_TYPE_FIXED_WING */
+    m[5] = 3;    /* MAV_AUTOPILOT_ARDUPILOTMEGA */
+    m[6] = MAV_ARMED | 0x01;
+    m[7] = 4;
+    m[8] = 3;
+    mav_position_feed(p, f, telemetry_frame(f, MAV_MSG_HEARTBEAT, 50, m, 9), now_ms);
+    memset(m, 0, sizeof(m));
+    put16(m + 14, 12345); /* 12.345 V */
+    put16(m + 16, 2345);  /* 23.45 A */
+    m[30] = 67;
+    mav_position_feed(p, f, telemetry_frame(f, MAV_MSG_SYS_STATUS, 124, m, 31), now_ms);
+    memset(m, 0, sizeof(m));
+    m[28] = 3;
+    m[29] = 14;
+    mav_position_feed(p, f, telemetry_frame(f, MAV_MSG_GPS_RAW_INT, 24, m, 30), now_ms);
+    memset(m, 0, sizeof(m));
+    putf(m, 18.5f);
+    putf(m + 4, 21.25f);
+    putf(m + 8, 150.0f);
+    putf(m + 12, 1.5f);
+    put16(m + 16, 90);
+    put16(m + 18, 55);
+    mav_position_feed(p, f, telemetry_frame(f, MAV_MSG_VFR_HUD, 20, m, 20), now_ms);
+    memset(m, 0, sizeof(m));
+    m[40] = 16;
+    m[41] = 200;
+    mav_position_feed(p, f, telemetry_frame(f, MAV_MSG_RC_CHANNELS, 118, m, 42), now_ms);
+    memset(m, 0, sizeof(m));
+    put32(m + 4, 411234567);
+    put32(m + 8, 289876543);
+    put32(m + 12, 250000);
+    put32(m + 16, 120000);
+    put16(m + 26, 4500);
+    mav_position_feed(p, f, telemetry_frame(f, MAV_MSG_GLOBAL_POSITION_INT, 104, m, 28), now_ms);
+}
+
+static void test_telemetry(void)
+{
+    mav_position_t p;
+    mav_position_init(&p);
+    CHECK(p.battery_mv == 0xFFFF && p.battery_ca == -1 && p.battery_pct == -1 && p.gps_sats == 255 && p.rc_rssi == 255);
+    fly(&p, 1000);
+    CHECK(p.heartbeat && p.heartbeat_ms == 1000 && p.custom_mode == 5 && (p.base_mode & MAV_ARMED));
+    CHECK(mav_is_ardupilot_plane(&p) && strcmp(mav_plane_mode(p.custom_mode), "FBWA") == 0);
+    CHECK(strcmp(mav_plane_mode(10), "AUTO") == 0 && strcmp(mav_plane_mode(21), "QRTL") == 0);
+    CHECK(mav_plane_mode(9) == NULL && mav_plane_mode(99) == NULL);
+    CHECK(p.sys && p.battery_mv == 12345 && p.battery_ca == 2345 && p.battery_pct == 67);
+    CHECK(p.gps && p.gps_fix == 3 && p.gps_sats == 14);
+    CHECK(p.hud && p.airspeed == 18.5f && p.groundspeed == 21.25f && p.climb == 1.5f && p.throttle == 55);
+    CHECK(p.rc && p.rc_rssi == 200);
+    CHECK(p.valid && p.lat == 411234567 && p.alt_msl_mm == 250000 && p.alt_mm == 120000 && p.heading == 4500);
+
+    /* a damaged SYS_STATUS changes nothing, nor does one with another message's CRC_EXTRA */
+    uint8_t f[80], m[52];
+    memset(m, 0, sizeof(m));
+    put16(m + 14, 9999);
+    size_t n = telemetry_frame(f, MAV_MSG_SYS_STATUS, 124, m, 31);
+    f[25] ^= 1;
+    mav_position_feed(&p, f, n, 2000);
+    mav_position_feed(&p, f, telemetry_frame(f, MAV_MSG_SYS_STATUS, 125, m, 31), 2000);
+    CHECK(p.battery_mv == 12345 && p.sys_ms == 1000);
+    /* a copter's HEARTBEAT: its modes have other numbers */
+    memset(m, 0, sizeof(m));
+    put32(m, 5);
+    m[4] = 2;
+    m[5] = 3;
+    mav_position_feed(&p, f, telemetry_frame(f, MAV_MSG_HEARTBEAT, 50, m, 9), 3000);
+    CHECK(!mav_is_ardupilot_plane(&p) && p.custom_mode == 5);
+}
+
+/* ------------------------------------------------------------------ the log's line */
+
+static int columns(const char *line)
+{
+    int c = 1;
+    for (; *line; line++) {
+        c += *line == ',';
+    }
+    return c;
+}
+
+static void join(char *out, const char *const *fields, int n)
+{
+    out[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        if (i) {
+            strcat(out, ",");
+        }
+        strcat(out, fields[i]);
+    }
+    strcat(out, "\n");
+}
+
+static void test_log_line(void)
+{
+    char t[24];
+    log_time_text(t, 1790933712u);
+    CHECK(strcmp(t, "2026-10-02T09:35:12Z") == 0);
+    log_time_text(t, 951782400u);
+    CHECK(strcmp(t, "2000-02-29T00:00:00Z") == 0);
+
+    cell_info_t c;
+    /* the A7670E's answer on the bench (modem firmware A7670M7_V1.11.1) */
+    CHECK(cell_parse("\r\n+CPSI: LTE,Online,286-01,0x172B,387360,449,EUTRAN-BAND3,1651,5,0,22,64,64,10\r\n\r\nOK\r\n", &c));
+    CHECK(strcmp(c.mode, "LTE") == 0 && strcmp(c.plmn, "286-01") == 0 && strcmp(c.band, "B3") == 0);
+    CHECK(c.cell == 387360 && c.rsrp_dbm == -76 && c.rsrq_half_db == -18 && c.rssi_dbm == -46 && c.sinr_db == 10);
+    /* the AT manual's example: 255 is unknown */
+    CHECK(cell_parse("+CPSI: LTE,Online,460-01,0x230A,175499523,318,EUTRAN-BAND3,1650,5,0,21,67,255,19", &c));
+    CHECK(c.rsrp_dbm == -73 && c.rsrq_half_db == -19 && c.rssi_dbm == LOG_I16_UNKNOWN && c.sinr_db == 19);
+    CHECK(cell_parse("+CPSI: GSM,Online,286-01,0x2B5C,12401,27,-64,2110,42-42", &c));
+    CHECK(strcmp(c.mode, "GSM") == 0 && strcmp(c.band, "GSM900") == 0 && c.cell == 12401);
+    CHECK(c.rsrp_dbm == LOG_I16_UNKNOWN && c.rssi_dbm == LOG_I16_UNKNOWN);
+    CHECK(cell_parse("+CPSI: GSM,Online,286-02,0x2B5C,12401,700,-64,2110,42-42", &c) && strcmp(c.band, "DCS1800") == 0);
+    CHECK(cell_parse("+CPSI: NO SERVICE,Online", &c));
+    CHECK(strcmp(c.mode, "NO SERVICE") == 0 && c.cell == 0 && c.band[0] == '\0');
+    CHECK(!cell_parse("\r\nERROR\r\n", &c));
+
+    /* all of it known */
+    static log_row_t r;
+    static char line[LOG_LINE_MAX], expect[LOG_LINE_MAX];
+    memset(&r, 0, sizeof(r));
+    r.utc = 1790933712u;
+    r.uptime_s = 754;
+    r.gnss_state = 1;
+    r.gnss = (gnss_fix_t){1790933710u, 411234567, 289876543, 150000, 1234, 27350, 90, 11, GNSS_FIX_3D};
+    r.gnss_age_s = 2;
+    r.signal_dbm = -71;
+    strcpy(r.operator_name, "Turk,cell");
+    cell_parse("+CPSI: LTE,Online,286-01,0x172B,387360,449,EUTRAN-BAND3,1651,5,0,22,64,64,10", &r.cell);
+    r.relay = true;
+    r.rtt_ms = 54;
+    r.loss_permille = 12;
+    r.data_kb = 1234;
+    r.gcs = true;
+    mav_position_init(&r.fc);
+    fly(&r.fc, 100000);
+    r.now_ms = 101500;
+    r.chip_c = 41;
+    r.rail_mv = 3950;
+    r.cell_pct = 78;
+    r.voice = 2;
+    r.events = "relay connected, photo 1790933700 sent\n";
+    const char *full[] = {
+        "2026-10-02T09:35:12Z", "754",
+        "3", "11", "41.1234567", "28.9876543", "150.0", "12.3", "273.5", "0.90", "2",
+        "LTE", "-71", "Turk;cell", "286-01", "B3", "387360", "-76", "-9.0", "-46", "10",
+        "1", "54", "1.2", "1234", "1",
+        "1", "FBWA", "1", "3", "14", "41.1234567", "28.9876543", "250.0", "120.0", "45.0",
+        "21.3", "18.5", "1.5", "55", "12.345", "23.4", "67", "200",
+        "41", "cell", "78", "3950", "sounding", "relay connected; photo 1790933700 sent ",
+    };
+    CHECK(sizeof(full) / sizeof(full[0]) == 50 && columns(log_header()) == 50);
+    join(expect, full, 50);
+    size_t n = log_format(line, sizeof(line), &r);
+    CHECK(n == strlen(line) && strcmp(line, expect) == 0);
+
+    /* the flight controller quiet for 6 s: only how long, nothing older than 5 s */
+    r.now_ms = 106000;
+    r.rail_mv = 4298; /* USB or the BEC: the gauge reads the rail, not the cell */
+    r.events = "";
+    r.gnss.fix = GNSS_FIX_NONE; /* the GNSS lost its fix */
+    r.gnss.hdop = LOCATOR_U16_UNKNOWN;
+    log_format(line, sizeof(line), &r);
+    const char *quiet[] = {
+        "2026-10-02T09:35:12Z", "754",
+        "0", "11", "", "", "", "", "", "", "2",
+        "LTE", "-71", "Turk;cell", "286-01", "B3", "387360", "-76", "-9.0", "-46", "10",
+        "1", "54", "1.2", "1234", "1",
+        "6", "", "", "", "", "", "", "", "", "",
+        "", "", "", "", "", "", "", "",
+        "41", "ext", "", "4298", "sounding", "",
+    };
+    join(expect, quiet, 50);
+    CHECK(strcmp(line, expect) == 0);
+
+    /* nothing known yet: just after power-on */
+    memset(&r, 0x5A, sizeof(r));
+    log_row_clear(&r);
+    r.uptime_s = 3;
+    log_format(line, sizeof(line), &r);
+    const char *none[50];
+    for (int i = 0; i < 50; i++) {
+        none[i] = "";
+    }
+    none[1] = "3";
+    none[21] = "0"; /* relay */
+    none[24] = "0"; /* data */
+    none[25] = "0"; /* gcs */
+    none[48] = "off";
+    join(expect, none, 50);
+    CHECK(strcmp(line, expect) == 0);
+}
+
+/* A log file as relay/tests/test_logs.py makes them: a header, `untimed` lines without a time, then `lines` lines a
+ * second apart from first_time. */
+static size_t log_file(char *out, size_t n, unsigned lines, uint32_t first_time, unsigned untimed)
+{
+    size_t len = (size_t)snprintf(out, n, "time_utc,uptime_s,gnss_fix\n");
+    for (unsigned i = 0; i < untimed; i++) {
+        len += (size_t)snprintf(out + len, n - len, ",%u,0\n", i);
+    }
+    for (unsigned i = 0; i < lines; i++) {
+        char t[24];
+        log_time_text(t, first_time + i);
+        len += (size_t)snprintf(out + len, n - len, "%s,%u,3,0123456789abcdef0123456789abcdef01234567\n", t,
+                                untimed + i);
+    }
+    return len;
+}
+
+/* What sdlog.c does with a file: its first 2 KB, and its last 2 KB. */
+static void file_times(const char *file, size_t len, uint32_t *start, uint32_t *end)
+{
+    static char buf[2049];
+    uint32_t first_up, t, up;
+    *start = *end = 0;
+    size_t head = len < 2048 ? len : 2048;
+    memcpy(buf, file, head);
+    buf[head] = '\0';
+    if (!log_first_uptime(buf, &first_up)) {
+        return;
+    }
+    size_t from = len > 2048 ? len - 2048 : 0;
+    memcpy(buf, file + from, len - from);
+    buf[len - from] = '\0';
+    if (log_last_time(buf, from > 0, &t, &up)) {
+        *end = t;
+        *start = up >= first_up ? t - (up - first_up) : t;
+    }
+}
+
+static void test_log_times(void)
+{
+    static char file[64 * 1024];
+    uint32_t start, end;
+    size_t len = log_file(file, sizeof(file), 500, 1790000000u, 20); /* longer than what is read of each end */
+    file_times(file, len, &start, &end);
+    CHECK(start == 1789999980u && end == 1790000499u);
+    len = log_file(file, sizeof(file), 50, 1790000000u, 200); /* no time at all in what is read of its start */
+    file_times(file, len, &start, &end);
+    CHECK(start == 1789999800u && end == 1790000049u);
+    len = log_file(file, sizeof(file), 3, 1790000000u, 0); /* shorter than what is read */
+    file_times(file, len, &start, &end);
+    CHECK(start == 1790000000u && end == 1790000002u);
+    len = log_file(file, sizeof(file), 0, 0, 2); /* no GNSS and no relay yet: no time at all */
+    file_times(file, len, &start, &end);
+    CHECK(start == 0 && end == 0);
+    len = log_file(file, sizeof(file), 0, 0, 0); /* only the header: the power went within a second */
+    file_times(file, len, &start, &end);
+    CHECK(start == 0 && end == 0);
+    /* a real line, all 50 columns */
+    char line[] = "time_utc,uptime_s\n2026-10-02T09:35:12Z,754,3,11,41.1234567\n";
+    char tail[sizeof(line)];
+    memcpy(tail, line, sizeof(line));
+    uint32_t up;
+    CHECK(log_first_uptime(line, &up) && up == 754);
+    CHECK(log_last_time(tail, false, &start, &up) && start == 1790933712u && up == 754);
+}
+
+/* ------------------------------------------------------------------ the USB link */
+
+static void test_usb_lines(void)
+{
+    CHECK(usb_crc32(0, (const uint8_t *)"123456789", 9) == 0xCBF43926u);
+    CHECK(usb_crc32(usb_crc32(0, (const uint8_t *)"1234", 4), (const uint8_t *)"56789", 5) == 0xCBF43926u);
+    char out[64];
+    const char *in[] = {"", "f", "fo", "foo", "foob", "fooba", "foobar"};
+    const char *b64[] = {"", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy"};
+    for (int i = 0; i < 7; i++) {
+        CHECK(usb_base64(out, (const uint8_t *)in[i], strlen(in[i])) == strlen(b64[i]) && strcmp(out, b64[i]) == 0);
+    }
+    static char line[USB_LINE_MAX];
+    size_t n = usb_data_line(line, 4096, (const uint8_t *)"foobar", 6);
+    CHECK(n == strlen(line) && strcmp(line, "@D 4096 Zm9vYmFy 9ef61f95\n") == 0);
+    static uint8_t chunk[USB_DATA_CHUNK + 10];
+    for (size_t i = 0; i < sizeof(chunk); i++) {
+        chunk[i] = (uint8_t)(i * 13);
+    }
+    n = usb_data_line(line, 4294967295u, chunk, sizeof(chunk)); /* at most a chunk */
+    CHECK(n == strlen(line) && n == 3 + 10 + 1 + 1024 + 1 + 8 + 1 && n < USB_LINE_MAX);
+
+    char name[16];
+    uint32_t num = 7;
+    CHECK(usb_parse("MAVLTE HELLO", name, sizeof(name), &num) == USB_CMD_HELLO);
+    CHECK(usb_parse("MAVLTE LIST\r", name, sizeof(name), &num) == USB_CMD_LIST && num == 0);
+    CHECK(usb_parse("MAVLTE LIST 40", name, sizeof(name), &num) == USB_CMD_LIST && num == 40);
+    CHECK(usb_parse("  MAVLTE  GET LOG00012.CSV 4096", name, sizeof(name), &num) == USB_CMD_GET);
+    CHECK(strcmp(name, "LOG00012.CSV") == 0 && num == 4096);
+    CHECK(usb_parse("MAVLTE GET LOG00012.CSV", name, sizeof(name), &num) == USB_CMD_GET && num == 0);
+    CHECK(usb_parse("MAVLTE SPEED 2000000", name, sizeof(name), &num) == USB_CMD_SPEED && num == 2000000);
+    CHECK(usb_parse("MAVLTE STOP", name, sizeof(name), &num) == USB_CMD_STOP);
+    CHECK(usb_parse("I (1234) modem: registered with Turkcell", name, sizeof(name), &num) == USB_CMD_NONE);
+    CHECK(usb_parse("MAVLTE GET", name, sizeof(name), &num) == USB_CMD_NONE);
+    CHECK(usb_parse("MAVLTE SPEED fast", name, sizeof(name), &num) == USB_CMD_NONE);
+    CHECK(usb_parse("mavlte hello", name, sizeof(name), &num) == USB_CMD_NONE);
+    CHECK(usb_parse("", name, sizeof(name), &num) == USB_CMD_NONE);
+    CHECK(usb_parse("MAVLTE GET LOG00012.CSV 0", name, 12, &num) == USB_CMD_NONE); /* no room for the name */
+}
+
+/* ------------------------------------------------------------------ logs over the tunnel (fileout.c) */
+
+#define CARD_FILES 45
+#define LOG_PACKETS 400
+
+typedef struct {
+    uint8_t data[2][40000]; /* LOG00045.CSV and LOG00044.CSV; the other files are empty */
+    uint32_t size[2];
+    bool no_card, fail_read, open;
+    int which;
+    int opens, closes;
+    /* what was sent */
+    int n;
+    uint8_t type[LOG_PACKETS];
+    uint16_t len[LOG_PACKETS];
+    uint8_t body[LOG_PACKETS][FILE_DATA_HEAD_LEN + FILE_CHUNK];
+} card_t;
+
+static int card_list(void *ctx, unsigned first, file_entry_t *out, unsigned max, unsigned *total)
+{
+    card_t *c = ctx;
+    if (c->no_card) {
+        return -FILE_NO_CARD;
+    }
+    *total = CARD_FILES;
+    unsigned n = 0;
+    for (unsigned i = first; i < CARD_FILES && n < max; i++, n++) {
+        snprintf(out[n].name, sizeof(out[n].name), "LOG%05u.CSV", (unsigned)((CARD_FILES - i % 100) % 100000));
+        out[n].size = i < 2 ? c->size[i] : 0;
+        out[n].start = i < 2 ? 1790000000u + i : 0;
+        out[n].end = i < 2 ? 1790003600u + i : 0;
+    }
+    return (int)n;
+}
+
+static int card_open(void *ctx, const char *name, uint32_t *size)
+{
+    card_t *c = ctx;
+    if (c->no_card) {
+        return FILE_NO_CARD;
+    }
+    int which = strcmp(name, "LOG00045.CSV") == 0 ? 0 : strcmp(name, "LOG00044.CSV") == 0 ? 1 : -1;
+    if (which < 0) {
+        return FILE_NOT_FOUND;
+    }
+    CHECK(!c->open); /* one file at a time */
+    c->open = true;
+    c->which = which;
+    c->opens++;
+    *size = c->size[which];
+    return FILE_OK;
+}
+
+static bool card_read(void *ctx, uint32_t offset, uint8_t *buf, size_t len)
+{
+    card_t *c = ctx;
+    CHECK(c->open && offset + len <= c->size[c->which]);
+    if (c->fail_read) {
+        return false;
+    }
+    memcpy(buf, c->data[c->which] + offset, len);
+    return true;
+}
+
+static void card_close(void *ctx)
+{
+    card_t *c = ctx;
+    CHECK(c->open);
+    c->open = false;
+    c->closes++;
+}
+
+static bool card_send(void *ctx, uint8_t type, const uint8_t *body, size_t len)
+{
+    card_t *c = ctx;
+    if (c->n < LOG_PACKETS) {
+        c->type[c->n] = type;
+        c->len[c->n] = (uint16_t)len;
+        memcpy(c->body[c->n], body, len);
+    }
+    c->n++;
+    return true;
+}
+
+static void file_req(file_outbox_t *o, uint16_t id, uint8_t op, uint32_t offset, const char *name, uint32_t now)
+{
+    uint8_t body[FILE_REQ_LEN] = {0};
+    put16(body, id);
+    body[2] = op;
+    put32(body + 3, offset);
+    memcpy(body + 7, name, strlen(name));
+    fileout_input(o, TUN_FILE_REQ, body, sizeof(body), now);
+}
+
+static void file_ack(file_outbox_t *o, uint16_t id, uint32_t next, uint32_t now)
+{
+    uint8_t body[FILE_ACK_LEN];
+    put16(body, id);
+    put32(body + 2, next);
+    fileout_input(o, TUN_FILE_ACK, body, sizeof(body), now);
+}
+
+static void test_fileout(void)
+{
+    static card_t c;
+    static file_outbox_t o;
+    memset(&c, 0, sizeof(c));
+    for (int f = 0; f < 2; f++) {
+        for (size_t i = 0; i < sizeof(c.data[f]); i++) {
+            c.data[f][i] = (uint8_t)(i * (f ? 7 : 3) + (i >> 8));
+        }
+    }
+    c.size[0] = 40000;
+    c.size[1] = 2500;
+    file_config_t cfg = {card_list, card_open, card_read, card_close, card_send, &c};
+    fileout_init(&o, &cfg);
+    uint32_t now = 0xFFFF0000u; /* the clock wraps during the test */
+
+    /* LIST, a page at a time */
+    file_req(&o, 7, FILE_OP_LIST, 0, "", now);
+    CHECK(fileout_busy(&o) && c.n == 0); /* nothing from inside tun_input: the card waits for the poll */
+    CHECK(!fileout_poll(&o, now, TUN_U16_UNKNOWN, 32768.0f) && !fileout_busy(&o));
+    CHECK(c.n == 1 && c.type[0] == TUN_FILE_LIST && c.len[0] == FILE_LIST_HEAD_LEN + 40 * FILE_ENTRY_LEN);
+    CHECK(get16(c.body[0]) == 7 && c.body[0][2] == FILE_OK && get16(c.body[0] + 3) == 45 && get16(c.body[0] + 5) == 0);
+    CHECK(c.body[0][7] == 40 && memcmp(c.body[0] + 8, "LOG00045.CSV", 12) == 0);
+    CHECK(u32(c.body[0] + 8 + 12) == 40000 && u32(c.body[0] + 8 + 16) == 1790000000u && u32(c.body[0] + 8 + 20) == 1790003600u);
+    file_req(&o, 8, FILE_OP_LIST, 40, "", now);
+    fileout_poll(&o, now, TUN_U16_UNKNOWN, 32768.0f);
+    CHECK(c.n == 2 && c.body[1][7] == 5 && get16(c.body[1] + 5) == 40 && memcmp(c.body[1] + 8, "LOG00005.CSV", 12) == 0);
+
+    /* a whole file, lost packets and all: the receiver ACKs every 200 ms what came in order */
+    c.n = 0;
+    file_req(&o, 9, FILE_OP_GET, 0, "log00045.csv", now); /* any case */
+    fileout_poll(&o, now, 60, 65536.0f);
+    CHECK(o.sending && c.opens == 1);
+    static uint8_t got[40000];
+    uint32_t have = 0, sent_ahead = 0, last_ack = now;
+    int lost = 0, i = 0, ended = 0;
+    while (have < 40000 && (uint32_t)(now - 0xFFFF0000u) < 120000) {
+        now += 10;
+        ended += fileout_poll(&o, now, 60, 65536.0f);
+        for (; i < c.n && i < LOG_PACKETS; i++) {
+            CHECK(c.type[i] == TUN_FILE_DATA && get16(c.body[i]) == 9 && c.body[i][2] == FILE_OK);
+            uint32_t off = u32(c.body[i] + 3), size = u32(c.body[i] + 7), len = c.len[i] - FILE_DATA_HEAD_LEN;
+            CHECK(size == 40000 && len >= 1 && len <= FILE_CHUNK && off + len <= size);
+            if (off + len > have && off + len - have > sent_ahead) {
+                sent_ahead = off + len - have;
+            }
+            if ((i % 7) == 3 && lost < 6) { /* lost on the way */
+                lost++;
+                continue;
+            }
+            if (off == have) {
+                memcpy(got + off, c.body[i] + FILE_DATA_HEAD_LEN, len);
+                have += len;
+            }
+        }
+        if (i >= LOG_PACKETS) { /* keep the capture small: start counting again */
+            c.n = i = 0;
+        }
+        if ((uint32_t)(now - last_ack) >= 200) {
+            last_ack = now;
+            file_ack(&o, 9, have, now);
+        }
+    }
+    CHECK(have == 40000 && memcmp(got, c.data[0], 40000) == 0 && lost == 6);
+    CHECK(sent_ahead <= FILE_WINDOW + FILE_CHUNK); /* never far beyond the last ACK */
+    file_ack(&o, 9, 40000, now);
+    CHECK(fileout_poll(&o, now, 60, 65536.0f) && !o.sending && c.closes == 1);
+    CHECK(strcmp(o.last_name, "LOG00045.CSV") == 0 && o.last_bytes == 40000 && o.last_complete && ended == 0);
+
+    /* no ACK: back to the last one after the retransmission time, then gives up */
+    c.n = 0;
+    file_req(&o, 10, FILE_OP_GET, 1024, "LOG00045.CSV", now);
+    for (int k = 0; k < 300; k++) {
+        now += 10;
+        fileout_poll(&o, now, TUN_U16_UNKNOWN, 65536.0f); /* rate starts at 4 KB/s: a few chunks in 3 s */
+    }
+    int again = 0;
+    for (int k = 1; k < c.n && k < LOG_PACKETS; k++) {
+        again += u32(c.body[k] + 3) == 1024; /* from the start again */
+    }
+    CHECK(c.n >= 3 && u32(c.body[0] + 3) == 1024 && again >= 1);
+    now += FILE_GIVE_UP_MS;
+    CHECK(fileout_poll(&o, now, TUN_U16_UNKNOWN, 65536.0f) && !o.sending && !o.last_complete);
+
+    /* asked again from where the receiver stopped: the same download goes on */
+    file_req(&o, 11, FILE_OP_GET, 0, "LOG00045.CSV", now);
+    fileout_poll(&o, now, 60, 65536.0f);
+    file_ack(&o, 11, 2048, now + 100);
+    file_req(&o, 11, FILE_OP_GET, 2048, "LOG00045.CSV", now + 100);
+    CHECK(!fileout_poll(&o, now + 100, 60, 65536.0f) && o.sending && o.acked == 2048 && c.opens == 3);
+
+    /* another download takes over: the first one hears STOPPED */
+    c.n = 0;
+    file_req(&o, 12, FILE_OP_GET, 0, "LOG00044.CSV", now + 200);
+    CHECK(fileout_poll(&o, now + 200, 60, 65536.0f) && !o.last_complete && o.sending && o.id == 12);
+    CHECK(c.type[0] == TUN_FILE_DATA && get16(c.body[0]) == 11 && c.body[0][2] == FILE_STOPPED && c.len[0] == FILE_DATA_HEAD_LEN);
+    file_req(&o, 12, FILE_OP_STOP, 0, "LOG00044.CSV", now + 300); /* and stops */
+    CHECK(fileout_poll(&o, now + 300, 60, 65536.0f) && !o.sending && c.closes == c.opens);
+
+    /* problems: not there, from the end (nothing more), the card failing, no card */
+    c.n = 0;
+    file_req(&o, 13, FILE_OP_GET, 0, "LOG00099.CSV", now);
+    fileout_poll(&o, now, 60, 65536.0f);
+    file_req(&o, 14, FILE_OP_GET, 2500, "LOG00044.CSV", now);
+    fileout_poll(&o, now, 60, 65536.0f);
+    CHECK(c.n == 2 && c.body[0][2] == FILE_NOT_FOUND && get16(c.body[0]) == 13);
+    CHECK(c.body[1][2] == FILE_OK && u32(c.body[1] + 3) == 2500 && u32(c.body[1] + 7) == 2500 && c.len[1] == FILE_DATA_HEAD_LEN);
+    CHECK(!o.sending && c.closes == c.opens);
+    c.fail_read = true;
+    file_req(&o, 15, FILE_OP_GET, 0, "LOG00044.CSV", now);
+    for (int k = 0; k < 50 && (o.sending || fileout_busy(&o)); k++) {
+        now += 20;
+        fileout_poll(&o, now, 60, 65536.0f);
+    }
+    CHECK(c.body[c.n - 1][2] == FILE_CARD_ERROR && !o.sending && c.closes == c.opens);
+    c.fail_read = false;
+    c.no_card = true;
+    c.n = 0;
+    file_req(&o, 16, FILE_OP_LIST, 0, "", now);
+    file_req(&o, 17, FILE_OP_GET, 0, "LOG00044.CSV", now);
+    fileout_poll(&o, now, 60, 65536.0f);
+    CHECK(c.n == 2 && c.type[0] == TUN_FILE_LIST && c.body[0][2] == FILE_NO_CARD && c.body[0][7] == 0);
+    CHECK(c.type[1] == TUN_FILE_DATA && c.body[1][2] == FILE_NO_CARD);
+}
+
 int main(void)
 {
     test_sha256();
@@ -1064,6 +1641,11 @@ int main(void)
     test_gnss_parse();
     test_locator_packet();
     test_alarm();
+    test_telemetry();
+    test_log_line();
+    test_log_times();
+    test_usb_lines();
+    test_fileout();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

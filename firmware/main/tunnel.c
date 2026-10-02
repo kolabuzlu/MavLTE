@@ -282,6 +282,12 @@ void tun_input(tun_client_t *t, const uint8_t *pkt, size_t len, uint32_t now_ms)
             t->last_rx = now_ms;
             loss_reset(t);
             t->stats.sessions++;
+            t->server_ms = 0;
+            if (body_len >= TUN_NONCE_LEN + 8) { /* the relay's clock, then: half our HELLO's round trip ago */
+                t->server_ms = (uint64_t)get_u32(body + 8) | (uint64_t)get_u32(body + 12) << 32;
+                t->server_ms += (uint32_t)(now_ms - t->last_hello) / 2;
+                t->server_ms_at = now_ms;
+            }
             send_ping(t, now_ms); /* makes the session active on the server */
             emit_event(t, TUN_EVENT_CONNECTED);
         }

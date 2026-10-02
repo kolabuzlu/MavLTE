@@ -11,7 +11,9 @@
 #include "board.h"
 #include "bridge.h"
 #include "modem.h"
+#include "sdlog.h"
 #include "status.h"
+#include "usblink.h"
 #include "version.h"
 
 static const char *TAG = "main";
@@ -31,7 +33,9 @@ void app_main(void)
 #if CONFIG_BRIDGE_LOCATOR
     battery_start();
 #endif
+    sdlog_start(); /* first: it keeps what the others report for the flight log */
     bridge_start();
     status_start();
     modem_start();
+    usblink_start();
 }

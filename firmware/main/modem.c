@@ -16,6 +16,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 
@@ -23,6 +24,8 @@
 #include "bridge.h"
 #include "alarm.h"
 #include "locator.h"
+#include "logrow.h"
+#include "sdlog.h"
 #include "status.h"
 
 #define MODEM_UART UART_NUM_1
@@ -34,7 +37,8 @@
 #define NVS_BAD_PIN "bad_pin"     /* the menuconfig SIM PIN that the SIM card rejected */
 #define NVS_SLOW_UART "slow_uart" /* 1: the modem did not answer at CONFIG_BRIDGE_MODEM_BAUD */
 #define NVS_NO_CMUX "no_cmux"     /* 1: the modem did not take CMUX: plain data calls, no GNSS during them */
-#define RADIO_EVERY_MS 10000      /* signal and network, read again during a CMUX data call */
+#define RADIO_EVERY_MS 5000       /* signal, network and cell, read again during a CMUX data call */
+#define RADIO_FRESH_MS 30000      /* older readings are left out of the flight log */
 
 #if CONFIG_BRIDGE_NETWORK_LTE_ONLY
 #define NETWORK_MODE 38 /* AT+CNMP: LTE only */
@@ -56,6 +60,12 @@ static bool fast_baud_failed; /* the modem took AT+IPR but did not answer at tha
 static bool cmux_off;         /* data calls without the multiplexer (it failed, or no locator) */
 static bool in_cmux;          /* this data call runs over CMUX: AT commands still work during it */
 static int baud = BOOT_BAUD;
+/* the network as last read, for the flight log (guarded by radio_lock) */
+static SemaphoreHandle_t radio_lock;
+static int16_t radio_dbm = BRIDGE_RSSI_UNKNOWN;
+static char radio_operator[24];
+static cell_info_t radio_cell;
+static uint32_t radio_ms;
 #if CONFIG_BRIDGE_LOCATOR_VOICE
 static bool voice_ready; /* the modem's audio is set up for the locator voice since it last (re)started */
 #endif
@@ -326,6 +336,7 @@ static bool check_sim(void)
     case ESP_MODEM_SIM_PIN_STATE_NEED_PIN: {
         if (CONFIG_BRIDGE_SIM_PIN[0] == '\0') {
             ESP_LOGE(TAG, "the SIM card needs a PIN: set it in menuconfig, or remove the PIN with a phone");
+            sdlog_event("SIM card needs a PIN");
             return false;
         }
         if (pin_known_bad()) {
@@ -364,9 +375,11 @@ static bool check_sim(void)
     }
     case ESP_MODEM_SIM_PIN_STATE_NEED_PUK:
         ESP_LOGE(TAG, "the SIM card is locked (PUK needed): unlock it in a phone");
+        sdlog_event("SIM card locked");
         return false;
     default:
         ESP_LOGE(TAG, "no usable SIM card: is it inserted (nano-SIM, contacts down)?");
+        sdlog_event("no SIM card");
         return false;
     }
 }
@@ -443,6 +456,43 @@ static int16_t signal_dbm(void)
         return BRIDGE_RSSI_UNKNOWN;
     }
     return (int16_t)(-113 + 2 * rssi); /* AT+CSQ scale */
+}
+
+/* Signal, network and cell, for the relay's link status and the flight log: wherever the modem takes AT commands (in
+ * command mode, and on the CMUX command channel during a data call). The operator's name goes into name
+ * (ESP_MODEM_C_API_STR_BUF_SIZE bytes), its access technology into *act (-1: none). */
+static int16_t read_radio(char *name, int *act)
+{
+    int16_t dbm = signal_dbm();
+    name[0] = '\0';
+    *act = -1;
+    esp_modem_get_operator_name(dce, name, act);
+    bridge_set_radio(dbm, *act >= 0 && *act < 0xFF ? (uint8_t)*act : BRIDGE_RAT_UNKNOWN);
+    cell_info_t cell;
+    if (command("AT+CPSI?\r", 2000) != ESP_OK || !cell_parse(answer, &cell)) {
+        cell_clear(&cell);
+    }
+    xSemaphoreTake(radio_lock, portMAX_DELAY);
+    radio_dbm = dbm;
+    snprintf(radio_operator, sizeof(radio_operator), "%s", name);
+    radio_cell = cell;
+    radio_ms = now_ms();
+    xSemaphoreGive(radio_lock);
+    return dbm;
+}
+
+void modem_log_row(log_row_t *row)
+{
+    if (!radio_lock) {
+        return;
+    }
+    xSemaphoreTake(radio_lock, portMAX_DELAY);
+    if (radio_ms && (uint32_t)(now_ms() - radio_ms) < RADIO_FRESH_MS) {
+        row->signal_dbm = radio_dbm == BRIDGE_RSSI_UNKNOWN ? LOG_I16_UNKNOWN : radio_dbm;
+        memcpy(row->operator_name, radio_operator, sizeof(row->operator_name));
+        row->cell = radio_cell;
+    }
+    xSemaphoreGive(radio_lock);
 }
 
 #if CONFIG_BRIDGE_LOCATOR_VOICE
@@ -575,6 +625,7 @@ static void voice_tick(bool usable)
                 command(VOICE_STOP, 2000); /* stops it at once */
             }
             ESP_LOGI(TAG, "locator voice off");
+            sdlog_event("voice off");
             bridge_set_voice(false, false);
         }
         return;
@@ -586,6 +637,7 @@ static void voice_tick(bool usable)
         voice_asked_ms = now;
         voice_try_ms = now - VOICE_EVERY_MS;
         ESP_LOGI(TAG, "locator voice on: %s through the board's speaker", VOICE_WHAT);
+        sdlog_event("voice on");
     }
     if (usable && (uint32_t)(now - voice_try_ms) >= (voice_playing ? VOICE_EVERY_MS : VOICE_RETRY_MS)) {
         voice_try_ms = now;
@@ -607,6 +659,7 @@ static void voice_tick(bool usable)
     bool speaking = voice_spoke && (uint32_t)(now - voice_ok_ms) < VOICE_EVERY_MS + VOICE_FAILED_MS;
     bool failed = !speaking && (uint32_t)(now - (voice_spoke ? voice_ok_ms : voice_asked_ms)) >= VOICE_FAILED_MS;
     if (failed && !voice_failed) {
+        sdlog_event("voice: the modem does not play it");
         if (usable) {
             ESP_LOGW(TAG, "the locator voice is on, but the modem does not play it (%s)", answer);
         } else {
@@ -652,10 +705,13 @@ static bool wait_registration(uint32_t timeout_ms)
         if (stat == 3 && !denied_logged) {
             denied_logged = true;
             ESP_LOGE(TAG, "the network refused registration: is the SIM active and does it have a data plan?");
+            sdlog_event("network refused registration");
         }
         if ((uint32_t)(now_ms() - last_log) >= 10000) {
             last_log = now_ms();
-            int16_t dbm = signal_dbm();
+            char name[ESP_MODEM_C_API_STR_BUF_SIZE];
+            int act;
+            int16_t dbm = read_radio(name, &act);
             if (dbm == BRIDGE_RSSI_UNKNOWN) {
                 ESP_LOGI(TAG, "searching for the network (no signal yet; check the LTE antenna)");
             } else {
@@ -665,6 +721,7 @@ static bool wait_registration(uint32_t timeout_ms)
         pause_ms(2000);
     }
     ESP_LOGW(TAG, "not registered with a network after %" PRIu32 " s", timeout_ms / 1000);
+    sdlog_event("no network for %" PRIu32 " s", timeout_ms / 1000);
     return false;
 }
 
@@ -685,16 +742,15 @@ static const char *rat_name(int act)
 
 static void report_radio(void)
 {
-    char name[ESP_MODEM_C_API_STR_BUF_SIZE] = "";
-    int act = -1;
-    int16_t dbm = signal_dbm();
-    esp_modem_get_operator_name(dce, name, &act);
+    char name[ESP_MODEM_C_API_STR_BUF_SIZE];
+    int act;
+    int16_t dbm = read_radio(name, &act);
     if (dbm == BRIDGE_RSSI_UNKNOWN) {
         ESP_LOGI(TAG, "registered with %s, %s", name, rat_name(act));
     } else {
         ESP_LOGI(TAG, "registered with %s, %s, signal %d dBm", name, rat_name(act), dbm);
     }
-    bridge_set_radio(dbm, act >= 0 && act < 0xFF ? (uint8_t)act : BRIDGE_RAT_UNKNOWN);
+    sdlog_event("registered with %s on %s", name, rat_name(act));
 }
 
 #if CONFIG_BRIDGE_LOCATOR
@@ -734,6 +790,7 @@ static bool dial(void)
             } else { /* it did, but the data call did not: hang_up() closes the multiplexer */
                 in_cmux = true;
                 ESP_LOGW(TAG, "the modem did not accept the data call (APN \"%s\")", CONFIG_BRIDGE_APN);
+                sdlog_event("data call refused");
             }
             return false;
         }
@@ -744,11 +801,13 @@ static bool dial(void)
 #endif
     if (esp_modem_set_mode(dce, ESP_MODEM_MODE_DATA) != ESP_OK) {
         ESP_LOGW(TAG, "the modem did not accept the data call (APN \"%s\")", CONFIG_BRIDGE_APN);
+        sdlog_event("data call refused");
         return false;
     }
     EventBits_t bits = xEventGroupWaitBits(events, PPP_UP | PPP_DOWN, pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
     if (!(bits & PPP_UP)) {
         ESP_LOGW(TAG, "no IP address from the network (APN \"%s\")", CONFIG_BRIDGE_APN);
+        sdlog_event("no IP address");
         return false;
     }
     return true;
@@ -789,6 +848,7 @@ static void leave_cmux(void)
 static void hard_reset(void)
 {
     ESP_LOGW(TAG, "resetting the modem");
+    sdlog_event("modem reset");
     bool restarting = false;
     if (dce) {
         hang_up();
@@ -843,27 +903,21 @@ static void read_gnss(void)
         ESP_LOGI(TAG, "GNSS: %s", answer_field("+CGNSSINFO:", raw, sizeof(raw)));
     }
     if (has_fix != had_fix) {
-        had_fix = has_fix;
         if (has_fix) {
             char lat[16], lon[16];
             ESP_LOGI(TAG, "GNSS: position %s, %s from %u satellites", degrees(lat, sizeof(lat), fix.lat),
                      degrees(lon, sizeof(lon), fix.lon), fix.sats);
+            sdlog_event("GNSS fix");
         } else {
+            if (had_fix > 0) {
+                sdlog_event("GNSS fix lost");
+            }
             ESP_LOGI(TAG, "GNSS: no position yet (is its antenna on the board's GNSS connector, under open sky?)");
         }
+        had_fix = has_fix;
     }
 }
 #endif
-
-/* Signal and network again, for the link status (only possible during a CMUX data call). */
-static void read_radio(void)
-{
-    char name[ESP_MODEM_C_API_STR_BUF_SIZE] = "";
-    int act = -1;
-    int16_t dbm = signal_dbm();
-    esp_modem_get_operator_name(dce, name, &act);
-    bridge_set_radio(dbm, act >= 0 && act < 0xFF ? (uint8_t)act : BRIDGE_RAT_UNKNOWN);
-}
 
 /* Watches the connection until it ends; during a CMUX call, reads the GNSS and the signal too. */
 static link_end_t stay_online(void)
@@ -881,6 +935,7 @@ static link_end_t stay_online(void)
         /* PPP can stay up while nothing gets through any more; redialling usually cures it */
         if (bridge_relay_silence_ms() > RELAY_SILENCE_LIMIT_MS) {
             ESP_LOGW(TAG, "nothing from the relay for %d minutes; redialling", RELAY_SILENCE_LIMIT_MS / 60000);
+            sdlog_event("relay silent: redialling");
             return LINK_RELAY_SILENT;
         }
         voice_tick(in_cmux);
@@ -895,7 +950,9 @@ static link_end_t stay_online(void)
 #endif
         if ((uint32_t)(now_ms() - last_radio) >= RADIO_EVERY_MS) {
             last_radio = now_ms();
-            read_radio();
+            char name[ESP_MODEM_C_API_STR_BUF_SIZE];
+            int act;
+            read_radio(name, &act);
         }
     }
 }
@@ -926,6 +983,7 @@ static void modem_task(void *arg)
                 continue;
             } else {
                 ESP_LOGE(TAG, "the modem does not answer on its UART");
+                sdlog_event("modem does not answer");
                 failures++;
                 hard_reset();
                 continue;
@@ -971,6 +1029,7 @@ void modem_start(void)
 {
     board = board_get();
     events = xEventGroupCreate();
+    radio_lock = xSemaphoreCreateMutex();
     const esp_netif_config_t netif_config = ESP_NETIF_DEFAULT_PPP();
     ppp_netif = esp_netif_new(&netif_config);
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, on_ip_event, NULL));

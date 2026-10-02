@@ -157,6 +157,16 @@ menu "MavLTE"
             number written "0 5 3 2 ..." tells whoever finds the aircraft whom to call. Quotes and
             characters other than ASCII are left out.
 
+    config BRIDGE_SD_LOG
+        bool "Flight log on the SD card (V2 boards)"
+        default y
+        help
+            A CSV line a second on the SD card in the board's TF slot (MAVLTE/LOGnnnnn.CSV, a new file
+            at each power-on): the module's GNSS, the mobile network and its signal, the relay link,
+            the flight controller's telemetry and the board's power. The card must be FAT32. MavLTE
+            downloads the files over the USB cable and over 4G. Without a card the firmware runs as
+            before. V1 boards wire their TF slot differently and log nothing.
+
     config BRIDGE_CAMERA
         bool "Camera: a photo when MavLTE asks for one (Snapshot)"
         default y

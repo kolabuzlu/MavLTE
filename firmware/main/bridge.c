@@ -2,11 +2,15 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_random.h"
@@ -22,9 +26,12 @@
 #include "battery.h"
 #include "board.h"
 #include "camera.h"
+#include "fileout.h"
 #include "mavframe.h"
 #include "locator.h"
+#include "logrow.h"
 #include "mavpos.h"
+#include "sdlog.h"
 #include "snapshot.h"
 #include "tunnel.h"
 #include "version.h"
@@ -38,6 +45,14 @@
 #define PHOTO_CAP_LTE 32768.0f
 #define PHOTO_CAP_2G 2048.0f
 #define POSITION_FRESH_MS 5000
+#define IP_UDP_BYTES 28        /* each datagram's IPv4 and UDP headers, which the mobile data plan counts too */
+#define CLOCK_STEP_MS 2000     /* a time source this far from the clock moves it */
+#define FILE_PACKETS 8
+#if CONFIG_BRIDGE_LOCATOR
+#define GNSS_FRESH_MS (3 * CONFIG_BRIDGE_LOCATOR_INTERVAL * 1000) /* as for the locator's reports */
+#else
+#define GNSS_FRESH_MS 15000
+#endif
 
 static const char *TAG = "bridge";
 
@@ -63,6 +78,17 @@ static uint32_t gnss_ms;       /* when gnss was read */
 static int gnss_state;         /* 0: not read yet, 1: readable, -1: cannot be read (no CMUX) */
 static uint16_t battery_mv = LOCATOR_U16_UNKNOWN; /* the board's cell, from its fuel gauge */
 static uint8_t battery_pct = LOCATOR_BATTERY_UNKNOWN;
+static uint64_t data_bytes;          /* mobile data both ways since power-on (guarded by lock) */
+static bool clock_set, clock_gnss;   /* the system clock has the time, from the GNSS (guarded by lock) */
+/* logs over 4G (fileout.h): the outbox runs in a task of its own, which may wait for the card; the tunnel's
+ * callback hands it the relay's packets through a queue */
+static file_outbox_t files;
+static sdlog_file_t file_4g;
+static QueueHandle_t file_packets;
+typedef struct {
+    uint8_t type, len;
+    uint8_t body[FILE_REQ_LEN];
+} file_packet_t;
 #if CONFIG_BRIDGE_CAMERA
 static QueueHandle_t camera_jobs; /* for the camera task, which may take a second or two per photo */
 typedef struct {
@@ -88,8 +114,13 @@ static uint32_t now_ms(void)
 
 static void tun_send_cb(void *ctx, const uint8_t *pkt, size_t len)
 {
-    if (sock >= 0 && sendto(sock, pkt, len, 0, (const struct sockaddr *)&server, sizeof(server)) < 0) {
+    if (sock < 0) {
+        return;
+    }
+    if (sendto(sock, pkt, len, 0, (const struct sockaddr *)&server, sizeof(server)) < 0) {
         stats.send_errors++;
+    } else {
+        data_bytes += len + IP_UDP_BYTES;
     }
 }
 
@@ -99,19 +130,55 @@ static void tun_data_cb(void *ctx, const uint8_t *data, size_t len)
     downlink_len = len;
 }
 
+/* The system clock, for the flight log's times (called with lock held): the relay's at each connection (its WELCOME
+ * carries it since 1.8.0) until the module's GNSS has a fix, then the GNSS's, which needs no network. */
+static void set_clock(uint64_t unix_ms, bool from_gnss)
+{
+    if (unix_ms < 1577836800000ULL || (clock_gnss && !from_gnss)) { /* before 2020: not a time */
+        return;
+    }
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int64_t off = (int64_t)unix_ms - ((int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000);
+    if (clock_set && llabs(off) < CLOCK_STEP_MS) {
+        clock_gnss |= from_gnss;
+        return;
+    }
+    tv.tv_sec = (time_t)(unix_ms / 1000);
+    tv.tv_usec = (suseconds_t)(unix_ms % 1000 * 1000);
+    settimeofday(&tv, NULL);
+    char text[24];
+    log_time_text(text, (uint32_t)tv.tv_sec);
+    const char *source = from_gnss ? "GNSS" : "relay";
+    if (clock_set) {
+        ESP_LOGI(TAG, "clock moved %lld ms, to the %s's time: %s", (long long)off, source, text);
+    } else {
+        ESP_LOGI(TAG, "clock set from the %s: %s", source, text);
+    }
+    sdlog_event("clock set from the %s", source);
+    clock_set = true;
+    clock_gnss |= from_gnss;
+}
+
 static void tun_event_cb(void *ctx, tun_event_t event, uint32_t session)
 {
     switch (event) {
     case TUN_EVENT_CONNECTED:
         ESP_LOGI(TAG, "connected to the relay (session %08" PRIx32 ")", session);
+        sdlog_event("relay connected");
         snap_restart(&snap, now_ms()); /* perhaps a new relay, that knows nothing of a photo on its way */
+        if (tun.server_ms) {
+            set_clock(tun.server_ms + (uint32_t)(now_ms() - tun.server_ms_at), false);
+        }
         break;
     case TUN_EVENT_TIMEOUT:
         ESP_LOGW(TAG, "no answer from the relay; reconnecting");
+        sdlog_event("relay not answering");
         reopen_socket = true;
         break;
     case TUN_EVENT_REJECTED:
         ESP_LOGI(TAG, "the relay does not know our session any more; reconnecting");
+        sdlog_event("relay forgot the session");
         break;
     }
 }
@@ -123,6 +190,12 @@ static void tun_random_cb(void *ctx, uint8_t *buf, size_t len)
 
 static void tun_packet_cb(void *ctx, uint8_t type, const uint8_t *body, size_t len)
 {
+    if (type == TUN_FILE_REQ || type == TUN_FILE_ACK) { /* for the logs' task, which may be busy with the card */
+        file_packet_t p = {.type = type, .len = (uint8_t)(len < sizeof(p.body) ? len : sizeof(p.body))};
+        memcpy(p.body, body, p.len);
+        xQueueSend(file_packets, &p, 0); /* full: dropped, and the agent asks again */
+        return;
+    }
     snap_input(&snap, type, body, len, now_ms());
 }
 
@@ -132,6 +205,7 @@ static void tun_packet_cb(void *ctx, uint8_t type, const uint8_t *body, size_t l
 static void snap_take_cb(void *ctx, uint32_t photo_id, uint16_t width, uint16_t height)
 {
     ESP_LOGI(TAG, "photo %" PRIu32 " asked for (%ux%u)", photo_id, width, height);
+    sdlog_event("photo %" PRIu32 " asked for (%ux%u)", photo_id, width, height);
     const camera_job_t job = {.release = false, .photo_id = photo_id, .width = width, .height = height};
     if (xQueueSend(camera_jobs, &job, 0) != pdTRUE) {
         snap_photo_taken(&snap, photo_id, SNAP_FAILED, NULL, 0, NULL, now_ms());
@@ -144,8 +218,10 @@ static void snap_release_cb(void *ctx, uint32_t photo_id, bool sent)
     if (sent) {
         ESP_LOGI(TAG, "photo %" PRIu32 " sent in %" PRIu32 ".%" PRIu32 " s", photo_id, snap.last_ms / 1000,
                  snap.last_ms % 1000 / 100);
+        sdlog_event("photo %" PRIu32 " sent", photo_id);
     } else if (snap.last_id == photo_id) {
         ESP_LOGW(TAG, "photo %" PRIu32 ": no word from the relay for a minute; given up", photo_id);
+        sdlog_event("photo %" PRIu32 " given up", photo_id);
     }
 #if CONFIG_BRIDGE_CAMERA
     /* no waiting here, with the lock held: if the queue were full, the next photo frees this one */
@@ -277,6 +353,8 @@ static void log_stats(void)
     tun_stats_t ts = tun.stats;
     xSemaphoreGive(lock);
     char rtt_text[12] = "?", loss_text[12] = "?", chip_text[12] = "?";
+    unsigned heap_kb = (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
+    unsigned block_kb = (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024);
     int8_t chip = board_chip_temp();
     if (chip != INT8_MIN) {
         snprintf(chip_text, sizeof(chip_text), "%d C", chip);
@@ -289,10 +367,10 @@ static void log_stats(void)
     }
     ESP_LOGI(TAG, "relay %s, rtt %s, downlink loss %s, GCS %s | up %" PRIu32 " B in %" PRIu32 " pkts, down %" PRIu32
              " B | FC rx %" PRIu32 " B tx %" PRIu32 " B | held back %" PRIu32 " B, dropped %" PRIu32 ", errors %" PRIu32
-             " | chip %s",
+             " | chip %s | heap %u KB free, %u KB in one piece",
              connected ? "connected" : "not connected", rtt_text, loss_text, gcs ? "connected" : "absent", ts.tx_bytes,
              ts.tx_packets, ts.rx_bytes, stats.fc_rx_bytes, stats.fc_tx_bytes, stats.paused_bytes, ts.dropped,
-             stats.send_errors, chip_text);
+             stats.send_errors, chip_text, heap_kb, block_kb);
 }
 
 #if CONFIG_BRIDGE_LOCATOR
@@ -361,6 +439,7 @@ static void net_task(void *arg)
                 if (n > 0) {
                     uint32_t now = now_ms();
                     xSemaphoreTake(lock, portMAX_DELAY);
+                    data_bytes += (uint32_t)n + IP_UDP_BYTES;
                     downlink_len = 0;
                     tun_input(&tun, rx, (size_t)n, now);
                     if (tun_connected(&tun) && tun.last_rx == now) { /* it was a valid packet */
@@ -420,11 +499,13 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
     if (id == IP_EVENT_PPP_GOT_IP) {
         const ip_event_got_ip_t *event = data;
         ESP_LOGI(TAG, "mobile data up, address " IPSTR, IP2STR(&event->ip_info.ip));
+        sdlog_event("mobile data up");
         relay_contact_ms = now_ms();
         net_generation++;
         xEventGroupSetBits(net_events, NET_UP);
     } else if (id == IP_EVENT_PPP_LOST_IP) {
         ESP_LOGW(TAG, "mobile data down");
+        sdlog_event("mobile data down");
         xEventGroupClearBits(net_events, NET_UP);
     }
 }
@@ -441,11 +522,13 @@ uint32_t bridge_relay_packets(void)
 
 bridge_state_t bridge_state(void)
 {
-    bridge_state_t state = {false, false};
+    bridge_state_t state = {false, false, false};
     if (lock) {
+        uint32_t now = now_ms();
         xSemaphoreTake(lock, portMAX_DELAY);
         state.relay = tun_connected(&tun);
         state.gcs = state.relay && tun.gcs_present;
+        state.fc = position.heartbeat && (uint32_t)(now - position.heartbeat_ms) < LOCATOR_FC_SILENT_S * 1000;
         xSemaphoreGive(lock);
     }
     return state;
@@ -459,6 +542,9 @@ void bridge_set_gnss(const gnss_fix_t *fix)
             gnss = *fix;
             gnss_ms = now_ms();
             gnss_state = 1;
+            if (fix->fix >= GNSS_FIX_2D && fix->time) {
+                set_clock((uint64_t)fix->time * 1000, true);
+            }
         } else {
             gnss_state = -1;
         }
@@ -492,6 +578,91 @@ void bridge_set_voice(bool speaking, bool failed)
         xSemaphoreTake(lock, portMAX_DELAY);
         tun_set_ping_flags(&tun, (speaking ? TUN_PING_SPEAKING : 0) | (failed ? TUN_PING_VOICE_FAILED : 0));
         xSemaphoreGive(lock);
+    }
+}
+
+void bridge_log_row(log_row_t *row)
+{
+    if (!lock) {
+        return;
+    }
+    uint32_t now = now_ms();
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (clock_set) {
+        row->utc = (uint32_t)time(NULL);
+    }
+    /* a reading the locator would no longer send (no data call to read it in, say) counts as none */
+    if (gnss_state < 0 || (gnss_state > 0 && (uint32_t)(now - gnss_ms) < GNSS_FRESH_MS)) {
+        row->gnss_state = gnss_state;
+        row->gnss = gnss;
+        row->gnss_age_s = (now - gnss_ms) / 1000;
+    }
+    row->relay = tun_connected(&tun);
+    row->rtt_ms = tun.rtt_ms;
+    row->loss_permille = tun_loss_permille(&tun);
+    row->data_kb = (uint32_t)(data_bytes / 1024);
+    row->gcs = tun.gcs_present;
+    row->fc = position;
+    row->now_ms = now;
+    row->rail_mv = battery_mv;
+    row->cell_pct = battery_pct;
+    row->voice = !tun.voice_on                                ? 0
+                 : (tun.ping_flags & TUN_PING_SPEAKING)       ? 2
+                 : (tun.ping_flags & TUN_PING_VOICE_FAILED)   ? 3
+                                                              : 1;
+    xSemaphoreGive(lock);
+    row->chip_c = board_chip_temp();
+}
+
+/* ---- logs over 4G (fileout.h), from the flight log's card */
+
+static int files_list_cb(void *ctx, unsigned first, file_entry_t *out, unsigned max, unsigned *total)
+{
+    return sdlog_list(first, out, max, total);
+}
+
+static int files_open_cb(void *ctx, const char *name, uint32_t *size)
+{
+    return sdlog_open(&file_4g, name, size);
+}
+
+static bool files_read_cb(void *ctx, uint32_t offset, uint8_t *buf, size_t len)
+{
+    return sdlog_read(&file_4g, offset, buf, len);
+}
+
+static void files_close_cb(void *ctx)
+{
+    sdlog_close(&file_4g);
+}
+
+static bool files_send_cb(void *ctx, uint8_t type, const uint8_t *body, size_t len)
+{
+    xSemaphoreTake(lock, portMAX_DELAY);
+    bool sent = tun_send_packet(&tun, type, body, len);
+    xSemaphoreGive(lock);
+    return sent;
+}
+
+static void files_task(void *arg)
+{
+    file_packet_t p;
+    for (;;) {
+        TickType_t wait = fileout_busy(&files) ? pdMS_TO_TICKS(10) : portMAX_DELAY;
+        while (xQueueReceive(file_packets, &p, wait) == pdTRUE) {
+            fileout_input(&files, p.type, p.body, p.len, now_ms());
+            wait = 0;
+        }
+        xSemaphoreTake(lock, portMAX_DELAY);
+        bool photo = snap_busy(&snap); /* a photo goes first */
+        uint16_t rtt = tun.rtt_ms;
+        float cap = photo_cap();
+        xSemaphoreGive(lock);
+        if (!photo && fileout_poll(&files, now_ms(), rtt, cap)) {
+            const char *how = files.last_complete ? "sent" : "stopped";
+            ESP_LOGI(TAG, "log %s %s over 4G (%" PRIu32 " bytes)", files.last_name, how, files.last_bytes);
+            sdlog_event("log %s %s over 4G", files.last_name, how);
+        }
     }
 }
 
@@ -558,6 +729,16 @@ void bridge_start(void)
     xTaskCreate(camera_task, "camera", 5120, NULL, 5, NULL);
 #endif
     snap_init(&snap, &tun, &snap_config);
+    file_packets = xQueueCreate(FILE_PACKETS, sizeof(file_packet_t));
+    const file_config_t files_config = {
+        .list = files_list_cb,
+        .open = files_open_cb,
+        .read = files_read_cb,
+        .close = files_close_cb,
+        .send = files_send_cb,
+    };
+    fileout_init(&files, &files_config);
+    xTaskCreate(files_task, "logs_4g", 4096, NULL, 6, NULL);
 
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, on_ip_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_LOST_IP, on_ip_event, NULL));

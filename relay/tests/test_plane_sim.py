@@ -64,6 +64,7 @@ class Ground:
         self.gcs_inbox = []
         self.fc_inbox = bytearray()
         self.fc_clients = []
+        self.fc_silent = False  # the fake flight controller stops talking
         self.relay_port, self.fc_port = self.run(self._start())
 
     def run(self, coro, timeout=5.0):
@@ -91,8 +92,9 @@ class Ground:
         async def talk():
             seq = 0
             while True:
-                writer.write(fc_telemetry(seq))
-                seq += 4
+                if not self.fc_silent:
+                    writer.write(fc_telemetry(seq))
+                    seq += 4
                 await asyncio.sleep(0.05)
 
         task = asyncio.ensure_future(talk())
@@ -541,7 +543,7 @@ class WindowTest(unittest.TestCase):
             win = root = None
             gc.collect()
 
-    def test_led_red_yellow_green_blue(self):
+    def test_led_red_yellow_purple_blue(self):
         ground = Ground()
         self.addCleanup(ground.close)
         plane = plane_sim.Plane(("127.0.0.1", ground.relay_port), KEY_V, fc_port=ground.fc_port)
@@ -557,20 +559,25 @@ class WindowTest(unittest.TestCase):
 
         try:
             with mock.patch.object(plane_sim, "STARTUP_QUICK", (0.6, 0.3, 0.3)), \
-                    mock.patch.object(mr, "LINK_TIMEOUT", 2.5):
+                    mock.patch.object(mr, "LINK_TIMEOUT", 2.5), mock.patch.object(plane_sim, "FC_SILENT", 1.0):
                 win.toggle_lte(True)
                 win.toggle_battery(True)
                 wait_for(self, lambda: ui.RED in seen, "red while there is no mobile data", pump=pump)
-                wait_for(self, lambda: win.lte_led.color == ui.BLUE, "blue: connected, a GCS is there", pump=pump)
+                wait_for(self, lambda: win.lte_led.color == ui.BLUE, "blue: ready to fly", pump=pump)
 
                 def gcs_watches(on):  # like MavLTE with both switches off
                     ground.gcs.ping_flags = mr.PING_FLAG_WATCHING if on else 0
                     ground.gcs.ping_now()
 
                 ground.loop.call_soon_threadsafe(gcs_watches, True)
-                wait_for(self, lambda: win.lte_led.color == ui.GREEN, "green: connected, no GCS", pump=pump)
+                wait_for(self, lambda: not win.plane.modem.client.gcs_present, "no GCS", pump=pump)
+                self.assertEqual(win.lte_led.color, ui.BLUE)  # ready to fly, a GCS connected or not
                 ground.loop.call_soon_threadsafe(gcs_watches, False)
-                wait_for(self, lambda: win.lte_led.color == ui.BLUE, "blue again", pump=pump)
+                ground.fc_silent = True
+                wait_for(self, lambda: win.lte_led.color == plane_sim.PURPLE, "purple: the flight controller is silent",
+                         pump=pump)
+                ground.fc_silent = False
+                wait_for(self, lambda: win.lte_led.color == ui.BLUE, "blue: it talks again", pump=pump)
                 ground.loop.call_soon_threadsafe(setattr, ground.relay, "keys", {})  # the relay stops answering
                 wait_for(self, lambda: win.lte_led.color == plane_sim.YELLOW, "yellow: no answer from the relay",
                          pump=pump)

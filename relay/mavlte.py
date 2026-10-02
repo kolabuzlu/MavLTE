@@ -11,7 +11,8 @@ where the LTE module's own GNSS puts the aircraft, live or last known; Map shows
 (Esri World Imagery) with its track. The Voice
 switch (the locator voice) sounds the speaker on the aircraft's board (a two-tone alarm) until it
 is switched off, to find it in the last metres; the relay keeps the switch, also while the
-aircraft is offline.
+aircraft is offline. ☰ → Flight logs lists the flight log's files on the SD card in the aircraft's
+LTE module and copies them into Documents\\MavLTE\\Logs, over 4G or over the board's USB cable.
 
     python mavlte.py            (or double-click MavLTE.pyw, or run MavLTE.exe: build_release.py)
 
@@ -44,6 +45,7 @@ from tkinter import messagebox, ttk
 from typing import Callable, Dict, List, Optional, Tuple
 
 import aircraft_card
+import boardusb
 import maptiles
 import mavrelay as mr
 from aircraft_card import SIZE_NAMES, photo_caption, photo_files, photo_meta
@@ -165,14 +167,14 @@ def parse_address(host: str, port: str) -> Tuple[str, int]:
 # Photos
 
 
-def pictures_folder() -> str:
-    """The user's Pictures folder, where Windows keeps it (in OneDrive, say)."""
+def known_folder(folder_id: str, name: str) -> str:
+    """One of the user's folders, where Windows keeps it (in OneDrive, say)."""
     if sys.platform == "win32":
         class GUID(ctypes.Structure):
             _fields_ = [("a", ctypes.c_uint32), ("b", ctypes.c_uint16), ("c", ctypes.c_uint16),
                         ("d", ctypes.c_ubyte * 8)]
 
-        u = uuid.UUID("33E28130-4E1E-4676-835A-98395C3BC3BB")  # FOLDERID_Pictures
+        u = uuid.UUID(folder_id)
         guid = GUID(u.time_low, u.time_mid, u.time_hi_version, (ctypes.c_ubyte * 8)(*u.bytes[8:]))
         path = ctypes.c_wchar_p()
         try:
@@ -183,7 +185,16 @@ def pictures_folder() -> str:
                     ctypes.windll.ole32.CoTaskMemFree(path)
         except (AttributeError, OSError):
             pass
-    return os.path.join(os.path.expanduser("~"), "Pictures")
+    return os.path.join(os.path.expanduser("~"), name)
+
+
+def pictures_folder() -> str:
+    return known_folder("33E28130-4E1E-4676-835A-98395C3BC3BB", "Pictures")  # FOLDERID_Pictures
+
+
+def logs_folder() -> str:
+    """Where the flight logs go: Documents\\MavLTE\\Logs."""
+    return os.path.join(known_folder("FDD39AD0-238F-46AF-ADB4-6C85480369C7", "Documents"), APP, "Logs")
 
 
 def reveal(path: str) -> None:
@@ -253,6 +264,14 @@ class AgentRunner:
         """Switches the aircraft's locator voice. False while there is no session with the relay."""
         async def go() -> bool:
             return self.agent is not None and self.agent.set_voice(on)
+
+        return self._call(go())
+
+    def files(self, use: Callable[[mr.FileFetcher], bool]) -> bool:
+        """use(the agent's FileFetcher), on the agent's loop: its list(), get() or stop(). False without an agent, or
+        what use() returns."""
+        async def go() -> bool:
+            return self.agent is not None and use(self.agent.files)
 
         return self._call(go())
 
@@ -866,6 +885,477 @@ class MapWindow(tk.Toplevel):
         self.follow_button.configure(style="Accent.TButton" if self.following else "TButton")
 
 
+# ---------------------------------------------------------------------------------------------
+# Flight logs (README, "Flight log")
+
+Entry = Tuple[str, int, int, int]  # a log file on the aircraft's card: name, bytes, first and last time (unix s)
+NO_BOARD = ("No MavLTE board on a USB port. Plug the board's USB-C into this computer: unplug the BEC first, "
+            "as USB-C and the board's 5V pin are one supply.")
+
+
+def log_copy_name(name: str, start: int) -> str:
+    """The copy's name: when the log began (this computer's time), then its name on the card, as
+    "2026-10-02 12-35 LOG00012.csv"; just "LOG00012.csv" if the board never knew the time."""
+    stem = name[:-4] if name.upper().endswith(".CSV") else name
+    when = time.strftime("%Y-%m-%d %H-%M ", time.localtime(start)) if start else ""
+    return f"{when}{stem}.csv"
+
+
+def size_text(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n / 1024 / 1024:.1f} MB"
+
+
+def length_text(start: int, end: int) -> str:
+    if not start or end < start:
+        return ""
+    s = end - start
+    if s < 60:
+        return f"{s} s"
+    if s < 3600:
+        return f"{s // 60} min"
+    return f"{s // 3600} h {s % 3600 // 60:02d} min"
+
+
+class AirLogs:
+    """The aircraft's log files over 4G, through the relay: the agent's FileFetcher. Its callbacks come on the agent's
+    thread."""
+
+    def __init__(self, runner: AgentRunner) -> None:
+        self.runner = runner
+        self.done: Optional[Callable[[bool, str], None]] = None  # the download going on
+
+    def list(self, first: int, done: Callable[[Optional[List[Entry]], int, str], None]) -> Optional[str]:
+        """Asks; why it cannot, or None."""
+        if not self.runner.running:
+            return "Not connected: set the relay server and key first (☰ → Settings)"
+        if not self.runner.files(lambda files: files.list(first, done)):
+            return "Not connected to the relay (yet)"
+        return None
+
+    def get(self, name: str, offset: int, write: Callable[[int, bytes], None], progress: Callable[[int, int], None],
+            done: Callable[[bool, str], None]) -> Optional[str]:
+        def ended(ok: bool, problem: str) -> None:
+            self.done = None
+            done(ok, problem)
+
+        self.done = ended
+        if not self.runner.running or not self.runner.files(lambda files: files.get(name, offset, write, progress,
+                                                                                      ended)):
+            self.done = None
+            return "Not connected to the relay"
+        return None
+
+    def stop(self) -> None:
+        def stop(files: mr.FileFetcher) -> bool:
+            files.stop()
+            done, self.done = self.done, None
+            if done is not None:  # (the fetcher says nothing more of a download it was told to stop)
+                done(False, "stopped")
+            return True
+
+        if self.runner.running:
+            self.runner.files(stop)
+
+    def close(self) -> None:
+        self.stop()
+
+
+class UsbLogs:
+    """The board's log files over its USB cable (boardusb.py): the port, in a thread of its own, opened when first
+    needed and closed with this. Its callbacks come on that thread."""
+
+    def __init__(self) -> None:
+        self.jobs: "queue.Queue[Optional[tuple]]" = queue.Queue()
+        self.stopped = threading.Event()
+        self.link: Optional[boardusb.BoardLink] = None
+        threading.Thread(target=self._run, name="usb-logs", daemon=True).start()
+
+    def list(self, first: int, done: Callable[[Optional[List[Entry]], int, str], None]) -> Optional[str]:
+        self.jobs.put(("list", first, done))
+        return None
+
+    def get(self, name: str, offset: int, write: Callable[[int, bytes], None], progress: Callable[[int, int], None],
+            done: Callable[[bool, str], None]) -> Optional[str]:
+        self.stopped.clear()
+        self.jobs.put(("get", name, offset, write, progress, done))
+        return None
+
+    def stop(self) -> None:
+        self.stopped.set()
+
+    def close(self) -> None:
+        self.stopped.set()
+        self.jobs.put(None)
+
+    @property
+    def where(self) -> str:
+        link = self.link
+        return f"{link.port}, board firmware {link.version}" if link is not None else ""
+
+    def _connect(self) -> boardusb.BoardLink:
+        if self.link is not None:
+            return self.link
+        if boardusb.serial is None:
+            raise boardusb.UsbError("Over USB, MavLTE needs pyserial: pip install pyserial")
+        problems = []
+        for port in boardusb.board_ports():
+            link = boardusb.BoardLink(port)
+            try:
+                link.open()
+            except boardusb.UsbError as exc:
+                problems.append(str(exc))
+                continue
+            log.info("flight logs over USB: %s, board firmware %s", port, link.version)
+            self.link = link
+            return link
+        raise boardusb.UsbError("; ".join(problems) if problems else NO_BOARD)
+
+    def _run(self) -> None:
+        while True:
+            job = self.jobs.get()
+            if job is None:
+                if self.link is not None:
+                    self.link.close()
+                return
+            kind, *args = job
+            try:
+                link = self._connect()
+                if kind == "list":
+                    entries, total = link.list(args[0])
+                    args[1](entries, total, "")
+                else:
+                    name, offset, write, progress, done = args
+                    link.get(name, offset, write, progress, self.stopped)
+                    done(True, "")
+            except boardusb.UsbError as exc:
+                if exc.fatal and self.link is not None:  # the cable pulled out, say: open it again next time
+                    self.link.close()
+                    self.link = None
+                if kind == "list":
+                    args[1](None, 0, str(exc))
+                else:
+                    args[4](False, str(exc))
+
+
+class LogsWindow(tk.Toplevel):
+    """The aircraft's flight logs (README, "Flight log"): the files on the SD card in its LTE module, newest first,
+    listed and copied into Documents\\MavLTE\\Logs over 4G (through the relay) or over the board's USB cable. A copy
+    that stopped short, or of a file that has grown since (the one being written), goes on from where it ends."""
+
+    SOURCES = ("4G", "USB cable")
+    COLUMNS = (("file", "File", 110), ("started", "Started", 170), ("length", "Length", 90), ("size", "Size", 80),
+               ("here", "Here", 90))
+    QUIET = 45.0  # s without a byte: a download is given up (its source went away)
+
+    def __init__(self, app: "App") -> None:
+        super().__init__(app.root)
+        self.app = app
+        s, pad = app.scale, round(8 * app.scale)
+        self.configure(bg=BG)
+        if app.icon is not None:
+            self.iconphoto(False, app.icon)
+        self.title(f"{app.settings.name} · {APP} flight logs")
+        self.events: "queue.Queue[Callable[[], None]]" = queue.Queue()  # the sources' callbacks, run here
+        self.source: Optional[object] = None
+        self.entries: List[Entry] = []
+        self.total = 0
+        self.listing = False
+        self.download: Optional[dict] = None  # the copy being made
+        self.waiting: List[Entry] = []  # to copy after it
+
+        top = tk.Frame(self, bg=SURFACE)
+        top.pack(fill="x")
+        row = tk.Frame(top, bg=SURFACE)
+        row.pack(fill="x", padx=pad, pady=(pad, round(4 * s)))
+        tk.Label(row, text="From", bg=SURFACE, fg=MUTED, font=app.font).pack(side="left")
+        self.from_ = Segments(row, app, self.SOURCES, 0, self.use)
+        self.from_.pack(side="left", padx=(pad, 0))
+        ttk.Button(row, text="Refresh", command=self.refresh).pack(side="right")
+        self.where = tk.Label(top, text="", bg=SURFACE, fg=DIM, font=app.font_small, anchor="w", justify="left",
+                              wraplength=round(560 * s))
+        self.where.pack(fill="x", padx=pad, pady=(0, pad))
+
+        bottom = tk.Frame(self, bg=SURFACE)
+        bottom.pack(side="bottom", fill="x")
+        buttons = tk.Frame(bottom, bg=SURFACE)
+        buttons.pack(side="right", padx=pad, pady=pad)
+        self.more_button = ttk.Button(buttons, text="More", command=self.more)
+        self.more_button.pack(side="left")
+        ttk.Button(buttons, text="Folder", command=self.open_folder).pack(side="left", padx=(round(6 * s), 0))
+        self.stop_button = ttk.Button(buttons, text="Stop", command=self.stop)
+        self.stop_button.pack(side="left", padx=(round(6 * s), 0))
+        self.get_button = ttk.Button(buttons, text="Download", style="Accent.TButton", command=self.download_selected)
+        self.get_button.pack(side="left", padx=(round(6 * s), 0))
+        left = tk.Frame(bottom, bg=SURFACE)
+        left.pack(side="left", fill="both", expand=True, padx=(pad, 0), pady=pad)
+        self.status = tk.Label(left, text="", bg=SURFACE, fg=DIM, font=app.font_small, anchor="w", justify="left",
+                               wraplength=round(300 * s))
+        self.status.pack(fill="x")
+        # as wide as the space beside the buttons: a long text wraps instead of widening the window
+        left.bind("<Configure>", lambda e: self.status.configure(wraplength=max(100, e.width - 4)))
+        self.bar_h = max(3, round(3 * s))
+        self.bar = tk.Canvas(left, width=1, height=self.bar_h, bg=SURFACE, highlightthickness=0)
+        self.bar.pack(fill="x", pady=(round(3 * s), 0))
+        self.geometry(f"{round(700 * s)}x{round(440 * s)}")
+        self.minsize(round(560 * s), round(300 * s))
+
+        ttk.Style(self).configure("Treeview", rowheight=round(22 * s), font=app.font)
+        ttk.Style(self).configure("Treeview.Heading", font=app.font_small)
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(body, columns=[c[0] for c in self.COLUMNS], show="headings", height=12,
+                                 selectmode="extended")
+        for key, heading, width in self.COLUMNS:
+            self.tree.heading(key, text=heading, anchor="w")
+            self.tree.column(key, width=round(width * s), anchor="w", stretch=key == "started")
+        scroll = ttk.Scrollbar(body, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.bind("<Double-1>", lambda _e: self.open_or_download())
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._buttons())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        dark_title_bar(self)
+        self.job = self.after(100, self._tick)
+        self.use(0)
+
+    def destroy(self) -> None:
+        if getattr(self, "job", None):
+            self.after_cancel(self.job)
+        if self.source is not None:
+            self.source.close()
+            self.source = None
+        if self.download is not None:
+            self.download["file"].close()
+            self.download = None
+        super().destroy()
+
+    # -- the source
+
+    def use(self, index: int) -> None:
+        """4G or the USB cable."""
+        self.stop()
+        if self.source is not None:
+            self.source.close()
+        self.source = AirLogs(self.app.runner) if index == 0 else UsbLogs()
+        self.from_.select(index)
+        self.entries, self.total, self.listing = [], 0, False
+        self._fill()
+        self.where.configure(text="Through the relay, from the SD card in the aircraft's LTE module. " + self._goes()
+                             if index == 0 else "Over the board's USB cable. " + NO_BOARD.split(". ", 1)[1])
+        self.refresh()
+
+    @staticmethod
+    def _goes() -> str:
+        """Where the copies go, inside the user's folder without it: "Documents\\\\MavLTE\\\\Logs"."""
+        folder = logs_folder()
+        try:
+            inside = os.path.relpath(folder, os.path.expanduser("~"))
+        except ValueError:  # on another drive
+            inside = ".."
+        return f"Copies go to {folder if inside.startswith('..') else inside}."
+
+    def refresh(self) -> None:
+        if not self.listing and self.download is None:
+            self.entries, self.total = [], 0
+            self._list(0)
+
+    def more(self) -> None:
+        if not self.listing and len(self.entries) < self.total:
+            self._list(len(self.entries))
+
+    def _list(self, first: int) -> None:
+        source = self.source
+        self.listing = True
+        self._show("Asking the aircraft for its files…" if isinstance(source, AirLogs)
+                   else "Looking for the board on the USB ports…")
+        problem = source.list(first, lambda entries, total, problem: self.events.put(
+            lambda: self._listed(source, first, entries, total, problem)))
+        if problem:
+            self.listing = False
+            self._show(problem, RED)
+        self._buttons()
+
+    def _listed(self, source, first: int, entries: Optional[List[Entry]], total: int, problem: str) -> None:
+        if source is not self.source:  # from before a switch
+            return
+        self.listing = False
+        if entries is None:
+            self._show(problem, RED)
+        else:
+            self.entries = self.entries[:first] + entries
+            self.total = total
+            self._show(f"{total} file{'s' if total != 1 else ''} on the card" + (
+                f", the newest {len(self.entries)} shown" if len(self.entries) < total else "") if total else
+                "No log files on the card yet")
+            if isinstance(source, UsbLogs):
+                self.where.configure(text=f"Over the board's USB cable: {source.where}. {self._goes()}")
+        self._fill()
+        self._buttons()
+
+    # -- the list
+
+    def _copy(self, entry: Entry) -> Tuple[str, int]:
+        """Where the copy of entry goes, and how much of it is there."""
+        path = os.path.join(logs_folder(), log_copy_name(entry[0], entry[2]))
+        try:
+            return path, os.path.getsize(path)
+        except OSError:
+            return path, 0
+
+    def _fill(self) -> None:
+        selected = {self.tree.set(item, "file") for item in self.tree.selection()}
+        self.tree.delete(*self.tree.get_children())
+        for entry in self.entries:
+            name, size, start, end = entry
+            _, have = self._copy(entry)
+            here = "" if not have else "saved" if have >= size else f"{have * 100 // max(1, size)} %"
+            started = time.strftime("%a %d %b %Y  %H:%M", time.localtime(start)) if start else "time unknown"
+            item = self.tree.insert("", "end", values=(name, started, length_text(start, end), size_text(size), here))
+            if name in selected:
+                self.tree.selection_add(item)
+
+    def _selected(self) -> List[Entry]:
+        names = {self.tree.set(item, "file") for item in self.tree.selection()}
+        return [entry for entry in self.entries if entry[0] in names]
+
+    def _buttons(self) -> None:
+        idle = self.download is None
+        self.get_button.state(["!disabled"] if idle and self.entries else ["disabled"])
+        self.stop_button.state(["disabled"] if idle else ["!disabled"])
+        self.more_button.state(["!disabled"] if idle and not self.listing and len(self.entries) < self.total
+                               else ["disabled"])
+
+    # -- copies
+
+    def download_selected(self) -> None:
+        """Copies the files selected (the newest if none is), one after another."""
+        if self.download is not None:
+            return
+        self.waiting = self._selected() or self.entries[:1]
+        self._next()
+
+    def open_or_download(self) -> None:
+        chosen = self._selected()
+        if not chosen:
+            return
+        path, have = self._copy(chosen[0])
+        if have and have >= chosen[0][1]:
+            open_file(path)
+        elif self.download is None:
+            self.waiting = chosen[:1]
+            self._next()
+
+    def _next(self) -> None:
+        if not self.waiting or self.source is None:
+            self._buttons()
+            return
+        entry = self.waiting.pop(0)
+        path, have = self._copy(entry)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            f = open(path, "ab")
+        except OSError as exc:
+            self.waiting.clear()
+            self._show(f"Cannot write {path}: {exc.strerror or exc}", RED)
+            self._buttons()
+            return
+        d = {"entry": entry, "path": path, "file": f, "from": have, "have": have, "size": entry[1],
+             "t0": time.monotonic(), "news": time.monotonic()}
+
+        def write(offset: int, data: bytes) -> None:  # on the source's thread, in order
+            try:
+                f.write(data)
+            except ValueError:  # closed: the window went
+                pass
+
+        def progress(have_: int, size: int) -> None:
+            d["have"], d["size"], d["news"] = have_, size, time.monotonic()
+
+        self.download = d
+        source = self.source
+        problem = source.get(entry[0], have, write, progress,
+                             lambda ok, problem: self.events.put(lambda: self._done(d, ok, problem)))
+        if problem:
+            self._done(d, False, problem)
+        self._buttons()
+
+    def stop(self) -> None:
+        self.waiting.clear()
+        if self.download is not None and self.source is not None:
+            self.source.stop()
+
+    def _done(self, d: dict, ok: bool, problem: str) -> None:
+        if d is not self.download:
+            return
+        self.download = None
+        d["file"].close()
+        name = d["entry"][0]
+        if ok:
+            got = d["have"] - d["from"]
+            self._show(f"{name} saved ({size_text(d['have'])}" + (f", {size_text(got)} new" if d["from"] and got
+                                                                   else "") + "): Folder shows it", GREEN)
+            self.entries = [(e[0], max(e[1], d["size"]), e[2], e[3]) if e[0] == name else e for e in self.entries]
+        elif problem == "stopped":
+            self._show(f"Stopped: {size_text(d['have'])} of {name} here; Download goes on from there.", AMBER)
+        else:
+            self.waiting.clear()
+            self._show(f"{name}: {problem}", RED)
+        self._fill()
+        self._next()
+
+    def open_folder(self) -> None:
+        chosen = self._selected()
+        if chosen:
+            path, have = self._copy(chosen[0])
+            if have:
+                reveal(path)
+                return
+        folder = logs_folder()
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as exc:
+            self._show(f"Cannot make {folder}: {exc.strerror or exc}", RED)
+            return
+        open_file(folder)
+
+    # -- four times a second
+
+    def _tick(self) -> None:
+        while True:
+            try:
+                self.events.get_nowait()()
+            except queue.Empty:
+                break
+        d = self.download
+        if d is not None:
+            now = time.monotonic()
+            if now - d["news"] > self.QUIET:  # its source went away (the agent restarted with new settings, say)
+                if self.source is not None:
+                    self.source.stop()
+                self._done(d, False, "no answer: the download stopped")
+            else:
+                rate = (d["have"] - d["from"]) / max(0.5, now - d["t0"])
+                self._show(f"{d['entry'][0]}: {size_text(d['have'])} of {size_text(d['size'])}, "
+                           f"{rate / 1024:.1f} KB/s", TEXT, d["have"] / max(1, d["size"]))
+        elif self.bar.find_all():
+            self.bar.delete("all")
+        self.job = self.after(250, self._tick)
+
+    def _show(self, text: str, color: str = DIM, fraction: Optional[float] = None) -> None:
+        if self.status.cget("text") != text or self.status.cget("fg") != color:
+            self.status.configure(text=text, fg=color)
+        self.bar.delete("all")
+        if fraction is not None:
+            w = self.bar.winfo_width()
+            self.bar.create_rectangle(0, 0, w, self.bar_h, fill=FIELD, outline="")
+            self.bar.create_rectangle(0, 0, round(w * min(1.0, fraction)), self.bar_h, fill=ACCENT, outline="")
+
+
 class SettingsDialog(tk.Toplevel):
     def __init__(self, app: "App") -> None:
         super().__init__(app.root)
@@ -966,6 +1456,12 @@ def setup_style(root: tk.Tk) -> None:
     style.configure("Vertical.TScrollbar", background=FIELD, troughcolor=LOG_BG, bordercolor=LOG_BG,
                     arrowcolor=MUTED, lightcolor=FIELD, darkcolor=FIELD, gripcount=0)
     style.map("Vertical.TScrollbar", background=[("active", "#3a3b3e")])
+    style.configure("Treeview", background=LOG_BG, fieldbackground=LOG_BG, foreground=TEXT, bordercolor=BORDER,
+                    lightcolor=LOG_BG, darkcolor=LOG_BG)
+    style.map("Treeview", background=[("selected", "#2c4a33")], foreground=[("selected", TEXT)])
+    style.configure("Treeview.Heading", background=FIELD, foreground=MUTED, bordercolor=BORDER, lightcolor=FIELD,
+                    darkcolor=FIELD, relief="flat")
+    style.map("Treeview.Heading", background=[("active", "#3a3b3e")])
 
 
 class App:
@@ -988,6 +1484,7 @@ class App:
         self.track = aircraft_card.Track()  # where the aircraft has been since MavLTE started, for the map
         self.tiles = maptiles.TileLoader()
         self.map_window: Optional[MapWindow] = None
+        self.logs_window: Optional[LogsWindow] = None
         self.fix_live = False  # the newest fix is live (the aircraft reports), not the last known
         self.shown_where: Tuple[str, str] = ("", TEXT)  # Position's text and colour, for the map too
         self.lan: Optional[str] = None  # this computer's address on its network, for the cards
@@ -1041,6 +1538,7 @@ class App:
         self.menu.add_command(label="Settings…", command=self.open_settings)
         self.menu.add_command(label="Show log", command=self.toggle_log)
         self.menu.add_command(label="Photo folder", command=self.open_photo_folder)
+        self.menu.add_command(label="Flight logs…", command=self.open_logs)
         self.menu.add_separator()
         self.menu.add_command(label="Exit", command=self.close)
         menu_button.bind("<Button-1>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
@@ -1249,6 +1747,13 @@ class App:
 
     def open_settings(self) -> None:
         SettingsDialog(self)
+
+    def open_logs(self) -> None:
+        if self.logs_window is None or not self.logs_window.winfo_exists():
+            self.logs_window = LogsWindow(self)
+        self.logs_window.deiconify()
+        self.logs_window.lift()
+        self.logs_window.focus_set()
 
     def toggle_log(self) -> None:
         if self.log_frame.winfo_ismapped():

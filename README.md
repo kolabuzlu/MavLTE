@@ -46,6 +46,10 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
 - **On your phone**: the app's *Aircraft* panel also comes as a web page from the relay server,
   password protected, for the search with only a phone in your pocket: the link, the position
   on the moving map, the voice switch and Snapshot.
+- **Flight log**: with a microSD card in the board's slot (V2 boards), a CSV line a second: the
+  module's GNSS, the mobile network and its signal (cell, band, RSRP, SINR), the relay link and
+  the mobile data used, the flight controller's telemetry, the board's power and what happened.
+  The MavLTE app copies the files over the board's USB cable or over 4G, so the card can stay in.
 
 | Folder | What |
 |---|---|
@@ -62,6 +66,7 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
 5. [MavLTE app and Mission Planner](#5-mavlte-app-and-mission-planner) on your laptop.
 6. [The web page on your phone](#6-the-web-page-on-your-phone), if you like: the *Aircraft* panel
    without the laptop.
+7. [The flight log](#7-the-flight-log), if you like: a microSD card in the board.
 
 Before the board arrives you can try everything else with ArduPilot SITL on your PC, in one
 command: see [Bench tests](#bench-tests).
@@ -121,6 +126,7 @@ the chip to tell them apart and prints `board version V1` or `V2` at start-up.
 | Locator | on, every 5 s |
 | Locator voice | on: a two-tone alarm. Or a spoken phrase, `Mav L T E here.` by default (letters and digits written apart are said one by one: a phone number written `0 5 3 2 ...` tells whoever finds the aircraft whom to call) |
 | Camera | on (off, or no camera fitted: the aircraft answers that it has none) |
+| Flight log on the SD card | on (V2 boards; without a card the firmware runs as before) |
 
 The rest (modem UART speed, batching, sending with no GCS connected, JPEG quality) can stay as
 they are; each has a help text. PlatformIO keeps your settings, including the key, in
@@ -185,16 +191,23 @@ so that line and the modem's firmware line are worth including in a report if po
 
 Once a minute the bridge logs its counters: relay state, round-trip time, bytes each way.
 
-**The RGB LED** on the board shows the state without a laptop, from worst to best red, yellow,
-green, blue. Green and blue match the Available and Connected LEDs in the MavLTE app:
+**The RGB LED** on the board (beside the Waveshare logo) shows the state without a laptop, from
+worst to best red, yellow, purple, blue:
 
 | LED | Meaning |
 |---|---|
 | red, blinking | no mobile data yet: modem starting, searching for the network |
 | red | modem, SIM or network problem; the log says which (it tries again by itself) |
 | yellow | mobile data up, but the relay does not answer (yet) |
-| green | connected to the relay, no GCS connected yet (telemetry held back) |
-| blue | a GCS is connected and the telemetry flows |
+| purple | connected to the relay, but the flight controller is silent: no MAVLink HEARTBEAT for 10 s (check the wiring, the baud rate and the port's protocol) |
+| blue | ready to fly: the relay and the flight controller, a GCS connected or not |
+
+At power-on it first shows each colour once, red, yellow, purple and blue, a second each (a lamp
+test), while the modem starts up.
+
+The board's other lights are not the firmware's: the blue one is power, and the red one at the
+antenna end is the modem's own network light (steady while it searches, flashing once
+registered). The red part at the top, beside the logo, is the ESP32's ceramic antenna, not a light.
 
 ## 3. Wiring and power
 
@@ -366,6 +379,7 @@ server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
 - Photos go to **Pictures\MavLTE** (`photo_dir` in `mavrelay.ini` to change it), named by date
   and time, each with a `.json` beside it holding the same notes. Photos taken while the app was
   closed (asked for from another laptop, say) arrive by themselves when it connects.
+- **☰ → Flight logs** copies the aircraft's flight log (see [section 7](#7-the-flight-log)).
 
 The app keeps its settings in the `[gcs]` section of `mavrelay.ini`: `MavLTE.exe` in
 `%LOCALAPPDATA%\MavLTE\mavrelay.ini` (or in a `mavrelay.ini` next to the exe, if you put one
@@ -432,6 +446,49 @@ opens like an app.
   voice and photo asked for on the page. Its settings, in `[web]` in `/etc/mavrelay/mavrelay.ini`
   (then `sudo systemctl restart mavweb`): `name`, the aircraft's name on the page; `photo_dir`;
   `listen`, 127.0.0.1:8090, which only Caddy needs to reach.
+
+## 7. The flight log
+
+With a microSD card in its TF slot, a V2 board writes what it knows to the card once a second, as
+CSV, from power-on to power-off: one file per power-on, `MAVLTE/LOG00001.CSV`, `LOG00002.CSV` and
+so on (a new one after every 16 MB, about 14 hours). An hour takes about 1.3 MB, so a card lasts
+for years; the board never deletes anything and never formats a card. It saves the file every 5
+seconds, so a power cut loses at most the last 5 seconds.
+
+**The card** must be FAT32: the board cannot read exFAT, which cards over 32 GB come with, and
+Windows' own formatting offers FAT32 only up to 32 GB. Format a larger card with a FAT32 tool
+(any cluster size; 32 KB is fine); a 256 GB card works. The board looks for a card every 30
+seconds, so it can also go in while the board runs. V1 boards wire their TF slot differently and
+log nothing.
+
+**Copying the files.** In the MavLTE app, **☰ → Flight logs**: the files on the card, newest
+first, with when each began, how long it ran and its size. **Download** copies the ones
+selected (the newest if none is) into **Documents\MavLTE\Logs**, named by when they began
+(`2026-10-02 12-35 LOG00012.csv`); a copy that stopped short, or of a file that has grown since,
+goes on from where it ends. **Folder** shows the copies. *From*:
+
+- **4G**, through the relay, from wherever the aircraft is: at up to 32 KB/s on LTE (2 KB/s on
+  2G), never while a photo goes, and only as fast as the link carries without holding up the
+  telemetry: a one-hour file takes about a minute on LTE. It needs firmware and relay 1.8.0.
+- **USB cable**, from the board's USB-C socket, the one it is flashed through: at about 65 KB/s,
+  a one-hour file in about 20 seconds, while the board runs on. **Unplug the BEC first**: USB-C
+  and the board's 5V pin are one supply. The app finds the board by itself; while it talks to it,
+  the board's own log on that port stays quiet, so a serial monitor cannot use the port then.
+
+**What a line holds** (an empty field: not known, or older than 5 seconds):
+
+| Columns | What |
+|---|---|
+| `time_utc`, `uptime_s` | UTC time, once the board has it (from the module's GNSS, or the relay's clock when it connects); seconds since power-on |
+| `gnss_fix`, `gnss_sats`, `gnss_lat`, `gnss_lon`, `gnss_alt_m`, `gnss_speed_ms`, `gnss_course`, `gnss_hdop`, `gnss_age_s` | The LTE module's own GNSS (the locator): fix (0 none, 2 2D, 3 3D), satellites, position, altitude above sea level, speed, course, HDOP, age of the reading |
+| `net`, `signal_dbm`, `operator`, `plmn`, `band`, `cell_id`, `rsrp_dbm`, `rsrq_db`, `rssi_dbm`, `sinr_db` | The mobile network: LTE, GSM or NO SERVICE, the signal (AT+CSQ), the operator and its MCC-MNC, the band (`B3`), the serving cell, and on LTE its RSRP, RSRQ, RSSI and SINR |
+| `relay`, `rtt_ms`, `loss_pct`, `data_kb`, `gcs` | Connected to the relay (1/0), round-trip time, downlink packet loss, mobile data used since power-on (with the IP and UDP headers your plan counts), a GCS connected |
+| `fc_heard_s`, `fc_mode`, `fc_armed`, `fc_gps_fix`, `fc_gps_sats`, `fc_lat`, `fc_lon`, `fc_alt_m`, `fc_rel_alt_m`, `fc_heading`, `fc_groundspeed_ms`, `fc_airspeed_ms`, `fc_climb_ms`, `fc_throttle`, `fc_battery_v`, `fc_current_a`, `fc_battery_pct`, `fc_rssi` | The flight controller, from its MAVLink: seconds since its last HEARTBEAT, flight mode (ArduPlane's names), armed, its GPS fix and satellites, position, altitude above sea level and above home, heading, ground speed, airspeed, climb rate, throttle, battery voltage, current and remaining, RC signal (0–254). The messages come at the stream rates of [section 4](#4-ardupilot-parameters) |
+| `chip_c`, `power`, `cell_pct`, `rail_mv` | The ESP32-S3's temperature, the board's power (`ext`: USB or the BEC; `cell`: its 18650), the cell's charge, the rail's voltage |
+| `voice`, `events` | The locator voice (`off`, `on`, `sounding`, `cannot`); what happened in that second: `relay connected; photo 1790933700 sent`, the reason for a restart (`brownout`, `watchdog`) in the first line |
+
+It is the link's own record, beside the flight controller's dataflash log, not instead of it:
+open it in a spreadsheet, or plot it with the coverage along the flight.
 
 ## Bench tests
 
@@ -605,6 +662,9 @@ missed while the app was closed) travel over your laptop's internet.
 | *Voice* says the aircraft's speaker is sounding, but nothing to hear | The speaker plugged into the board's speaker header; the fuselage muffling it (see *Speaker* in section 3). |
 | The web page does not open, or the browser warns about its certificate | TCP ports 80 and 443 open in the provider's firewall; the name points at the server. `journalctl -u caddy` says whether Let's Encrypt gave the certificate. |
 | The web page says `No connection to the server` | The phone's own internet; it tries again by itself. If other sites work, `systemctl status mavweb` on the server. |
+| *Flight logs*: `the aircraft has no SD card it can read` | A card in the TF slot, formatted FAT32 (not exFAT); the ESP32 log says what it found. |
+| *Flight logs*: `No MavLTE board on a USB port` | The board's USB-C to this computer with a data cable (some are charge-only); firmware 1.8.0 or later. Close any serial monitor on its port. |
+| *Flight logs* over 4G: `no answer from the aircraft (firmware before 1.8.0?)` | The aircraft's firmware or the relay is older than 1.8.0: update both. |
 | The moving map stays black | The map's satellite photos come from Esri (server.arcgisonline.com) over the laptop's or phone's own internet. MavLTE's log says `cannot load the map's tiles from Esri` and why; it tries again after half a minute. |
 
 ## Development

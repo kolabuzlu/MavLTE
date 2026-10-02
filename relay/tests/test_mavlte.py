@@ -21,8 +21,10 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
+import boardusb  # noqa: E402
 import maptiles  # noqa: E402
 import mavrelay as mr  # noqa: E402
+from test_boardusb import FakeBoard  # noqa: E402
 from test_mavrelay import KEY_G, KEY_V, v2_frame  # noqa: E402
 
 try:
@@ -49,6 +51,15 @@ def jpeg():
 
 
 JPEG = jpeg()
+
+
+def flight_log(lines, first=1790933700, untimed=0):
+    """A flight log as the board writes it: the header, `untimed` lines before it knew the time, then a line a second."""
+    rows = [b"time_utc,uptime_s,gnss_fix,gnss_sats"] + [b",%d,0,0" % i for i in range(untimed)]
+    for i in range(lines):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(first + i)).encode()
+        rows.append(stamp + b",%d,3,11,41.1234567,28.9876543" % (untimed + i))
+    return b"\n".join(rows) + b"\n"
 
 
 def free_port(kind=socket.SOCK_DGRAM):
@@ -505,6 +516,101 @@ class GuiTest(unittest.TestCase):
         self.pump(lambda: self.text(row.status).startswith("On: it was sounding when last heard"), timeout=10,
                   what="sounding while offline")
         self.assertTrue(row.switch.on)  # the relay keeps the switch
+
+    def logs_window(self, copies):
+        self.app.open_logs()
+        win = self.app.logs_window
+        win.withdraw()
+        return win
+
+    def test_flight_logs_over_4g(self):
+        """☰ → Flight logs: the files on the aircraft's card, copied through the relay; a copy cut short goes on."""
+        app = self.app
+        card, copies = tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, card, True)
+        self.addCleanup(shutil.rmtree, copies, True)
+        newest = flight_log(400, untimed=20)
+        with open(os.path.join(card, "LOG00002.CSV"), "wb") as f:
+            f.write(newest)
+        with open(os.path.join(card, "LOG00001.CSV"), "wb") as f:
+            f.write(flight_log(0, untimed=3))  # no GNSS and no relay that time: no time at all
+        files = mr.FileOutbox(self.vehicle, card, cap=lambda: 64 * 1024)
+        photos = self.outbox
+
+        def on_packet(ptype, body):
+            photos.on_packet(ptype, body)
+            files.on_packet(ptype, body)
+
+        async def pump_files():
+            self.vehicle.on_packet = on_packet
+            while True:
+                await asyncio.sleep(0.02)
+                files.pump(time.monotonic())
+
+        self.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(pump_files()))
+        self.pump(lambda: app.camera.enabled, what="aircraft online")
+        with mock.patch.object(mavlte, "logs_folder", lambda: copies):
+            win = self.logs_window(copies)
+            tree = win.tree
+            self.pump(lambda: len(tree.get_children()) == 2, what="the list")
+            first, second = tree.get_children()
+            self.assertEqual([tree.set(first, c) for c in ("file", "length", "here")], ["LOG00002.CSV", "6 min", ""])
+            start = 1790933700 - 20  # reckoned back to its first line, from before the board knew the time
+            self.assertEqual(tree.set(first, "started"), time.strftime("%a %d %b %Y  %H:%M", time.localtime(start)))
+            self.assertEqual(tree.set(second, "started"), "time unknown")
+            self.assertEqual(win.status.cget("text"), "2 files on the card")
+
+            tree.selection_set(first)
+            win.download_selected()
+            path = os.path.join(copies, mavlte.log_copy_name("LOG00002.CSV", start))
+            self.assertTrue(os.path.basename(path).endswith(" LOG00002.csv"))
+            self.pump(lambda: win.download is None and os.path.exists(path), timeout=15, what="the copy")
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), newest)
+            self.assertEqual(tree.set(tree.get_children()[0], "here"), "saved")
+            self.assertIn("LOG00002.CSV saved", win.status.cget("text"))
+
+            with open(path, "r+b") as f:  # a copy cut short: Download goes on from where it ends
+                f.truncate(10000)
+            win._fill()
+            self.assertEqual(tree.set(tree.get_children()[0], "here"), f"{10000 * 100 // len(newest)} %")
+            tree.selection_set(tree.get_children()[0])
+            win.download_selected()
+            self.pump(lambda: win.download is None, timeout=15, what="the rest")
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), newest)
+            self.assertIn(", ", win.status.cget("text"))  # "... KB new"
+            win.destroy()
+
+    def test_flight_logs_over_usb(self):
+        app = self.app
+        copies = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, copies, True)
+        data = flight_log(300)
+        board = FakeBoard(files={"LOG00003.CSV": data})
+        board.times["LOG00003.CSV"] = (1790933700, 1790933999)
+        found = []
+        real_link = boardusb.BoardLink
+        with mock.patch.object(mavlte, "logs_folder", lambda: copies), \
+                mock.patch.object(boardusb, "board_ports", lambda: list(found)), \
+                mock.patch.object(boardusb, "serial", object()), \
+                mock.patch.object(boardusb, "BoardLink", lambda port: real_link(port, opener=lambda: board)):
+            win = self.logs_window(copies)
+            win.use(1)  # the USB cable: no board on any port yet
+            self.pump(lambda: win.status.cget("text") == mavlte.NO_BOARD, what="no board")
+            found.append("COM99")  # plugged in
+            win.refresh()
+            self.pump(lambda: len(win.tree.get_children()) == 1, what="the list over USB")
+            self.assertIn("COM99, board firmware 1.8.0", win.where.cget("text"))
+            self.assertEqual(win.tree.set(win.tree.get_children()[0], "length"), "4 min")
+            win.download_selected()  # nothing selected: the newest
+            path = os.path.join(copies, mavlte.log_copy_name("LOG00003.CSV", 1790933700))
+            self.pump(lambda: win.download is None and os.path.exists(path), what="the copy over USB")
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), data)
+            win.use(0)  # back to 4G: the port is closed
+            self.pump(lambda: board.closed, what="the port closed")
+            win.destroy()
 
     def test_wrong_key_says_no_answer(self):
         app = self.app

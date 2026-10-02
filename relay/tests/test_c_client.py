@@ -1,4 +1,4 @@
-"""Runs the firmware's C tunnel and snapshot code (firmware/test/host/tunnel_harness) against this relay.
+"""Runs the firmware's C tunnel, snapshot and log code (firmware/test/host/tunnel_harness) against this relay.
 
 Needs make and a C compiler (Linux, macOS or WSL); skipped otherwise.
 """
@@ -163,6 +163,59 @@ class CVehicleTest(unittest.IsolatedAsyncioTestCase):
         stats = dict(item.split("=") for item in out.decode().split())
         self.assertEqual((stats["photos"], stats["bad"]), ("1", "0"))
         self.assertIn("harness: voice on\nharness: voice off", err.decode())
+
+    async def test_c_vehicle_logs(self):
+        """The firmware's log sender (C) lists its card and sends a file through the relay to a GCS agent (Python)."""
+        port = await self.start_server()
+        relay = self.relay
+        self.addCleanup(self.transport.close)
+
+        async def ticker():
+            while True:
+                await asyncio.sleep(0.2)
+                relay.tick(time.monotonic())
+
+        agent = mr.GcsAgent(("127.0.0.1", port), KEY_G)
+        for task in (asyncio.ensure_future(ticker()), asyncio.ensure_future(agent.run())):
+            self.addCleanup(task.cancel)
+        proc = await asyncio.create_subprocess_exec(self.harness, "127.0.0.1", str(port), KEY_V.hex(), "15",
+                                                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        await self.until(lambda: relay.vehicle is not None and agent.client.is_connected)
+        await asyncio.sleep(0.5)
+
+        listed = []
+        self.assertTrue(agent.files.list(0, lambda entries, total, problem: listed.append((entries, total, problem))))
+        await self.until(lambda: listed, timeout=10)
+        self.assertEqual(listed[0], ([("LOG00007.CSV", 60000, 1790000000, 1790003600), ("LOG00006.CSV", 0, 0, 0)], 2,
+                                     ""))
+
+        got, ended = bytearray(), []
+
+        def write(offset, data):
+            self.assertEqual(offset, len(got))
+            got.extend(data)
+
+        self.assertTrue(agent.files.get("LOG00007.CSV", 0, write, lambda have, size: None,
+                                        lambda ok, problem: ended.append((ok, problem))))
+        await self.until(lambda: ended, timeout=12)
+        self.assertEqual(ended[0], (True, ""))
+        self.assertEqual(bytes(got), bytes((i * 31 + 5) & 0xFF for i in range(60000)))
+
+        ended.clear()  # an empty file, and one the card does not have
+        self.assertTrue(agent.files.get("LOG00006.CSV", 0, write, lambda have, size: None,
+                                        lambda ok, problem: ended.append((ok, problem))))
+        await self.until(lambda: ended)
+        self.assertEqual(ended[0], (True, ""))
+        ended.clear()
+        self.assertTrue(agent.files.get("LOG00099.CSV", 0, write, lambda have, size: None,
+                                        lambda ok, problem: ended.append((ok, problem))))
+        await self.until(lambda: ended)
+        self.assertEqual(ended[0], (False, mr.FILE_PROBLEMS[mr.FILE_NOT_FOUND]))
+
+        out, err = await asyncio.wait_for(proc.communicate(), 25)
+        self.assertEqual(proc.returncode, 0, err.decode())
+        stats = dict(item.split("=") for item in out.decode().split())
+        self.assertEqual((stats["logs"], stats["bad"]), ("1", "0"))
 
 
 if __name__ == "__main__":

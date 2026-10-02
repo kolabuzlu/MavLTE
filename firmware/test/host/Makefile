@@ -4,7 +4,8 @@
 CC ?= cc
 CFLAGS ?= -std=c11 -O1 -g -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined
 CORE := ../../main
-SRCS := $(CORE)/sha256.c $(CORE)/mavframe.c $(CORE)/tunnel.c $(CORE)/snapshot.c $(CORE)/mavpos.c $(CORE)/locator.c $(CORE)/alarm.c
+SRCS := $(CORE)/sha256.c $(CORE)/mavframe.c $(CORE)/tunnel.c $(CORE)/snapshot.c $(CORE)/mavpos.c $(CORE)/locator.c $(CORE)/alarm.c \
+        $(CORE)/fileout.c $(CORE)/logrow.c $(CORE)/usbproto.c
 
 all: test_core tunnel_harness
 

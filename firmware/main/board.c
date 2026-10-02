@@ -6,10 +6,13 @@
 #include "esp_efuse.h"
 #include "esp_efuse_table.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "board";
 static board_t board;
+static SemaphoreHandle_t temp_lock; /* the temperature sensor: the bridge and the flight log both read it */
 
 static int board_version(void)
 {
@@ -35,6 +38,7 @@ static int board_version(void)
 const board_t *board_get(void)
 {
     if (!board.version) {
+        temp_lock = xSemaphoreCreateMutex();
         board.version = board_version();
         board.modem_power_gpio = board.version == 1 ? 33 : 21;
         /* pins that are free on the header of each version */
@@ -45,7 +49,7 @@ const board_t *board_get(void)
     return &board;
 }
 
-int8_t board_chip_temp(void)
+static int8_t read_chip_temp(void)
 {
     static temperature_sensor_handle_t sensor;
     static bool failed;
@@ -76,4 +80,15 @@ int8_t board_chip_temp(void)
         return -127;
     }
     return (int8_t)(c < 0.0f ? c - 0.5f : c + 0.5f);
+}
+
+int8_t board_chip_temp(void)
+{
+    if (!temp_lock) {
+        return INT8_MIN;
+    }
+    xSemaphoreTake(temp_lock, portMAX_DELAY);
+    int8_t c = read_chip_temp();
+    xSemaphoreGive(temp_lock);
+    return c;
 }

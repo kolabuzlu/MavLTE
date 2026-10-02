@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "locator.h"
+#include "logrow.h"
 
 #define BRIDGE_RSSI_UNKNOWN 0x7FFF
 #define BRIDGE_RAT_UNKNOWN 0xFF
@@ -37,6 +38,11 @@ uint32_t bridge_relay_packets(void);
 typedef struct {
     bool relay; /* session with the relay */
     bool gcs;   /* the relay says a GCS is connected */
+    bool fc;    /* the flight controller's HEARTBEAT came within LOCATOR_FC_SILENT_S */
 } bridge_state_t;
 
 bridge_state_t bridge_state(void);
+
+/* What the bridge knows, for the flight log's line: the time (once the relay or the GNSS has given it), the module's
+ * GNSS, the relay, the mobile data used, the flight controller, the board's power and the locator voice. */
+void bridge_log_row(log_row_t *row);

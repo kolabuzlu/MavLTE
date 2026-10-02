@@ -35,7 +35,7 @@ corrupts the frames around it.
 | type | name    | direction | session / seq | body |
 |------|---------|-----------|---------------|------|
 | 1    | HELLO   | C → S | 0 / 0 | nonce (8 bytes), then optional UTF-8 info text (≤ 64 bytes) |
-| 2    | WELCOME | S → C | new session / 0 | the 8-byte nonce from the HELLO |
+| 2    | WELCOME | S → C | new session / 0 | the 8-byte nonce from the HELLO, then (since 1.8.0) the server's clock, `unix_ms u64` |
 | 3    | DATA    | C ↔ S | session / seq | MAVLink bytes (whole frames), ≤ 1172 bytes |
 | 4    | PING    | C → S | session / seq | `t_ms u32, rtt_ms u16, rx_loss_permille u16, rssi_dbm i16, rat u8, flags u8` (GCS: bit 0 watching; vehicle: bit 1 sounding, bit 2 cannot sound) |
 | 5    | PONG    | S → C | session / seq | `t_ms u32` (echo), `flags u8` (bit 0: a GCS is connected; to the vehicle, bit 1: sound the speaker) |
@@ -48,6 +48,10 @@ corrupts the frames around it.
 | 12   | SNAP_SYNC | GCS → S | session / seq | `newest_photo_id u32` |
 | 13   | POSITION  | V → S → GCS | session / seq | `gnss_time u32, lat i32, lon i32, alt_mm i32, speed_cms u16, course_cdeg u16, hdop u16, sats u8, fix u8, flags u8, fc_silent_s u16, battery_mv u16, battery_pct u8, time u32, chip_c i8` (see [Locator](#locator)) |
 | 14   | VOICE     | GCS → S | session / seq | `flags u8` (bit 0: on) (see [Locator voice](#locator-voice)) |
+| 15   | FILE_REQ  | GCS → S → V | session / seq | `req_id u16, op u8, offset u32, name` (12 bytes) (see [Logs](#logs)) |
+| 16   | FILE_LIST | V → S → GCS | session / seq | `req_id u16, status u8, files u16, first u16, count u8`, then `count` × (`name` (12 bytes), `bytes u32, start u32, end u32`) |
+| 17   | FILE_DATA | V → S → GCS | session / seq | `req_id u16, status u8, offset u32, size u32`, then up to 1024 bytes of the file |
+| 18   | FILE_ACK  | GCS → S → V | session / seq | `req_id u16, next u32` |
 
 Unknown values are `0xFFFF` for u16 fields, `0x7FFF` for `rssi_dbm` and `0xFF` for `rat`.
 `rat` uses the 3GPP TS 27.007 access technology numbers (0 GSM, 3 EDGE, 7 LTE, ...).
@@ -70,6 +74,10 @@ count up to there goes on counting by itself, until the server drops the session
    starts its sequence numbers at 1 and sends a PING straight away.
 4. The first valid DATA or PING makes the session *active*. A new active vehicle session
    replaces the previous one; up to 8 GCS sessions can be active at once.
+
+Since 1.8.0 the WELCOME also carries the server's clock (unix milliseconds) after the nonce. A
+vehicle without a GNSS time sets its own clock from it, for the times in its log. Clients that do
+not need it ignore it, as older ones do.
 
 Clients PING once a second. A client that hears nothing valid from the server for 10 s drops
 its session and starts over with HELLO. Servers drop active sessions after 120 s of silence
@@ -201,6 +209,45 @@ says a phrase with its text-to-speech).
    the voice is on; bit 2, the vehicle sounds; bit 3, it cannot.
 4. A GCS agent sends VOICE again, once a second, until STATUS shows the switch it asked for, for at
    most 10 s (a server older than 1.5.0 ignores VOICE and never shows it).
+
+## Logs
+
+The aircraft's own log files: the ESP32 firmware writes one to its SD card per power-on, a line a
+second (README, *Flight log*). GCS agents list and download them through the server, which keeps
+nothing of them: it passes each request to the vehicle, and the answers back to the agent that asked.
+
+1. A GCS agent sends FILE_REQ. `op` 1, LIST: the list of files, newest first, from entry `offset`
+   on. `op` 2, GET: the file `name` from byte `offset` on. `op` 3, STOP: the end of a GET. `name`
+   is the file's name on the card (ASCII, NUL-padded to 12 bytes, as `LOG00012.CSV`). The server
+   passes the request to the vehicle under a `req_id` of its own (two agents may use the same
+   one) and the vehicle's answers back under the agent's; it forgets a request 120 s after its
+   last packet. Without an online vehicle it answers at once, with status NO_AIRCRAFT.
+2. LIST: the vehicle answers with one FILE_LIST: how many files the card has, the index of the
+   first entry in this packet, and up to 40 entries: the name, the size in bytes, and the times
+   of the file's first and last line (unix seconds, 0 if unknown). For more, the agent asks again
+   from the next index.
+3. GET: the vehicle answers with FILE_DATA, each with the file's size, the offset and up to 1024
+   bytes of the file from there. The size is the one when the GET came: a file still being
+   written grows, and a later GET from there brings the rest. The vehicle sends at most 32 KB
+   beyond the last offset an ACK showed, paced as photos are and never while a photo goes; with
+   no new ACK for `max(1 s, 2.5 × round trip)` it starts again from the last offset an ACK
+   showed. A GET from the size or beyond gets one FILE_DATA without bytes. A new GET, from any
+   agent, ends the one before, which gets status STOPPED. The vehicle gives up after 30 s
+   without an ACK.
+4. The agent answers FILE_DATA with FILE_ACK `next`: every byte before that offset has come. It
+   ACKs at least five times a second while bytes arrive, keeps only the bytes at `next` and drops
+   the others (go-back-N), and sends its GET again from `next` when nothing has come for a few
+   seconds.
+5. A status other than OK comes without bytes or entries, and ends the request.
+
+Status values: 0 OK, 1 NO_CARD (no SD card, or one the vehicle cannot read), 2 NOT_FOUND,
+3 NO_AIRCRAFT, 4 CARD_ERROR (reading the file failed), 5 STOPPED.
+
+A vehicle or server older than 1.8.0 ignores these packets: the agent hears nothing.
+
+The board also offers the same files on its USB serial port, for MavLTE on a PC beside it: text
+commands and lines, each line of the file's bytes with its CRC-32 (`firmware/main/usbproto.h`,
+`relay/boardusb.py`). That is not part of this protocol.
 
 ## Not provided
 

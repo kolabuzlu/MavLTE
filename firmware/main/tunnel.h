@@ -90,6 +90,10 @@ typedef struct {
     uint16_t rtt_ms;
     int16_t rssi_dbm;
     uint8_t rat;
+    /* the relay's clock, from its last WELCOME (since 1.8.0): unix milliseconds at server_ms_at on ours;
+     * server_ms is 0 if the relay sent none */
+    uint64_t server_ms;
+    uint32_t server_ms_at;
     uint32_t last_rx, last_ping, last_hello, last_roll;
     tun_stats_t stats;
     uint8_t pkt[TUN_MAX_DATAGRAM];

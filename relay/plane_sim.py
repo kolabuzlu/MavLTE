@@ -198,6 +198,8 @@ PLANE_MODES = {0: "MANUAL", 1: "CIRCLE", 2: "STABILIZE", 3: "TRAINING", 4: "ACRO
                22: "QAUTOTUNE", 23: "QACRO", 24: "THERMAL", 25: "LOITER2QLAND", 26: "AUTOLAND"}
 
 YELLOW = "#e6c84a"
+PURPLE = "#c26be0"
+FC_SILENT = 10.0  # s without the flight controller's HEARTBEAT: the board's LED turns purple
 
 log = logging.getLogger("mavrelay.plane")
 
@@ -1199,8 +1201,8 @@ class SimWindow:
         client = m.client if m is not None else None
         session = client is not None and client.session != 0
         # the LED, as on the board (README: "The RGB LED"), from worst to best: red without mobile data
-        # (blinking while it starts and searches), yellow while the relay does not answer, green when
-        # connected but no GCS is (telemetry held back), blue when a GCS is and the telemetry flows
+        # (blinking while it starts and searches), yellow while the relay does not answer, purple when
+        # connected but the flight controller is silent, blue when ready to fly (a GCS connected or not)
         no_coverage = p.network == NO_CONNECTION
         if m is None:
             color = ui.LED_OFF
@@ -1208,8 +1210,8 @@ class SimWindow:
             color = ui.RED if blink else ui.LED_OFF
         elif not session:
             color = YELLOW
-        elif not client.gcs_present:
-            color = ui.GREEN
+        elif not (p.battery and now - p.fc.heartbeat < FC_SILENT):
+            color = PURPLE
         else:
             color = ui.BLUE
         self.lte_led.set(color)

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import calendar
 import configparser
 import hashlib
 import hmac
@@ -35,7 +36,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -652,6 +653,89 @@ TEMP_HOT = 80  # too hot: give the board air, out of the sun
 VOICE = 14
 VOICE_BODY = struct.Struct("<B")  # bit 0: on
 
+# ---------------------------------------------------------------------------------------------
+# Logs: the aircraft's log files (the ESP32 writes one to its SD card per power-on), listed and
+# downloaded through the relay (docs/PROTOCOL.md, "Logs"). The relay keeps none of it: it passes each
+# request to the aircraft, and the answers back to the agent that asked.
+
+FILE_REQ, FILE_LIST, FILE_DATA, FILE_ACK = range(15, 19)
+FILE_REQ_BODY = struct.Struct("<HBI12s")  # request id, op, offset (LIST: the first entry wanted), file name
+FILE_LIST_HEAD = struct.Struct("<HBHHB")  # request id, status, files in all, index of the first entry, entries
+FILE_ENTRY = struct.Struct("<12sIII")  # name, bytes, the times of its first and last line (unix seconds, 0: none)
+FILE_DATA_HEAD = struct.Struct("<HBII")  # request id, status, offset, the file's size; then its bytes from offset
+FILE_ACK_BODY = struct.Struct("<HI")  # request id, every byte before this offset has come
+FILE_OP_LIST, FILE_OP_GET, FILE_OP_STOP = 1, 2, 3
+FILE_OK, FILE_NO_CARD, FILE_NOT_FOUND, FILE_NO_AIRCRAFT, FILE_CARD_ERROR, FILE_STOPPED = range(6)
+FILE_PROBLEMS = {
+    FILE_NO_CARD: "the aircraft has no SD card it can read",
+    FILE_NOT_FOUND: "the aircraft's card has no such file",
+    FILE_NO_AIRCRAFT: "the aircraft is not connected",
+    FILE_CARD_ERROR: "the aircraft could not read its card",
+    FILE_STOPPED: "another download took its place",
+}
+FILE_CHUNK = 1024
+FILE_LIST_MOST = 40  # entries in one FILE_LIST
+FILE_WINDOW = 32 * 1024  # bytes a sender sends beyond the receiver's last ACK
+LOG_NAME = re.compile(r"LOG\d{5}\.CSV")
+LOG_SCAN = 2048  # bytes read at each end of a log file for its times: a line is at most 640
+WELCOME_TIME = struct.Struct("<Q")  # after the nonce, since 1.8.0: the relay's clock (unix milliseconds)
+
+
+def log_time(field: bytes) -> int:
+    """Unix seconds of a log line's first field ("2026-10-02T09:35:12Z"), 0 if it holds no time."""
+    try:
+        return calendar.timegm(time.strptime(field.decode("ascii").strip(), "%Y-%m-%dT%H:%M:%SZ"))
+    except (UnicodeDecodeError, ValueError):
+        return 0
+
+
+def log_line(line: bytes) -> Optional[Tuple[int, int]]:
+    """A log line's time (0: none) and uptime; None for what is not one (the header)."""
+    fields = line.split(b",", 2)
+    if len(fields) < 2 or not fields[1].isdigit():
+        return None
+    return log_time(fields[0]) if fields[0] else 0, int(fields[1])
+
+
+def log_times(path: str) -> Tuple[int, int]:
+    """A log file's times (unix seconds, 0: unknown), as the firmware's sdlog.c finds them: its last line's that has
+    one, and its first line's, reckoned back from that one with the uptimes, so that a file whose first lines came
+    before the board knew the time still gets its start."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(LOG_SCAN)
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - LOG_SCAN))
+            tail = f.read()
+    except OSError:
+        return 0, 0
+    first = next((parsed for parsed in map(log_line, head.split(b"\n")[:-1]) if parsed), None)
+    lines = tail.split(b"\n")[:-1]  # whole lines only
+    if size > LOG_SCAN:
+        lines = lines[1:]  # cut short by the read
+    last = next((parsed for parsed in map(log_line, reversed(lines)) if parsed and parsed[0]), None)
+    if first is None or last is None:
+        return 0, 0
+    (_, first_up), (end, up) = first, last
+    return (end - (up - first_up) if up >= first_up else end), end
+
+
+def log_entries(folder: str) -> List[Tuple[str, int, int, int]]:
+    """The log files in `folder`, the newest (highest number) first: name, bytes, first and last line's time."""
+    try:
+        names = [n for n in os.listdir(folder) if LOG_NAME.fullmatch(n.upper())]
+    except OSError:
+        return []
+    out = []
+    for name in sorted(names, key=str.upper, reverse=True):
+        path = os.path.join(folder, name)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        out.append((name.upper(), size) + log_times(path))
+    return out
+
 
 class Position(NamedTuple):
     gnss_time: int = 0
@@ -1088,6 +1172,68 @@ class VoiceSwitch:
             slog.warning("cannot save the locator voice switch: %s", exc)
 
 
+class FileRoutes:
+    """The relay's part in logs: passes FILE_REQ and FILE_ACK from GCS agents on to the aircraft, under
+    request ids of its own (two agents may use the same id), and the aircraft's FILE_LIST and FILE_DATA
+    back to the agent that asked. It keeps nothing else."""
+
+    FORGET = 120.0  # seconds after a request's last packet
+
+    def __init__(self, relay: "RelayServer") -> None:
+        self.relay = relay
+        self.routes: Dict[int, list] = {}  # our id -> [GCS session id, the agent's id, last packet (monotonic)]
+        self.ids: Dict[Tuple[int, int], int] = {}  # (GCS session id, the agent's id) -> our id
+        self.last_id = 0
+
+    def from_gcs(self, sess: "Session", ptype: int, body: bytes, now: float) -> None:
+        if ptype == FILE_REQ and len(body) >= FILE_REQ_BODY.size:
+            agent_id, op, offset, name = FILE_REQ_BODY.unpack_from(body)
+            vehicle = self.relay.vehicle
+            if vehicle is None or now - vehicle.last_rx >= self.relay.ONLINE_TIMEOUT:
+                if op == FILE_OP_LIST:
+                    self.relay._send(sess, FILE_LIST, FILE_LIST_HEAD.pack(agent_id, FILE_NO_AIRCRAFT, 0, offset & 0xFFFF, 0))
+                elif op == FILE_OP_GET:
+                    self.relay._send(sess, FILE_DATA, FILE_DATA_HEAD.pack(agent_id, FILE_NO_AIRCRAFT, offset, 0))
+                return
+            ours = self.ids.get((sess.sid, agent_id))
+            if ours is None:
+                ours = self._new(sess.sid, agent_id)
+            self.routes[ours][2] = now
+            if op == FILE_OP_GET:
+                slog.info("%s downloads %s from the aircraft, from byte %d", sess.describe(),
+                          name.rstrip(b"\0").decode("ascii", "replace"), offset)
+            self.relay._send(vehicle, FILE_REQ, FILE_REQ_BODY.pack(ours, op, offset, name))
+        elif ptype == FILE_ACK and len(body) >= FILE_ACK_BODY.size:
+            agent_id, next_byte = FILE_ACK_BODY.unpack_from(body)
+            ours = self.ids.get((sess.sid, agent_id))
+            if ours is not None and self.relay.vehicle is not None:
+                self.routes[ours][2] = now
+                self.relay._send(self.relay.vehicle, FILE_ACK, FILE_ACK_BODY.pack(ours, next_byte))
+
+    def from_vehicle(self, ptype: int, body: bytes, now: float) -> None:
+        route = self.routes.get(struct.unpack_from("<H", body)[0]) if len(body) >= 2 else None
+        sess = self.relay.sessions.get(route[0]) if route is not None else None
+        if sess is None or not sess.active:
+            return
+        route[2] = now
+        self.relay._send(sess, ptype, struct.pack("<H", route[1]) + body[2:])
+
+    def forget(self, now: float) -> None:
+        for ours, (sid, agent_id, last) in list(self.routes.items()):
+            if now - last > self.FORGET or sid not in self.relay.sessions:
+                del self.routes[ours]
+                self.ids.pop((sid, agent_id), None)
+
+    def _new(self, sid: int, agent_id: int) -> int:
+        while True:
+            self.last_id = self.last_id % 0xFFFF + 1
+            if self.last_id not in self.routes:
+                break
+        self.routes[self.last_id] = [sid, agent_id, 0.0]
+        self.ids[(sid, agent_id)] = self.last_id
+        return self.last_id
+
+
 class RelayServer(asyncio.DatagramProtocol):
     """Forwards MAVLink between the vehicle session and all GCS sessions (and plain TCP clients)."""
 
@@ -1106,6 +1252,7 @@ class RelayServer(asyncio.DatagramProtocol):
         self.photos = PhotoStore(self, photo_folder, photo_days)
         self.locator = LocatorStore(self, os.path.join(state_dir, "locator.json") if state_dir else None)
         self.voice = VoiceSwitch(os.path.join(state_dir, "voice.json") if state_dir else None)
+        self.files = FileRoutes(self)
         self.sessions: Dict[int, Session] = {}
         self.vehicle: Optional[Session] = None
         self.tcp: Optional[TcpGcsPort] = None
@@ -1174,6 +1321,11 @@ class RelayServer(asyncio.DatagramProtocol):
                 self.voice.switch(bool(pkt.body[0] & 0x01), sess)
         elif SNAP_REQ <= pkt.type <= SNAP_SYNC:
             self.photos.on_packet(sess, pkt.type, pkt.body, now)
+        elif FILE_REQ <= pkt.type <= FILE_ACK:
+            if sess.role == ROLE_GCS and pkt.type in (FILE_REQ, FILE_ACK):
+                self.files.from_gcs(sess, pkt.type, pkt.body, now)
+            elif sess.role == ROLE_VEHICLE and pkt.type in (FILE_LIST, FILE_DATA):
+                self.files.from_vehicle(pkt.type, pkt.body, now)
 
     # -- forwarding
 
@@ -1220,7 +1372,7 @@ class RelayServer(asyncio.DatagramProtocol):
         known = next((s for s in self.sessions.values() if s.role == pkt.role and s.nonce == nonce), None)
         if known is not None:
             if not known.active:  # the client retrying before our WELCOME reached it
-                self.transport.sendto(encode(key, WELCOME, ROLE_SERVER, known.sid, 0, nonce), addr)
+                self.transport.sendto(encode(key, WELCOME, ROLE_SERVER, known.sid, 0, self._welcome(nonce)), addr)
             return  # else a replay of the HELLO that started an active session
         pending = [s for s in self.sessions.values() if not s.active]
         if len(pending) >= self.MAX_PENDING:
@@ -1234,8 +1386,13 @@ class RelayServer(asyncio.DatagramProtocol):
         info = pkt.body[NONCE_LEN:NONCE_LEN + INFO_MAX].decode("utf-8", "replace")
         info = "".join(c for c in info if c.isprintable())
         self.sessions[sid] = Session(sid, pkt.role, key, addr, info, now, nonce)
-        self.transport.sendto(encode(key, WELCOME, ROLE_SERVER, sid, 0, nonce), addr)
+        self.transport.sendto(encode(key, WELCOME, ROLE_SERVER, sid, 0, self._welcome(nonce)), addr)
         slog.debug("HELLO from %s %s -> session %08x", ROLE_NAMES.get(pkt.role), fmt_addr(addr), sid)
+
+    @staticmethod
+    def _welcome(nonce: bytes) -> bytes:
+        """The nonce, and our clock: an aircraft without a GNSS time takes its log's times from it."""
+        return nonce + WELCOME_TIME.pack(int(time.time() * 1000))
 
     def _activate(self, sess: Session) -> None:
         sess.active = True
@@ -1322,6 +1479,7 @@ class RelayServer(asyncio.DatagramProtocol):
 
         for sid in [s for s, t in self._last_reject.items() if now - t > 10.0]:
             del self._last_reject[sid]
+        self.files.forget(now)
 
         for sess in self.gcs_sessions():  # photos to a GCS agent go only as fast as its link allows
             if sess.deliveries and sess.rtt_ms != U16_UNKNOWN:
@@ -1756,6 +1914,135 @@ class PhotoInbox:
             self.on_photo(path, info)
 
 
+class FileFetcher:
+    """The GCS agent's side of logs: lists the aircraft's log files and downloads one at a time, through the
+    relay, from any offset (a download that stopped goes on from there). Its callbacks run on the agent's
+    loop."""
+
+    TRY_EVERY = 2.0  # seconds between requests while no answer comes
+    LIST_WITHIN = 12.0
+    ASK_AGAIN = 4.0  # a download with nothing new for this long asks again from where it stopped...
+    GIVE_UP = 30.0  # ...and gives up after this long
+    ACK_EVERY = 0.2
+
+    def __init__(self, client: TunnelClient) -> None:
+        self.client = client
+        self.last_id = secrets.randbelow(0xFFFF)
+        self.listing: Optional[dict] = None
+        self.download: Optional[dict] = None
+
+    def _new_id(self) -> int:
+        self.last_id = self.last_id % 0xFFFF + 1
+        return self.last_id
+
+    def list(self, first: int, done: Callable[[Optional[List[Tuple[str, int, int, int]]], int, str], None]) -> bool:
+        """Asks for the aircraft's log files from entry `first` on (the newest first): done(entries, files in
+        all, "") with up to FILE_LIST_MOST of them, or done(None, 0, why not). False without a session."""
+        if not self.client.is_connected:
+            return False
+        now = time.monotonic()
+        self.listing = {"id": self._new_id(), "first": first, "done": done, "since": now, "asked": now}
+        self._ask_list()
+        return True
+
+    def get(self, name: str, offset: int, write: Callable[[int, bytes], None], progress: Callable[[int, int], None],
+            done: Callable[[bool, str], None]) -> bool:
+        """Downloads the file `name` from byte `offset` on: write(offset, data) piece by piece in order,
+        progress(bytes there, size), then done(True, "") or done(False, why not). One at a time: a new one
+        ends the one before. False without a session."""
+        if not self.client.is_connected:
+            return False
+        self.stop()
+        now = time.monotonic()
+        self.download = {"id": self._new_id(), "name": name, "next": offset, "acked": offset, "write": write,
+                         "progress": progress, "done": done, "asked": now, "news": now, "ack_at": now,
+                         "heard": False}
+        self._ask_get()
+        return True
+
+    def stop(self) -> None:
+        d, self.download = self.download, None
+        if d is not None:
+            self.client.send_packet(FILE_REQ, FILE_REQ_BODY.pack(d["id"], FILE_OP_STOP, 0, d["name"].encode("ascii")))
+
+    def _ask_list(self) -> None:
+        self.client.send_packet(FILE_REQ, FILE_REQ_BODY.pack(self.listing["id"], FILE_OP_LIST, self.listing["first"],
+                                                             b""))
+
+    def _ask_get(self) -> None:
+        d = self.download
+        self.client.send_packet(FILE_REQ, FILE_REQ_BODY.pack(d["id"], FILE_OP_GET, d["next"], d["name"].encode("ascii")))
+
+    def _ack(self, now: float) -> None:
+        d = self.download
+        d["acked"], d["ack_at"] = d["next"], now
+        self.client.send_packet(FILE_ACK, FILE_ACK_BODY.pack(d["id"], d["next"]))
+
+    def on_packet(self, ptype: int, body: bytes) -> None:
+        now = time.monotonic()
+        if ptype == FILE_LIST and self.listing is not None and len(body) >= FILE_LIST_HEAD.size:
+            req, status, files, first, count = FILE_LIST_HEAD.unpack_from(body)
+            if req != self.listing["id"]:
+                return
+            done, self.listing = self.listing["done"], None
+            if status != FILE_OK:
+                done(None, 0, FILE_PROBLEMS.get(status, f"no list (status {status})"))
+                return
+            entries = []
+            for i in range(count):
+                at = FILE_LIST_HEAD.size + i * FILE_ENTRY.size
+                if at + FILE_ENTRY.size > len(body):
+                    break
+                name, size, start, end = FILE_ENTRY.unpack_from(body, at)
+                entries.append((name.rstrip(b"\0").decode("ascii", "replace"), size, start, end))
+            done(entries, files, "")
+        elif ptype == FILE_DATA and self.download is not None and len(body) >= FILE_DATA_HEAD.size:
+            d = self.download
+            req, status, offset, size = FILE_DATA_HEAD.unpack_from(body)
+            if req != d["id"]:
+                return
+            d["heard"] = True
+            if status != FILE_OK:
+                self.download = None
+                d["done"](False, FILE_PROBLEMS.get(status, f"no file (status {status})"))
+                return
+            data = body[FILE_DATA_HEAD.size:]
+            if offset == d["next"] and data:  # anything else is a copy, or comes after a gap: dropped
+                d["write"](offset, data)
+                d["next"] += len(data)
+                d["news"] = now
+                d["progress"](d["next"], size)
+            if d["next"] >= size:  # all there (or nothing more: a GET from the end)
+                self._ack(now)
+                self.download = None
+                d["done"](True, "")
+            elif d["next"] - d["acked"] >= FILE_WINDOW // 2:
+                self._ack(now)  # half the sender's window: keep it moving
+
+    def pump(self, now: float) -> None:
+        listing = self.listing
+        if listing is not None:
+            if now - listing["since"] > self.LIST_WITHIN:
+                self.listing = None
+                listing["done"](None, 0, "no answer from the aircraft (firmware before 1.8.0?)")
+            elif now - listing["asked"] >= self.TRY_EVERY:
+                listing["asked"] = now
+                self._ask_list()
+        d = self.download
+        if d is None:
+            return
+        if now - d["news"] > self.GIVE_UP:
+            self.download = None
+            d["done"](False, "the download stopped: no word from the aircraft" if d["heard"]
+                      else "no answer from the aircraft (firmware before 1.8.0?)")
+            return
+        if now - d["ack_at"] >= (self.ACK_EVERY if d["next"] != d["acked"] else 1.0):
+            self._ack(now)
+        if now - d["news"] >= self.ASK_AGAIN and now - d["asked"] >= self.ASK_AGAIN:
+            d["asked"] = now
+            self._ask_get()
+
+
 class PhotoOutbox:
     """The aircraft's side of snapshots: takes the photo the relay asks for and sends it, no faster
     than the link carries without delaying the telemetry. capture(width, height) returns the JPEG, or
@@ -1840,6 +2127,129 @@ class PhotoOutbox:
             self.rate.set_cap(self.cap())
             self.rate.rtt_sample(self.client.rtt_ms / 1000, now)
         sender.pump(now, self.rate, rto_for(self.client.rtt_ms))
+
+
+class FileOutbox:
+    """The aircraft's side of logs, for the Python vehicle and the tests (the ESP32 does the same with its SD
+    card): lists the log files in `folder` (None: no card) and sends the one asked for, from the offset asked
+    for, at most FILE_WINDOW beyond the receiver's last ACK, paced by a RateControl (cap(): bytes/s) and never
+    while busy() (a photo going out), and from the last ACK again when no new one comes (go-back-N). One
+    download at a time: a new GET ends the one before."""
+
+    GIVE_UP = 30.0  # seconds without an ACK
+
+    def __init__(self, client: TunnelClient, folder: Optional[str], cap: Optional[Callable[[], float]] = None,
+                 busy: Optional[Callable[[], bool]] = None) -> None:
+        self.client, self.folder = client, folder
+        self.cap = cap or (lambda: 8192.0)
+        self.busy = busy or (lambda: False)
+        self.rate = RateControl(self.cap())
+        self.rtt_at = 0.0
+        self.get: Optional[dict] = None  # the download going on
+
+    def on_packet(self, ptype: int, body: bytes) -> None:
+        now = time.monotonic()
+        if ptype == FILE_REQ and len(body) >= FILE_REQ_BODY.size:
+            req, op, offset, raw = FILE_REQ_BODY.unpack_from(body)
+            name = raw.rstrip(b"\0").decode("ascii", "replace").upper()
+            if op == FILE_OP_LIST:
+                self._list(req, offset)
+            elif op == FILE_OP_GET:
+                self._start(req, name, offset, now)
+            elif op == FILE_OP_STOP and self.get is not None and self.get["id"] == req:
+                self._end("stopped")
+        elif ptype == FILE_ACK and self.get is not None and len(body) >= FILE_ACK_BODY.size:
+            req, next_byte = FILE_ACK_BODY.unpack_from(body)
+            g = self.get
+            if req != g["id"]:
+                return
+            g["last_ack"] = now
+            if g["acked"] < next_byte <= g["size"]:
+                g["acked"], g["moved"] = next_byte, now
+                if next_byte >= g["size"]:
+                    self._end("sent")
+
+    def _list(self, req: int, first: int) -> None:
+        if self.folder is None or not os.path.isdir(self.folder):
+            self.client.send_packet(FILE_LIST, FILE_LIST_HEAD.pack(req, FILE_NO_CARD, 0, first & 0xFFFF, 0))
+            return
+        entries = log_entries(self.folder)
+        page = entries[first:first + FILE_LIST_MOST]
+        self.client.send_packet(FILE_LIST, FILE_LIST_HEAD.pack(req, FILE_OK, min(len(entries), 0xFFFF),
+                                                               first & 0xFFFF, len(page))
+                                + b"".join(FILE_ENTRY.pack(name.encode("ascii"), *rest) for name, *rest in page))
+
+    def _open(self, name: str):
+        """The log file `name` (any case on disk), open for reading; the status if not."""
+        if self.folder is None or not os.path.isdir(self.folder):
+            return FILE_NO_CARD
+        if LOG_NAME.fullmatch(name):
+            for found in os.listdir(self.folder):
+                if found.upper() == name:
+                    try:
+                        return open(os.path.join(self.folder, found), "rb")
+                    except OSError:
+                        return FILE_CARD_ERROR
+        return FILE_NOT_FOUND
+
+    def _start(self, req: int, name: str, offset: int, now: float) -> None:
+        if self.get is not None and self.get["id"] != req:  # someone else's download: this one ends it
+            g = self.get
+            self.client.send_packet(FILE_DATA, FILE_DATA_HEAD.pack(g["id"], FILE_STOPPED, g["acked"], g["size"]))
+        self._end(None)
+        f = self._open(name)
+        if isinstance(f, int):
+            self.client.send_packet(FILE_DATA, FILE_DATA_HEAD.pack(req, f, offset, 0))
+            return
+        size = os.fstat(f.fileno()).st_size
+        if offset >= size:  # nothing (more) to send
+            f.close()
+            self.client.send_packet(FILE_DATA, FILE_DATA_HEAD.pack(req, FILE_OK, size, size))
+            return
+        self.get = {"id": req, "name": name, "file": f, "size": size, "acked": offset, "next": offset,
+                    "last_ack": now, "moved": now, "from": offset}
+        self.rate = RateControl(self.cap())
+        vlog.info("log %s asked for, from byte %d of %d", name, offset, size)
+
+    def _end(self, how: Optional[str]) -> None:
+        g, self.get = self.get, None
+        if g is not None:
+            g["file"].close()
+            if how:
+                vlog.info("log %s %s (%d KB)", g["name"], how, (g["acked"] - g["from"]) // 1024)
+
+    def pump(self, now: float) -> None:
+        g = self.get
+        if g is None:
+            return
+        if now - g["last_ack"] > self.GIVE_UP:
+            vlog.warning("log %s: no word from the relay for %.0f s; given up", g["name"], self.GIVE_UP)
+            self._end(None)
+            return
+        if self.busy():
+            return
+        if now - self.rtt_at >= 1.0 and self.client.rtt_ms != U16_UNKNOWN:
+            self.rtt_at = now
+            self.rate.set_cap(self.cap())
+            self.rate.rtt_sample(self.client.rtt_ms / 1000, now)
+        if g["next"] > g["acked"] and now - g["moved"] >= rto_for(self.client.rtt_ms):
+            g["next"], g["moved"] = g["acked"], now  # no new ACK for a while: from the last one again
+        budget = self.rate.budget(now)
+        end = min(g["size"], g["acked"] + FILE_WINDOW)
+        while g["next"] < end:
+            n = min(FILE_CHUNK, g["size"] - g["next"])
+            if budget < n:
+                break
+            g["file"].seek(g["next"])
+            data = g["file"].read(n)
+            if len(data) != n:
+                self.client.send_packet(FILE_DATA, FILE_DATA_HEAD.pack(g["id"], FILE_CARD_ERROR, g["next"], g["size"]))
+                self._end(None)
+                return
+            self.client.send_packet(FILE_DATA, FILE_DATA_HEAD.pack(g["id"], FILE_OK, g["next"], g["size"]) + data)
+            budget -= n
+            self.rate.spend(n)
+            g["next"] += n
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2205,6 +2615,7 @@ class GcsAgent:
         self.module_hot = False  # its chip reached TEMP_HOT, and has not cooled below TEMP_WARM since
         self.module_on_cell: Optional[bool] = None  # it runs on its own cell (False: on external power)
         self.client.on_packet = self._on_packet
+        self.files = FileFetcher(self.client)  # the aircraft's log files
         # the locator voice: the switch asked for, sent again until the relay's STATUS shows it
         self.voice_request: Optional[bool] = None
         self.voice_until = 0.0
@@ -2270,6 +2681,8 @@ class GcsAgent:
         if ptype == POSITION:
             if len(body) >= POSITION_BODY.size:
                 self._got_position(Position.unpack(body))
+        elif ptype in (FILE_LIST, FILE_DATA):
+            self.files.on_packet(ptype, body)
         elif self.photos is not None:
             self.photos.on_packet(ptype, body)
 
@@ -2399,18 +2812,20 @@ class GcsAgent:
 
     async def run(self) -> None:
         glog.info("connecting to relay %s:%d", self.client.host, self.client.port)
-        photos = asyncio.ensure_future(self._photo_loop()) if self.photos is not None else None
+        timers = asyncio.ensure_future(self._timers())
         try:
             await self.client.run()
         finally:
-            if photos is not None:
-                photos.cancel()
+            timers.cancel()
             self.close_ports()
 
-    async def _photo_loop(self) -> None:
+    async def _timers(self) -> None:
         while True:
             await asyncio.sleep(0.1)
-            self.photos.pump(time.monotonic())
+            now = time.monotonic()
+            if self.photos is not None:
+                self.photos.pump(now)
+            self.files.pump(now)
 
 
 async def run_gcs(opts) -> None:
@@ -2441,7 +2856,12 @@ async def run_vehicle(opts) -> None:
     client = TunnelClient(ROLE_VEHICLE, opts.key, *opts.server, on_data=lambda data: link.send(data),
                           info=f"mavlte-pyvehicle/{__version__}")
     photos = PhotoOutbox(client)  # no camera here: it says so when asked for a photo
-    client.on_packet, client.on_session = photos.on_packet, photos.on_session
+    files = FileOutbox(client, opts.logs, busy=lambda: photos.busy)  # logs: a folder of LOGnnnnn.CSV, if given
+
+    def on_packet(ptype: int, body: bytes) -> None:
+        (files if FILE_REQ <= ptype <= FILE_ACK else photos).on_packet(ptype, body)
+
+    client.on_packet, client.on_session = on_packet, photos.on_session
 
     def send(chunk: bytes) -> None:
         if opts.always_send or client.gcs_present:
@@ -2459,6 +2879,7 @@ async def run_vehicle(opts) -> None:
             chunk = batcher.poll(time.monotonic(), opts.batch_ms / 1000)
             if chunk:
                 send(chunk)
+            files.pump(time.monotonic())
 
     async def voice() -> None:  # no speaker here: it reports that it sounds, as the ESP32 does
         on = False
@@ -2578,6 +2999,8 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--tcp", help="connect to TCP, e.g. SITL 127.0.0.1:5762")
     src.add_argument("--udp", help="listen on UDP, e.g. 0.0.0.0:14560")
     v.add_argument("--batch-ms", type=float, help="collect this long before sending (default 50)")
+    v.add_argument("--logs", help="a folder of LOGnnnnn.CSV files to offer as the aircraft's logs (the ESP32 "
+                                  "keeps them on its SD card)")
     v.add_argument("--always-send", action="store_true", default=None,
                    help="send telemetry even while no GCS is connected")
     v.add_argument("--log-level", help="debug, info, warning (default info)")
@@ -2657,6 +3080,7 @@ def resolve_options(args: argparse.Namespace) -> argparse.Namespace:
         if not (out.serial or out.tcp or out.udp):
             raise SystemExit("give one of --serial, --tcp or --udp")
         out.batch_ms = float(o.get("batch_ms", 50))
+        out.logs = o.get("logs")
         value = o.get("always_send", False)
         out.always_send = value if isinstance(value, bool) else str(value).lower() in ("1", "yes", "true", "on")
     return out

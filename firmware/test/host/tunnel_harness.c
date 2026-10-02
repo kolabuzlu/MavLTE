@@ -1,4 +1,4 @@
-/* Stand-in for the ESP32: runs the firmware's tunnel client, batcher and snapshot outbox against a
+/* Stand-in for the ESP32: runs the firmware's tunnel client, batcher, snapshot outbox and log sender against a
  * real relay.
  *
  *   tunnel_harness HOST PORT KEYHEX SECONDS
@@ -7,8 +7,9 @@
  * connected and echoes every frame it receives back to the server. Its camera takes the same
  * photo every time: PHOTO_BYTES bytes, byte i = (i * 13 + 7) & 0xFF, over Istanbul at 120 m, heading
  * 45 degrees. Its locator reports, once a second, a GNSS fix at the same place (11 satellites), with the
- * flight controller silent for 42 s, and its locator voice speaks whenever the relay switches it on.
- * Prints its statistics on exit. Used by relay/tests/test_c_client.py. */
+ * flight controller silent for 42 s, and its locator voice speaks whenever the relay switches it on. Its SD card
+ * holds two log files: LOG00007.CSV, LOG_BYTES bytes, byte i = (i * 31 + 5) & 0xFF, from 1790000000 to 1790003600,
+ * and LOG00006.CSV, empty. Prints its statistics on exit. Used by relay/tests/test_c_client.py. */
 #define _POSIX_C_SOURCE 200809L
 
 #include <netdb.h>
@@ -20,12 +21,14 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "fileout.h"
 #include "locator.h"
 #include "mavframe.h"
 #include "snapshot.h"
 #include "tunnel.h"
 
 #define PHOTO_BYTES 30000
+#define LOG_BYTES 60000
 
 static int sock = -1;
 static struct sockaddr_storage server;
@@ -38,6 +41,9 @@ static size_t echo_len;
 static snap_outbox_t snap;
 static uint8_t photo[PHOTO_BYTES];
 static unsigned photos_sent;
+static file_outbox_t files;
+static uint8_t log_file[LOG_BYTES];
+static unsigned logs_sent;
 
 static uint32_t now_ms(void)
 {
@@ -72,7 +78,61 @@ static void on_event(void *ctx, tun_event_t ev, uint32_t session)
 static void on_packet(void *ctx, uint8_t type, const uint8_t *body, size_t len)
 {
     (void)ctx;
-    snap_input(&snap, type, body, len, now_ms());
+    if (type == TUN_FILE_REQ || type == TUN_FILE_ACK) {
+        fileout_input(&files, type, body, len, now_ms());
+    } else {
+        snap_input(&snap, type, body, len, now_ms());
+    }
+}
+
+/* ---- the SD card: two files */
+
+static int card_list(void *ctx, unsigned first, file_entry_t *out, unsigned max, unsigned *total)
+{
+    (void)ctx;
+    static const file_entry_t card[2] = {{"LOG00007.CSV", LOG_BYTES, 1790000000u, 1790003600u},
+                                         {"LOG00006.CSV", 0, 0, 0}};
+    int n = 0;
+    *total = 2;
+    for (unsigned i = first; i < 2 && (unsigned)n < max; i++) {
+        out[n++] = card[i];
+    }
+    return n;
+}
+
+static int card_open(void *ctx, const char *name, uint32_t *size)
+{
+    (void)ctx;
+    if (strcmp(name, "LOG00007.CSV") == 0) {
+        *size = LOG_BYTES;
+        return FILE_OK;
+    }
+    if (strcmp(name, "LOG00006.CSV") == 0) {
+        *size = 0;
+        return FILE_OK;
+    }
+    return FILE_NOT_FOUND;
+}
+
+static bool card_read(void *ctx, uint32_t offset, uint8_t *buf, size_t len)
+{
+    (void)ctx;
+    if (offset > LOG_BYTES || len > LOG_BYTES - offset) {
+        return false;
+    }
+    memcpy(buf, log_file + offset, len);
+    return true;
+}
+
+static void card_close(void *ctx)
+{
+    (void)ctx;
+}
+
+static bool card_send(void *ctx, uint8_t type, const uint8_t *body, size_t len)
+{
+    (void)ctx;
+    return tun_send_packet(&tun, type, body, len);
 }
 
 static void take(void *ctx, uint32_t photo_id, uint16_t width, uint16_t height)
@@ -150,6 +210,13 @@ int main(int argc, char **argv)
     }
     const snap_config_t snap_cfg = {.take = take, .release = release};
     snap_init(&snap, &tun, &snap_cfg);
+    for (size_t i = 0; i < sizeof(log_file); i++) {
+        log_file[i] = (uint8_t)(i * 31 + 5);
+    }
+    const file_config_t file_cfg = {
+        .list = card_list, .open = card_open, .read = card_read, .close = card_close, .send = card_send,
+    };
+    fileout_init(&files, &file_cfg);
 
     uint32_t start = now_ms(), last_frame = start, last_position = start, counter = 0;
     uint32_t duration = (uint32_t)atoi(argv[4]) * 1000;
@@ -184,6 +251,11 @@ int main(int argc, char **argv)
         }
         mav_batcher_poll(&batcher, now, 20, emit, NULL);
         snap_poll(&snap, now, 65536.0f);
+        if (!snap_busy(&snap) && fileout_poll(&files, now, tun.rtt_ms, 65536.0f)) { /* never while a photo goes */
+            fprintf(stderr, "harness: log %s %s (%u bytes)\n", files.last_name,
+                    files.last_complete ? "sent" : "stopped", (unsigned)files.last_bytes);
+            logs_sent += files.last_complete;
+        }
         if (tun_connected(&tun) && (uint32_t)(now - last_position) >= 1000) {
             uint8_t body[LOCATOR_BODY_LEN];
             gnss_fix_t fix;
@@ -195,9 +267,9 @@ int main(int argc, char **argv)
         }
     }
     printf("sessions=%u tx_packets=%u tx_bytes=%u rx_packets=%u rx_bytes=%u dropped=%u bad=%u frames=%u "
-           "photos=%u\n",
+           "photos=%u logs=%u\n",
            (unsigned)tun.stats.sessions, (unsigned)tun.stats.tx_packets, (unsigned)tun.stats.tx_bytes,
            (unsigned)tun.stats.rx_packets, (unsigned)tun.stats.rx_bytes, (unsigned)tun.stats.dropped,
-           (unsigned)tun.stats.bad, (unsigned)counter, photos_sent);
+           (unsigned)tun.stats.bad, (unsigned)counter, photos_sent, logs_sent);
     return 0;
 }
