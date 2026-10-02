@@ -36,7 +36,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.8.1"
+__version__ = "1.8.2"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -642,6 +642,31 @@ BATTERY_UNKNOWN = 0xFF
 # On V2 boards the fuel gauge sits on the board's supply rail, not on the cell: while USB or the 5V pin (the
 # BEC) powers the board it reads the converter feeding that rail (about 4.3 V), more than a Li-ion cell holds
 EXTERNAL_POWER_MV = 4250
+# The charge of the board's 18650 cell from its voltage, as the firmware reckons it (locator_cell_percent() in
+# firmware/main/locator.c): 4.20 V full and 3.40 V empty (the modem's lowest supply), along a Li-ion discharge curve
+# in between: mV, %.
+CELL_CURVE = ((4200, 100), (4100, 90), (4000, 79), (3900, 68), (3800, 55), (3700, 38), (3600, 21), (3500, 6),
+              (3400, 0))
+
+
+def cell_percent(mv: int) -> int:
+    """The cell's charge for its voltage, along CELL_CURVE."""
+    if mv >= CELL_CURVE[0][0]:
+        return 100
+    for (v_hi, p_hi), (v_lo, p_lo) in zip(CELL_CURVE, CELL_CURVE[1:]):
+        if mv >= v_lo:
+            span = v_hi - v_lo
+            return p_lo + ((mv - v_lo) * (p_hi - p_lo) + span // 2) // span
+    return 0
+
+
+def cell_mv(pct: float) -> int:
+    """The cell's voltage for a charge, along CELL_CURVE (for the plane simulator's cell)."""
+    pct = max(0.0, min(100.0, pct))
+    for (v_hi, p_hi), (v_lo, p_lo) in zip(CELL_CURVE, CELL_CURVE[1:]):
+        if pct >= p_lo:
+            return round(v_lo + (pct - p_lo) * (v_hi - v_lo) / (p_hi - p_lo))
+    return CELL_CURVE[-1][0]
 TEMP_UNKNOWN = -128
 # The ESP32-S3's own sensor reads warmer than the air around the board. V2 boards' ESP32-S3R8 is rated
 # for 65 degrees C of air around it (V1's ESP32-S3R2: 85); its datasheet ties that to the chip's octal
@@ -778,10 +803,15 @@ class Position(NamedTuple):
         return self.battery_mv != U16_UNKNOWN and self.battery_mv >= EXTERNAL_POWER_MV
 
     def power_text(self) -> str:
-        """'external power', 'battery 85%' (the module runs on its cell), or '' if it does not say."""
+        """'external power', 'battery 85%, 3.95 V' (the module runs on its cell: the gauge then reads the cell), or ''
+        if it does not say."""
         if self.on_external_power:
             return "external power"
-        return f"battery {self.battery_pct}%" if self.battery_pct != BATTERY_UNKNOWN else ""
+        parts = [f"{self.battery_pct}%"] if self.battery_pct != BATTERY_UNKNOWN else []
+        if self.battery_mv != U16_UNKNOWN:
+            mv = self.battery_mv + 5  # to 10 mV, in whole numbers: 4105 mV is 4.11 V
+            parts.append(f"{mv // 1000}.{mv // 10 % 100:02d} V")
+        return "battery " + ", ".join(parts) if parts else ""
 
     def describe(self) -> str:
         """For the log: where, or why not."""

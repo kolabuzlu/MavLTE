@@ -4,11 +4,11 @@
 #include "esp_log.h"
 
 #include "board.h"
+#include "locator.h"
 
 #define GAUGE_PORT I2C_NUM_0 /* the camera makes its own bus on port 1 where it has its own pins (V1) */
 #define GAUGE_ADDRESS 0x36
 #define REG_VCELL 0x02 /* 78.125 uV per bit, big-endian */
-#define REG_SOC 0x04   /* 1/256 % per bit */
 
 static const char *TAG = "battery";
 static i2c_master_bus_handle_t bus;
@@ -57,13 +57,12 @@ static bool read_register(uint8_t reg, uint16_t *value)
 
 bool battery_read(uint16_t *mv, uint8_t *pct)
 {
-    uint16_t vcell, soc;
-    if (!read_register(REG_VCELL, &vcell) || !read_register(REG_SOC, &soc)) {
+    uint16_t vcell;
+    if (!read_register(REG_VCELL, &vcell)) {
         return false;
     }
     *mv = (uint16_t)((uint32_t)vcell * 5 / 64); /* 78.125 uV = 5/64 mV (vcell * 78125 overflowed above 4.295 V) */
-    unsigned whole = soc >> 8;
-    *pct = (uint8_t)(whole > 100 ? 100 : whole);
+    *pct = locator_cell_percent(*mv);           /* the user's scale, not the gauge's own estimate (its SOC) */
     return true;
 }
 

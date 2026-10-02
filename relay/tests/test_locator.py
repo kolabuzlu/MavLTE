@@ -4,6 +4,7 @@ directory:  python -m unittest -v"""
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -54,15 +55,30 @@ class PositionTest(unittest.TestCase):
         self.assertEqual(mr.Position(flags=mr.POS_NO_GNSS).describe(), "no GNSS")
         self.assertEqual(mr.Position().fc_silent, mr.U16_UNKNOWN)  # not heard since the module started
 
+    def test_cell_curve(self):
+        """The user's scale: 4.20 V full, 3.40 V empty, along a Li-ion curve; the same as the firmware's."""
+        self.assertEqual([mr.cell_percent(mv) for mv in (4300, 4200, 3950, 3800, 3750, 3450, 3400, 3000)],
+                         [100, 100, 74, 55, 47, 3, 0, 0])
+        self.assertEqual([mr.cell_mv(pct) for pct in (100, 55, 0)], [4200, 3800, 3400])
+        for pct in range(101):  # the simulator's voltage gives its charge back
+            self.assertEqual(mr.cell_percent(mr.cell_mv(pct)), pct)
+        with open(os.path.join(os.path.dirname(__file__), "..", "..", "firmware", "main", "locator.c"),
+                  encoding="utf-8") as f:
+            source = f.read()
+        table = source[source.index("uint8_t locator_cell_percent"):].split(";", 1)[0]
+        self.assertEqual(tuple((int(v), int(p)) for v, p in re.findall(r"\{(\d+), (\d+)\}", table)), mr.CELL_CURVE)
+
     def test_power(self):
         """On V2 boards the gauge reads the supply rail: above what a Li-ion cell holds, that is external power."""
         rail = mr.Position(battery_mv=4298, battery_pct=100)  # the first board on USB, no cell in it
         self.assertEqual((rail.on_external_power, rail.power_text()), (True, "external power"))
         cell = mr.Position(battery_mv=3950, battery_pct=78)
-        self.assertEqual((cell.on_external_power, cell.power_text()), (False, "battery 78%"))
+        self.assertEqual((cell.on_external_power, cell.power_text()), (False, "battery 78%, 3.95 V"))
         self.assertTrue(mr.Position(battery_mv=mr.EXTERNAL_POWER_MV).on_external_power)
         self.assertFalse(mr.Position(battery_mv=mr.EXTERNAL_POWER_MV - 1, battery_pct=100).on_external_power)
         self.assertEqual(mr.Position(battery_pct=55).power_text(), "battery 55%")  # millivolts unknown
+        self.assertEqual(mr.Position(battery_mv=3700).power_text(), "battery 3.70 V")  # percent unknown
+        self.assertEqual(mr.Position(battery_mv=4105, battery_pct=97).power_text(), "battery 97%, 4.11 V")
         self.assertEqual(mr.Position().power_text(), "")  # no gauge
 
     def test_ages(self):
@@ -171,7 +187,7 @@ class RelayLocatorTest(unittest.TestCase):
             report(4100, 97)
             report(4298, 100)
         power = [line for line in logs.output if "LTE module" in line]
-        self.assertEqual(power, ["WARNING:mavrelay.relay:the aircraft's LTE module runs on its own cell now (battery 97%)",
+        self.assertEqual(power, ["WARNING:mavrelay.relay:the aircraft's LTE module runs on its own cell now (battery 97%, 4.11 V)",
                                  "INFO:mavrelay.relay:the aircraft's LTE module has external power again"])
 
     def test_saved_before_1_4_0(self):
@@ -242,7 +258,7 @@ class LiveLocatorTest(unittest.IsolatedAsyncioTestCase):
                 await self.until(lambda: agent.position.battery_mv == mv)
         power = [line for line in logs.output if "LTE module" in line]
         self.assertEqual(power, ["INFO:mavrelay.gcs:the aircraft's LTE module has external power again",
-                                 "WARNING:mavrelay.gcs:the aircraft's LTE module runs on its own cell now (battery 98%)"])
+                                 "WARNING:mavrelay.gcs:the aircraft's LTE module runs on its own cell now (battery 98%, 4.12 V)"])
 
         # an agent that connects later hears the last known one at once, even with the aircraft gone
         vehicle_task = self.tasks[0]

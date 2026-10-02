@@ -1358,6 +1358,25 @@ static void test_log_times(void)
     CHECK(log_last_time(tail, false, &start, &up) && start == 1790933712u && up == 754);
 }
 
+static void test_cell_percent(void)
+{
+    /* the user's endpoints, 4.20 V full and 3.40 V empty, and the curve's points between them */
+    static const uint16_t points[][2] = {{4200, 100}, {4100, 90}, {4000, 79}, {3900, 68}, {3800, 55},
+                                         {3700, 38},  {3600, 21}, {3500, 6},  {3400, 0}};
+    for (size_t i = 0; i < sizeof(points) / sizeof(points[0]); i++) {
+        CHECK(locator_cell_percent(points[i][0]) == points[i][1]);
+    }
+    CHECK(locator_cell_percent(4298) == 100 && locator_cell_percent(65535) == 100); /* on USB or the BEC: the rail */
+    CHECK(locator_cell_percent(3399) == 0 && locator_cell_percent(0) == 0);
+    CHECK(locator_cell_percent(3950) == 74 && locator_cell_percent(3750) == 47 && locator_cell_percent(3450) == 3);
+    uint8_t last = 0;
+    for (unsigned mv = 3300; mv <= 4300; mv++) { /* never down as the voltage goes up */
+        uint8_t pct = locator_cell_percent((uint16_t)mv);
+        CHECK(pct >= last && pct <= 100);
+        last = pct;
+    }
+}
+
 /* ------------------------------------------------------------------ the USB link */
 
 static void test_usb_lines(void)
@@ -1644,6 +1663,7 @@ int main(void)
     test_telemetry();
     test_log_line();
     test_log_times();
+    test_cell_percent();
     test_usb_lines();
     test_fileout();
     printf("%d checks, %d failures\n", checks, failures);

@@ -268,7 +268,7 @@ class WebTest(unittest.TestCase):
         self.assertEqual(s["temp"], {"text": " · 45 °C", "color": "text"})
         self.report(flags=mr.POS_FC_SILENT, fc_silent=130, battery_mv=3950, battery_pct=78, temp=85)  # it came down
         s = self.wait(cookie, lambda s: s["module"]["color"] == "red", "the flight controller silent")
-        self.assertEqual(s["module"]["text"], "flight controller silent for 2 min · battery 78%")
+        self.assertEqual(s["module"]["text"], "flight controller silent for 2 min · battery 78%, 3.95 V")
         self.assertEqual(s["temp"], {"text": " · 85 °C", "color": "red"})
 
         self.aircraft_gone()

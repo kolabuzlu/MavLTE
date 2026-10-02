@@ -767,7 +767,7 @@ class Plane:
             pos = pos._replace(battery_pct=100, battery_mv=RAIL_MV)
         elif self.cell:
             pct = int(round(self.cell_pct))
-            pos = pos._replace(battery_pct=pct, battery_mv=3300 + 9 * pct)
+            pos = pos._replace(battery_pct=pct, battery_mv=mr.cell_mv(self.cell_pct))
         self._chip_update()
         return pos._replace(flags=pos.flags | flags, fc_silent=silent, temp=int(round(self.chip_c)))
 

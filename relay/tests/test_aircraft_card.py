@@ -83,7 +83,7 @@ class CardTest(unittest.TestCase):
                            battery_mv=3950, battery_pct=78, temp=85)
         a = agent(position=searching)
         self.assertEqual(card.position(a, True, now), ("GNSS searching (3 satellites)", card.MUTED, None))
-        self.assertEqual(card.module(a, True, now), (card.Shown("flight controller not heard yet · battery 78%",
+        self.assertEqual(card.module(a, True, now), (card.Shown("flight controller not heard yet · battery 78%, 3.95 V",
                                                                 card.AMBER), card.Shown(" · 85 °C", card.RED)))
         self.assertEqual(card.position(agent(position=report(flags=mr.POS_NO_GNSS, fix=mr.FIX_NONE)), True, now).text,
                          "the LTE module cannot read its GNSS")

@@ -360,7 +360,7 @@ class GuiTest(unittest.TestCase):
         self.assertEqual(app.map_link.cget("fg"), mavlte.LED_OFF)  # nothing to show on a map yet
         report(flags=mr.POS_FC_SILENT, fc_silent=130, battery_pct=78, battery_mv=3950)  # it came down
         self.pump(lambda: value("Position") == "41.12346, 28.98765 · 11 satellites", what="live position")
-        self.assertEqual(value("Module"), "flight controller silent for 2 min · battery 78%")
+        self.assertEqual(value("Module"), "flight controller silent for 2 min · battery 78%, 3.95 V")
         self.assertEqual(app.craft_values["Module"].cget("fg"), mavlte.RED)
         self.assertEqual(app.map_link.cget("fg"), mavlte.BLUE)
         copied, opened = [], []
@@ -468,7 +468,7 @@ class GuiTest(unittest.TestCase):
         report(4298, 100)  # USB or the BEC: the gauge reads the board's supply rail
         self.pump(lambda: self.text(module) == "flight controller talking · external power", what="external power")
         report(4012, 88)  # on its own cell
-        self.pump(lambda: self.text(module) == "flight controller talking · battery 88%", what="on the cell")
+        self.pump(lambda: self.text(module) == "flight controller talking · battery 88%, 4.01 V", what="on the cell")
 
     def test_locator_voice(self):
         app = self.app

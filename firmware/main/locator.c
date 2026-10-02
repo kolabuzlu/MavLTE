@@ -192,6 +192,22 @@ bool gnss_parse(const char *answer, gnss_fix_t *out)
     return true;
 }
 
+uint8_t locator_cell_percent(uint16_t mv)
+{
+    static const uint16_t curve[][2] = {{4200, 100}, {4100, 90}, {4000, 79}, {3900, 68}, {3800, 55},
+                                        {3700, 38},  {3600, 21}, {3500, 6},  {3400, 0}};
+    if (mv >= curve[0][0]) {
+        return 100;
+    }
+    for (size_t i = 1; i < sizeof(curve) / sizeof(curve[0]); i++) {
+        if (mv >= curve[i][0]) { /* between this point and the one above it, in a straight line */
+            unsigned span = curve[i - 1][0] - curve[i][0], rise = curve[i - 1][1] - curve[i][1];
+            return (uint8_t)(curve[i][1] + ((mv - curve[i][0]) * rise + span / 2) / span);
+        }
+    }
+    return 0;
+}
+
 uint32_t gnss_unix_time(int year, int month, int day, int hour, int minute, int second)
 {
     if (year < 2020 || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 60) {
