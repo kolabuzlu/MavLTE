@@ -18,7 +18,8 @@ the relay's config file, and its own settings in a [web] section there (install-
     sudo python3 mavweb.py password --config /etc/mavrelay/mavrelay.ini     sets the page's password
     python3 mavweb.py --config /etc/mavrelay/mavrelay.ini                   the page itself (mavweb.service)
 
-The page is the web folder beside this file. Standard library only (3.8+), like mavrelay.py.
+The page is the web folder beside this file. Its moving map loads Esri World Imagery tiles straight from Esri
+into the phone; mavweb keeps the aircraft's track for it. Standard library only (3.8+), like mavrelay.py.
 """
 
 from __future__ import annotations
@@ -60,7 +61,8 @@ FILES = {
     "/icon.png": (os.path.join(HERE, "mavlte.png"), "image/png"),
 }
 HEADERS = (
-    ("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
+    ("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; "
+                                "img-src 'self' https://server.arcgisonline.com; "  # the moving map's tiles
                                 "connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'self'; "
                                 "frame-ancestors 'none'"),
     ("X-Content-Type-Options", "nosniff"),
@@ -247,10 +249,12 @@ class WebPage:
         self.thread = threading.Thread(target=self.loop.run_forever, name="agent", daemon=True)
         self.agent: Optional[mr.GcsAgent] = None
         self.task: Optional[asyncio.Future] = None
+        self.tracking: Optional[asyncio.Future] = None
         self.failed = False
         self.on_failure: Optional[Callable[[], None]] = None
         self.voice = aircraft_card.Voice()
         self.voice_shown = (False, aircraft_card.Shown("", aircraft_card.DIM))
+        self.track = aircraft_card.Track()  # for the moving map: kept on the agent's loop
         self.by_id: Dict[int, str] = {}  # the photos kept
         self.newest: Optional[dict] = None
         self._photos_changed()
@@ -263,8 +267,15 @@ class WebPage:
                                      photo_dir=self.opts.photo_dir, on_photo=lambda path, info: self._photos_changed())
             self.task = asyncio.ensure_future(self.agent.run())
             self.task.add_done_callback(self._ended)
+            self.tracking = asyncio.ensure_future(self._track())
 
         self.call(go)
+
+    async def _track(self) -> None:
+        """Every fix onto the track, also while no phone looks: the map then shows where the aircraft went."""
+        while True:
+            self.track.add(self.agent.last_fix)
+            await asyncio.sleep(0.5)
 
     def _ended(self, task: asyncio.Future) -> None:
         if not task.cancelled() and task.exception() is not None:
@@ -275,9 +286,10 @@ class WebPage:
 
     def stop(self) -> None:
         async def go() -> None:
-            if self.task is not None:
-                self.task.cancel()
-                await asyncio.gather(self.task, return_exceptions=True)
+            tasks = [task for task in (self.task, self.tracking) if task is not None]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         if self.thread.is_alive():
             try:
@@ -315,6 +327,10 @@ class WebPage:
         """The photos kept, newest first, for the viewer."""
         return [photo_entry(path) for _, path in sorted(self.by_id.items(), reverse=True)]
 
+    def track_points(self) -> List[list]:
+        """The track for the moving map: [latitude, longitude, unix time], oldest first."""
+        return self.call(lambda: [[round(p.lat / 1e7, 7), round(p.lon / 1e7, 7), p.time] for p in self.track.fixes])
+
     def state(self, size: int) -> dict:
         """The Aircraft card, as MavLTE shows it (size: the photo size the phone has chosen)."""
         return self.call(lambda: self._state(size))
@@ -333,6 +349,9 @@ class WebPage:
             self.voice_shown = shown
         voice_on, voice = self.voice_shown
         camera = aircraft_card.camera(agent, online, size, now)
+        fix = agent.last_fix  # the moving map's aircraft
+        self.track.add(fix)
+        live = aircraft_card.live(agent, online, now_unix)
         return {
             "name": self.opts.name,
             "version": mr.__version__,
@@ -345,6 +364,9 @@ class WebPage:
                          "copy": aircraft_card.coordinates(where.fix) if where.fix else None},
             "module": {"text": module.text, "color": module.color},
             "temp": {"text": temp.text, "color": temp.color},
+            "fix": None if fix is None else {
+                "lat": round(fix.lat / 1e7, 7), "lon": round(fix.lon / 1e7, 7), "time": fix.time,
+                "heading": aircraft_card.heading(fix), "live": live is not None and live.has_fix},
             "voice": {"on": voice_on, "text": voice.text, "color": voice.color, "can": bool(agent.client.session)},
             "camera": camera._asdict(),
             "photo": self.newest,
@@ -460,7 +482,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json(404, {"error": "Not found"})
             return self.send(200, body, ctype, cache="no-cache")  # always the newest after an update
         photo = re.fullmatch(r"/photo/(\d{1,10})\.jpg", url.path)
-        if url.path not in ("/api/state", "/api/photos") and photo is None:
+        if url.path not in ("/api/state", "/api/photos", "/api/track") and photo is None:
             return self.send_json(404, {"error": "Not found"})
         expires = self.signed_in()
         if expires is None:
@@ -475,6 +497,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(200, state, renew)
         if url.path == "/api/photos":
             return self.send_json(200, self.page.photos())
+        if url.path == "/api/track":
+            return self.send_json(200, {"fixes": self.page.track_points()})
         path = self.page.photo_path(int(photo.group(1)))
         try:
             with open(path or "", "rb") as f:

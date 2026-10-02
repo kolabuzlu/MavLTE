@@ -36,7 +36,8 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
 - **Locator**: the LTE module's own GNSS reports where the aircraft is every 5 s, whatever the
   flight controller does. After a crash that kills the flight controller, the module keeps
   reporting as long as it has power (an 18650 cell on the board), and says the flight controller
-  has gone silent. The relay keeps the last known position; the app shows it with a map link.
+  has gone silent. The relay keeps the last known position; the app shows it on a moving map
+  (satellite photos), with the track it flew.
 - **Locator voice**: switch it on in the MavLTE app and the board's speaker sounds a two-tone
   alarm again and again, to find the aircraft in tall grass or crops once its position has
   brought you close. The relay keeps the switch: switched on while the aircraft is out of reach,
@@ -44,12 +45,12 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
   coverage.
 - **On your phone**: the app's *Aircraft* panel also comes as a web page from the relay server,
   password protected, for the search with only a phone in your pocket: the link, the position
-  with a map link, the voice switch and Snapshot.
+  on the moving map, the voice switch and Snapshot.
 
 | Folder | What |
 |---|---|
 | [firmware/](firmware) | ESP-IDF firmware for the ESP32-S3 (PlatformIO or `idf.py`) |
-| [relay/](relay) | `mavrelay.py`: the relay server, the GCS agent and a Python vehicle for bench tests; `MavLTE.pyw` / `mavlte.py`: the MavLTE app (the GCS agent as a window), `build_release.py` makes it into `MavLTE.exe`; `mavweb.py` and `web/`: the app's *Aircraft* panel as a web page for a phone, on the relay server (`aircraft_card.py`: what that panel says, for both); `sitl_demo.py`: the whole link with ArduPilot SITL on one PC; `PlaneSim.pyw` / `plane_sim.py`: SITL as a plane with a battery switch, a virtual LTE module with its GNSS and a backup cell, and a virtual camera |
+| [relay/](relay) | `mavrelay.py`: the relay server, the GCS agent and a Python vehicle for bench tests; `MavLTE.pyw` / `mavlte.py`: the MavLTE app (the GCS agent as a window), `build_release.py` makes it into `MavLTE.exe`; `mavweb.py` and `web/`: the app's *Aircraft* panel as a web page for a phone, on the relay server (`aircraft_card.py`: what that panel says, for both; `maptiles.py`: the app's moving map tiles); `sitl_demo.py`: the whole link with ArduPilot SITL on one PC; `PlaneSim.pyw` / `plane_sim.py`: SITL as a plane with a battery switch, a virtual LTE module with its GNSS and a backup cell, and a virtual camera |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | Tunnel protocol |
 
 ## Setup, in order
@@ -335,10 +336,15 @@ server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
 - With both switches off the app only watches: the Available LEDs keep working, but the aircraft
   holds its telemetry back, so it uses almost no mobile data.
 - **Position**, in the *Aircraft* panel, is where the LTE module's own GNSS puts the aircraft,
-  live every 5 s, whatever the switches. **Map** opens it in Google Maps (on a phone: the Maps
-  app), **Copy** puts the coordinates on the clipboard. With the aircraft offline, it shows the
-  last known position and how long ago that was (in amber): the relay keeps it, so the app shows
-  it even when it was closed at the time. **Module** says whether the flight controller still
+  live every 5 s, whatever the switches. **Copy** puts the coordinates on the clipboard. With the
+  aircraft offline, it shows the last known position and how long ago that was (in amber): the
+  relay keeps it, so the app shows it even when it was closed at the time. **Map** opens the
+  moving map: the aircraft on satellite photos (Esri World Imagery), green while it reports and
+  amber where it was last known, an arrow when it moves, with the track it flew since the app
+  started. It follows the aircraft until you drag the map; the wheel or **−** and **+** zoom, and
+  **Follow** brings it back. **Google Maps** there opens the position in the browser (with
+  directions, on a phone). The map's tiles come from Esri over this computer's internet,
+  about 15–40 KB each. **Module** says whether the flight controller still
   talks to the module, in red when it has gone silent (a crash, say) while the module still
   reports, its power: *external power* (USB or the BEC) or, on its own cell, the cell's charge
   (after a crash that took the flight battery: the log says when it changes), and the
@@ -395,6 +401,11 @@ only a phone: its link and signal, **Position** with **Map** and **Copy**, **Mod
 **Voice** switch, and **Snapshot** with the last photo (tap it for the whole screen, swipe for the
 ones before). It says what the app says, in the same colours. It runs on the relay server, so no
 laptop has to be on. Telemetry stays with Mission Planner: the page has none.
+
+**Map** opens the moving map on the whole screen, as in the app, with the track the page's server
+kept (the last three hours or so, also while no phone looked): drag it, pinch or **−** and **+**
+to zoom, **Follow** to come back to the aircraft. **Google Maps** opens the Maps app with the
+position, to be guided there.
 
 ```bash
 cd relay && sudo sh install-web.sh 203-0-113-10.sslip.io
@@ -594,6 +605,7 @@ missed while the app was closed) travel over your laptop's internet.
 | *Voice* says the aircraft's speaker is sounding, but nothing to hear | The speaker plugged into the board's speaker header; the fuselage muffling it (see *Speaker* in section 3). |
 | The web page does not open, or the browser warns about its certificate | TCP ports 80 and 443 open in the provider's firewall; the name points at the server. `journalctl -u caddy` says whether Let's Encrypt gave the certificate. |
 | The web page says `No connection to the server` | The phone's own internet; it tries again by itself. If other sites work, `systemctl status mavweb` on the server. |
+| The moving map stays black | The map's satellite photos come from Esri (server.arcgisonline.com) over the laptop's or phone's own internet. MavLTE's log says `cannot load the map's tiles from Esri` and why; it tries again after half a minute. |
 
 ## Development
 

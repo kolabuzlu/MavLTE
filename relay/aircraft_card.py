@@ -16,7 +16,8 @@ import json
 import os
 import re
 import time
-from typing import List, NamedTuple, Optional, Tuple
+from collections import deque
+from typing import Deque, List, NamedTuple, Optional, Tuple
 
 import mavrelay as mr
 
@@ -224,6 +225,38 @@ def camera(agent: Optional[mr.GcsAgent], online: bool, size: int, now: float) ->
     if not online:
         return Camera("The aircraft is offline", DIM, None, False, False)
     return Camera(SIZE_HINTS[size], DIM, None, True, False)
+
+
+# ---------------------------------------------------------------------------------------------
+# The moving map: where the aircraft has been, and where it points
+
+
+class Track:
+    """The aircraft's path for the moving map: its LTE module's GNSS fixes (one every 5 s) as the agent gets them,
+    the first often the relay's last known position. Fed and read on one thread."""
+
+    MOST = 2000  # fixes kept: almost three hours
+
+    def __init__(self) -> None:
+        self.fixes: Deque[mr.Position] = deque(maxlen=self.MOST)
+
+    def add(self, pos: Optional[mr.Position]) -> bool:
+        """Keeps a fix newer than the last one kept; True if it did."""
+        if pos is None or not pos.has_fix or (self.fixes and pos.time <= self.fixes[-1].time):
+            return False
+        self.fixes.append(pos)
+        return True
+
+    @property
+    def newest(self) -> Optional[mr.Position]:
+        return self.fixes[-1] if self.fixes else None
+
+
+def heading(pos: mr.Position) -> Optional[float]:
+    """Where the aircraft moves, in degrees from north, from its GNSS: None below 2 m/s (no telling then)."""
+    if pos.course == mr.U16_UNKNOWN or pos.speed == mr.U16_UNKNOWN or pos.speed < 200:
+        return None
+    return pos.course / 100
 
 
 # ---------------------------------------------------------------------------------------------

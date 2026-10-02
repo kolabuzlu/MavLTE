@@ -7,7 +7,8 @@ the switches; Connected (blue, next to the switch) while it is online and that p
 switches start off. With both off the app only watches: the aircraft holds its telemetry back.
 Snapshot asks the aircraft for a photo from its camera, whatever the switches; photos are kept in
 Pictures\\MavLTE, each with a .json beside it saying when and where it was taken. Position shows
-where the LTE module's own GNSS puts the aircraft, live or last known, with a map link. The Voice
+where the LTE module's own GNSS puts the aircraft, live or last known; Map shows it on a moving map
+(Esri World Imagery) with its track. The Voice
 switch (the locator voice) sounds the speaker on the aircraft's board (a two-tone alarm) until it
 is switched off, to find it in the last metres; the relay keeps the switch, also while the
 aircraft is offline.
@@ -23,7 +24,9 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import io
 import logging
+import math
 import os
 import queue
 import re
@@ -38,9 +41,10 @@ import uuid
 import webbrowser
 from dataclasses import dataclass
 from tkinter import messagebox, ttk
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import aircraft_card
+import maptiles
 import mavrelay as mr
 from aircraft_card import SIZE_NAMES, photo_caption, photo_files, photo_meta
 
@@ -690,6 +694,178 @@ class PhotoViewer(tk.Toplevel):
         self.picture.configure(image=self.shown, text="")
 
 
+class MapWindow(tk.Toplevel):
+    """The moving map: the aircraft on Esri World Imagery, with its track since MavLTE started (the relay's last
+    known position first), from the LTE module's own GNSS, one fix every 5 s. It follows the aircraft until
+    dragged; the wheel, the + and - keys or the buttons zoom, and Follow brings it back to the aircraft."""
+
+    ZOOM = 16  # to begin with: about a kilometre across
+    TRAIL = "#ffd23f"  # the track, yellow: it shows on fields and forest alike
+    CASING = "#101010"
+
+    def __init__(self, app: "App") -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.configure(bg=BG)
+        if app.icon is not None:
+            self.iconphoto(False, app.icon)
+        self.title(f"{app.settings.name} · {APP} map")
+        s, pad = app.scale, round(8 * app.scale)
+        bar = tk.Frame(self, bg=SURFACE)
+        bar.pack(side="bottom", fill="x")
+        ttk.Button(bar, text="Google Maps", command=app.open_google_maps).pack(side="right", padx=(0, pad), pady=pad)
+        self.follow_button = ttk.Button(bar, text="Follow", command=self.follow)
+        self.follow_button.pack(side="right", padx=(0, round(6 * s)))
+        for text, step in (("+", 1), ("−", -1)):
+            ttk.Button(bar, text=text, width=3, command=lambda step=step: self.zoom_by(step)).pack(
+                side="right", padx=(0, round(6 * s)))
+        self.where = tk.Label(bar, text="", bg=SURFACE, fg=TEXT, font=app.font, anchor="w")
+        self.where.pack(side="left", fill="x", expand=True, padx=(pad, 0))
+        self.canvas = c = tk.Canvas(self, width=round(600 * s), height=round(420 * s), bg=LOG_BG,
+                                    highlightthickness=0, cursor="fleur")
+        c.pack(fill="both", expand=True)
+        self.zoom = self.ZOOM
+        self.following = True
+        self.center: Optional[Tuple[float, float]] = None  # latitude, longitude of the middle, once dragged
+        self.drag: Optional[Tuple[int, int]] = None
+        self.photos: Dict[maptiles.Key, ImageTk.PhotoImage] = {}  # the tiles on the canvas
+        self.drawn: Optional[tuple] = None  # what the map was drawn for: it draws again when that changes
+        c.bind("<ButtonPress-1>", lambda e: setattr(self, "drag", (e.x, e.y)))
+        c.bind("<B1-Motion>", self._move)
+        c.bind("<ButtonRelease-1>", lambda _e: setattr(self, "drag", None))
+        c.bind("<MouseWheel>", lambda e: self.zoom_by(1 if e.delta > 0 else -1, (e.x, e.y)))
+        c.bind("<Button-4>", lambda e: self.zoom_by(1, (e.x, e.y)))  # the wheel on X11
+        c.bind("<Button-5>", lambda e: self.zoom_by(-1, (e.x, e.y)))
+        c.bind("<Configure>", lambda _e: self.draw())
+        for key, step in (("<plus>", 1), ("<KP_Add>", 1), ("<minus>", -1), ("<KP_Subtract>", -1)):
+            self.bind(key, lambda _e, step=step: self.zoom_by(step))
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self._paint_follow()
+        dark_title_bar(self)
+        self.job = self.after(100, self._tick)
+
+    def destroy(self) -> None:
+        if getattr(self, "job", None):  # (not there if the window failed while it was made)
+            self.after_cancel(self.job)
+        super().destroy()
+
+    def _tick(self) -> None:
+        if self.app.tiles.arrived() or self._drawn_for() != self.drawn:
+            self.draw()
+        self.job = self.after(250, self._tick)
+
+    def _drawn_for(self) -> tuple:
+        track = self.app.track
+        return (self.zoom, self.center, track.newest, len(track.fixes), self.app.fix_live, self.app.shown_where,
+                self.canvas.winfo_width(), self.canvas.winfo_height())
+
+    def _view(self) -> Optional[Tuple[float, float]]:
+        """The latitude and longitude in the middle of the map: the aircraft's, while it follows it."""
+        newest = self.app.track.newest
+        if self.center is None and newest is not None:
+            return newest.lat / 1e7, newest.lon / 1e7
+        return self.center
+
+    def draw(self) -> None:
+        c, s = self.canvas, self.app.scale
+        w, h = c.winfo_width(), c.winfo_height()
+        if w <= 1 or h <= 1:  # not laid out (yet): the size it asked for
+            w, h = int(c.cget("width")), int(c.cget("height"))
+        self.drawn = self._drawn_for()
+        text, color = self.app.shown_where  # as the card's Position
+        self.where.configure(text=text, fg=color)
+        c.delete("all")
+        view = self._view()
+        if view is None:
+            c.create_text(w / 2, h / 2, text="No position from the aircraft yet", fill=MUTED, font=self.app.font)
+            return
+        cx, cy = maptiles.to_pixel(*view, self.zoom)
+        photos: Dict[maptiles.Key, ImageTk.PhotoImage] = {}
+        for col, row in maptiles.tiles_around(cx, cy, w, h, self.zoom):
+            key = maptiles.tile_key(self.zoom, col, row)
+            photo = photos.get(key) or self.photos.get(key) or self._picture(key)
+            if photo is not None:
+                photos[key] = photo
+                c.create_image(round(col * maptiles.TILE - cx + w / 2), round(row * maptiles.TILE - cy + h / 2),
+                               image=photo, anchor="nw")
+        self.photos = photos
+        points: List[float] = []
+        for pos in self.app.track.fixes:
+            x, y = maptiles.to_pixel(pos.lat / 1e7, pos.lon / 1e7, self.zoom)
+            points += (x - cx + w / 2, y - cy + h / 2)
+        if len(points) >= 4:
+            for fill, width in ((self.CASING, 5), (self.TRAIL, 3)):
+                c.create_line(points, fill=fill, width=round(width * s), capstyle="round", joinstyle="round")
+        newest = self.app.track.newest
+        if newest is not None:
+            x, y = maptiles.to_pixel(newest.lat / 1e7, newest.lon / 1e7, self.zoom)
+            self._aircraft(x - cx + w / 2, y - cy + h / 2, aircraft_card.heading(newest),
+                           GREEN if self.app.fix_live else AMBER)
+        credit = c.create_text(w - round(4 * s), h - round(2 * s), text="Imagery: " + maptiles.ATTRIBUTION,
+                               anchor="se", fill=MUTED, font=self.app.font_small)
+        x0, y0, x1, y1 = c.bbox(credit)
+        c.tag_lower(c.create_rectangle(x0 - 4, y0, x1 + 4, y1 + 2, fill=LOG_BG, outline=""), credit)
+
+    def _picture(self, key: maptiles.Key) -> Optional[ImageTk.PhotoImage]:
+        data = self.app.tiles.get(key)
+        if data is None:
+            return None
+        try:
+            with Image.open(io.BytesIO(data)) as img:
+                return ImageTk.PhotoImage(img)
+        except Exception as exc:  # not a picture: the tile stays empty
+            log.debug("map tile %s: %s", key, exc)
+            return None
+
+    def _aircraft(self, x: float, y: float, heading: Optional[float], color: str) -> None:
+        """An arrow where it points, while it moves; a dot when it does not."""
+        c, s = self.canvas, self.app.scale
+        if heading is None:
+            r = 7 * s
+            c.create_oval(x - r, y - r, x + r, y + r, fill=color, outline=self.CASING, width=2)
+            return
+        a = math.radians(heading)
+        shape = []
+        for angle, length in ((0, 14), (140, 10), (180, 4), (220, 10)):  # tip, right wing, tail notch, left wing
+            b = a + math.radians(angle)
+            shape += (x + length * s * math.sin(b), y - length * s * math.cos(b))
+        c.create_polygon(shape, fill=color, outline=self.CASING, width=2)
+
+    def _move(self, event) -> None:
+        view = self._view()
+        if self.drag is None or view is None:
+            return
+        cx, cy = maptiles.to_pixel(*view, self.zoom)
+        self.center = maptiles.to_latlon(cx - (event.x - self.drag[0]), cy - (event.y - self.drag[1]), self.zoom)
+        self.drag = (event.x, event.y)
+        if self.following:
+            self.following = False
+            self._paint_follow()
+        self.draw()
+
+    def zoom_by(self, step: int, at: Optional[Tuple[int, int]] = None) -> None:
+        """One zoom level in or out; at: the pointer, whose place stays under it (unless following)."""
+        zoom = max(maptiles.MIN_ZOOM, min(maptiles.MAX_ZOOM, self.zoom + step))
+        view = self._view()
+        if zoom == self.zoom or view is None:
+            return
+        if at is not None and not self.following:
+            dx, dy = at[0] - self.canvas.winfo_width() / 2, at[1] - self.canvas.winfo_height() / 2
+            cx, cy = maptiles.to_pixel(*view, self.zoom)
+            x, y = maptiles.to_pixel(*maptiles.to_latlon(cx + dx, cy + dy, self.zoom), zoom)
+            self.center = maptiles.to_latlon(x - dx, y - dy, zoom)
+        self.zoom = zoom
+        self.draw()
+
+    def follow(self) -> None:
+        self.following, self.center = True, None
+        self._paint_follow()
+        self.draw()
+
+    def _paint_follow(self) -> None:
+        self.follow_button.configure(style="Accent.TButton" if self.following else "TButton")
+
+
 class SettingsDialog(tk.Toplevel):
     def __init__(self, app: "App") -> None:
         super().__init__(app.root)
@@ -809,6 +985,11 @@ class App:
         self.photos_in: "queue.Queue[Tuple[str, mr.PhotoInfo]]" = queue.Queue()  # saved by the agent's thread
         self.clicked_at = -1e9  # Snapshot: the photo that comes next opens in the viewer
         self.viewer: Optional[PhotoViewer] = None
+        self.track = aircraft_card.Track()  # where the aircraft has been since MavLTE started, for the map
+        self.tiles = maptiles.TileLoader()
+        self.map_window: Optional[MapWindow] = None
+        self.fix_live = False  # the newest fix is live (the aircraft reports), not the last known
+        self.shown_where: Tuple[str, str] = ("", TEXT)  # Position's text and colour, for the map too
         self.lan: Optional[str] = None  # this computer's address on its network, for the cards
         self.lan_at = -1e9
 
@@ -1056,6 +1237,7 @@ class App:
         self._update_server_label()
         self._remember("name", "server", "key")
         if changed:  # reconnect with the new server or key
+            self.track = aircraft_card.Track()  # another relay may have another aircraft
             cards = [card for card in (self.tcp_card, self.udp_card) if card.switch.on]
             if self.runner.running:
                 self.runner.stop()
@@ -1096,6 +1278,8 @@ class App:
         agent = self.runner.agent
         now = time.monotonic()
         status = None
+        if agent is not None:
+            self.track.add(agent.last_fix)
         if agent is None:
             self.relay_led.set(LED_OFF)
             self._set(self.relay_text, "Not connected: set the relay server and key (☰ → Settings)")
@@ -1227,6 +1411,9 @@ class App:
         now_unix = time.time()
         where = aircraft_card.position(agent, online, now_unix)
         self.shown_fix = where.fix
+        live = aircraft_card.live(agent, online, now_unix)
+        self.fix_live = live is not None and live.has_fix
+        self.shown_where = (where.text, PALETTE[where.color])
         self._paint(self.craft_values["Position"], where.text, PALETTE[where.color])
         for link in (self.map_link, self.copy_link):
             self._paint(link, link.cget("text"), BLUE if where.fix else LED_OFF)
@@ -1241,6 +1428,19 @@ class App:
         return link
 
     def open_map(self) -> None:
+        """The moving map; without Pillow, which reads its tiles, Google Maps in the browser."""
+        if self.shown_fix is None:
+            return
+        if Image is None:
+            self.open_google_maps()
+            return
+        if self.map_window is None or not self.map_window.winfo_exists():
+            self.map_window = MapWindow(self)
+        self.map_window.deiconify()
+        self.map_window.lift()
+        self.map_window.focus_set()
+
+    def open_google_maps(self) -> None:
         pos = self.shown_fix
         if pos is not None:
             webbrowser.open(aircraft_card.map_link(pos))

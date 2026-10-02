@@ -179,12 +179,13 @@ class WebTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"<title>MavLTE</title>", body)
         self.assertIn("script-src 'self'", r.getheader("Content-Security-Policy"))
+        self.assertIn("img-src 'self' https://server.arcgisonline.com;", r.getheader("Content-Security-Policy"))
         self.assertEqual((r.getheader("X-Frame-Options"), r.getheader("X-Content-Type-Options")), ("DENY", "nosniff"))
         for path, ctype in (("/app.js", "text/javascript"), ("/app.css", "text/css"), ("/icon.png", "image/png"),
                             ("/manifest.webmanifest", "application/manifest+json")):
             status, r, _ = self.request("GET", path)
             self.assertEqual((status, r.getheader("Content-Type").split(";")[0]), (200, ctype), path)
-        for path in ("/api/state", "/api/photos", "/photo/1790000000.jpg"):
+        for path in ("/api/state", "/api/photos", "/api/track", "/photo/1790000000.jpg"):
             self.assertEqual(self.request("GET", path)[0], 401, path)
         for path in ("/mavweb.py", "/../mavrelay.ini", "/web/app.js", "/photo/../mavrelay.ini", "/index.html"):
             self.assertEqual(self.request("GET", path)[0], 404, path)
@@ -276,6 +277,24 @@ class WebTest(unittest.TestCase):
         self.assertTrue(s["position"]["text"].startswith("last known 41.12346, 28.98765, "))
         self.assertEqual((s["position"]["color"], s["module"]["text"]), ("amber", "-"))
         self.assertEqual(s["position"]["copy"], "41.123457, 28.987654")  # still there to look for it
+        self.assertEqual((s["fix"]["lat"], s["fix"]["live"]), (41.1234567, False))  # the map's aircraft, in amber
+
+    def test_the_track_for_the_moving_map(self):
+        cookie = self.signed_in()
+        self.wait(cookie, lambda s: s["aircraft"]["text"] == "Online", "online")
+        self.assertEqual(json.loads(self.request("GET", "/api/track", cookie=cookie)[2]), {"fixes": []})
+        self.report(speed=1500, course=9000)  # flying east, at 15 m/s
+        s = self.wait(cookie, lambda s: s["fix"] is not None, "a fix")
+        self.assertEqual({k: v for k, v in s["fix"].items() if k != "time"},
+                         {"lat": 41.1234567, "lon": 28.9876543, "heading": 90.0, "live": True})
+        time.sleep(1.1)  # the relay stamps fixes in whole seconds
+        self.report(lat=411244567)  # 111 m north, and standing (no speed)
+        time.sleep(1.5)  # no phone asks meanwhile: the page's server keeps the track all the same
+        status, _, body = self.request("GET", "/api/track", cookie=cookie)
+        fixes = json.loads(body)["fixes"]
+        self.assertEqual([(lat, lon) for lat, lon, _ in fixes], [(41.1234567, 28.9876543), (41.1244567, 28.9876543)])
+        self.assertLess(fixes[0][2], fixes[1][2])
+        self.assertIsNone(self.state(cookie)["fix"]["heading"])
 
     def test_locator_voice(self):
         cookie = self.signed_in()

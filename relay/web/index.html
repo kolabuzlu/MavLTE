@@ -57,7 +57,7 @@
         <dd>
           <span id="position">-</span>
           <span class="actions">
-            <a class="pill" id="map" target="_blank" rel="noopener noreferrer">Map</a>
+            <button class="pill" id="open-map" type="button" disabled>Map</button>
             <button class="pill" id="copy" type="button">Copy</button>
           </span>
         </dd>
@@ -96,6 +96,31 @@
     <button id="newer" type="button" aria-label="Newer photo">›</button>
   </div>
   <button class="close" id="viewer-close" type="button" aria-label="Close">×</button>
+</div>
+
+<div class="mapview" id="mapview" role="dialog" aria-modal="true" aria-label="Moving map" hidden>
+  <div class="map" id="map">
+    <div id="tiles"></div>
+    <svg class="overlay" aria-hidden="true">
+      <polyline class="casing" id="trail-casing" points=""/>
+      <polyline class="trail" id="trail" points=""/>
+      <g id="plane">
+        <circle id="plane-dot" r="7"/>
+        <path id="plane-arrow" d="M0,-14 L6.4,7.7 L0,4 L-6.4,7.7 Z"/>
+      </g>
+    </svg>
+    <p class="credit">Imagery: Esri, Vantor, Earthstar Geographics, and the GIS User Community</p>
+  </div>
+  <div class="map-bar">
+    <p id="map-where"></p>
+    <div class="map-buttons">
+      <button id="zoom-out" type="button" aria-label="Zoom out">−</button>
+      <button id="zoom-in" type="button" aria-label="Zoom in">+</button>
+      <button id="follow" type="button" aria-pressed="true">Follow</button>
+      <a class="pill" id="google" target="_blank" rel="noopener noreferrer">Google Maps</a>
+    </div>
+  </div>
+  <button class="close" id="map-close" type="button" aria-label="Close">×</button>
 </div>
 </body>
 </html>

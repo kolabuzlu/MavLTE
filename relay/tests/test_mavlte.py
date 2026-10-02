@@ -15,11 +15,13 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
+import maptiles  # noqa: E402
 import mavrelay as mr  # noqa: E402
 from test_mavrelay import KEY_G, KEY_V, v2_frame  # noqa: E402
 
@@ -355,7 +357,7 @@ class GuiTest(unittest.TestCase):
                 mock.patch.object(app.root, "clipboard_append", copied.append), \
                 mock.patch.object(mavlte.webbrowser, "open", opened.append):
             app.copy_position()
-            app.open_map()
+            app.open_google_maps()  # from the moving map (Map)
         self.assertEqual(copied, ["41.123457, 28.987654"])
         self.assertEqual(opened, ["https://www.google.com/maps/search/?api=1&query=41.123457,28.987654"])
 
@@ -366,6 +368,62 @@ class GuiTest(unittest.TestCase):
         self.pump(lambda: value("Position").startswith("last known 41.12346, 28.98765, "), what="last known")
         self.assertEqual(app.craft_values["Position"].cget("fg"), mavlte.AMBER)
         self.assertEqual(value("Module"), "-")
+
+    @unittest.skipUnless(mavlte.Image is not None if HAVE_TK else False, "the moving map needs Pillow")
+    def test_moving_map(self):
+        app = self.app
+        from PIL import Image
+        out = io.BytesIO()
+        Image.new("RGB", (256, 256), (60, 90, 50)).save(out, "JPEG")
+        asked = []
+        app.tiles.fetch = lambda url: asked.append(url) or out.getvalue()  # Esri, without the internet
+
+        def report(**kw):
+            fields = dict(gnss_time=int(time.time()), lat=411234567, lon=289876543, alt=150_000, sats=11,
+                          fix=mr.FIX_3D, fc_silent=0)
+            fields.update(kw)
+            self.loop.call_soon_threadsafe(self.vehicle.send_packet, mr.POSITION, mr.Position(**fields).pack())
+
+        self.pump(lambda: app.camera.enabled, what="aircraft online")
+        report(speed=1500, course=9000)  # flying east
+        self.pump(lambda: app.track.newest is not None and app.shown_fix is not None, what="a fix on the track")
+        app.open_map()
+        win = app.map_window
+        win.withdraw()  # drawn all the same, at the size it asks for
+        canvas = win.canvas
+        kinds = lambda: [canvas.type(item) for item in canvas.find_all()]  # noqa: E731
+        self.pump(lambda: "image" in kinds(), what="tiles on the map")
+        x, y = maptiles.to_pixel(41.1234567, 28.9876543, 16)
+        self.assertIn(f"/World_Imagery/MapServer/tile/16/{int(y // 256)}/{int(x // 256)}", " ".join(asked))
+        [arrow] = [item for item in canvas.find_all() if canvas.type(item) == "polygon"]
+        x0, y0, x1, y1 = canvas.bbox(arrow)
+        middle = (int(canvas.cget("width")) / 2, int(canvas.cget("height")) / 2)  # it follows the aircraft
+        self.assertLess(abs((x0 + x1) / 2 - middle[0]) + abs((y0 + y1) / 2 - middle[1]), 12)
+        self.assertGreater(x1 - x0, y1 - y0)  # pointing east: wider than tall
+        self.assertEqual(canvas.itemcget(arrow, "fill"), mavlte.GREEN)  # live
+        self.assertEqual(win.where.cget("text"), self.text(app.craft_values["Position"]))
+
+        second = time.time() + 1.1
+        self.pump(lambda: time.time() > second, what="a second: the relay stamps fixes in whole seconds")
+        report(lat=411244567)  # 111 m north, standing still
+        self.pump(lambda: len(app.track.fixes) == 2, what="the second fix")
+        self.pump(lambda: kinds().count("line") == 2 and "oval" in kinds(), what="the track, and a dot")
+
+        win.zoom_by(1)
+        self.assertEqual(win.zoom, 17)
+        win.drag = (100, 100)
+        win._move(SimpleNamespace(x=160, y=140))  # dragged: it stops following
+        self.assertFalse(win.following)
+        self.assertEqual(str(win.follow_button.cget("style")), "TButton")
+        win.follow()
+        self.assertEqual((win.following, win.center, str(win.follow_button.cget("style"))), (True, None,
+                                                                                            "Accent.TButton"))
+        win.destroy()
+
+        opened = []
+        with mock.patch.object(mavlte, "Image", None), mock.patch.object(mavlte.webbrowser, "open", opened.append):
+            app.open_map()  # without Pillow, which reads the tiles: Google Maps, as before
+        self.assertEqual(opened, ["https://www.google.com/maps/search/?api=1&query=41.124457,28.987654"])
 
     def test_chip_temperature(self):
         app = self.app

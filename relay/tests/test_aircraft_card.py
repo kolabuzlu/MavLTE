@@ -6,6 +6,7 @@ import sys
 import time
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -125,6 +126,29 @@ class CardTest(unittest.TestCase):
         photos.arriving = (mr.PhotoInfo(1, 40 * 1024, 1024, 768), 10 * 1024)
         self.assertEqual(card.camera(a, True, 1, 100.0),
                          ("Arriving: 10 of 40 KB (1024×768)", card.TEXT, 0.25, False, True))
+
+    def test_track(self):
+        track = card.Track()
+        self.assertIsNone(track.newest)
+        first = report(time=1790000100)
+        self.assertTrue(track.add(first))
+        self.assertFalse(track.add(first))  # the same fix again: the app looks four times a second
+        self.assertFalse(track.add(report(time=1790000099)))  # older: the relay's last known, after a newer one
+        self.assertFalse(track.add(report(time=1790000200, fix=mr.FIX_NONE, lat=mr.UNKNOWN_I32, lon=mr.UNKNOWN_I32)))
+        self.assertFalse(track.add(None))
+        self.assertTrue(track.add(report(time=1790000105, lat=411244567)))
+        self.assertEqual(([p.time for p in track.fixes], track.newest.lat), ([1790000100, 1790000105], 411244567))
+        with mock.patch.object(card.Track, "MOST", 3):
+            short = card.Track()
+        for t in range(5):
+            short.add(report(time=1790000000 + t))
+        self.assertEqual([p.time - 1790000000 for p in short.fixes], [2, 3, 4])  # the oldest go
+
+    def test_heading(self):
+        self.assertIsNone(card.heading(report()))  # no speed, no course
+        self.assertIsNone(card.heading(report(speed=150, course=9000)))  # too slow to tell
+        self.assertIsNone(card.heading(report(speed=1500)))
+        self.assertEqual(card.heading(report(speed=1500, course=27050)), 270.5)
 
     def test_photo_caption(self):
         meta = dict(mr.PhotoInfo(1790000000, 40 * 1024, 1024, 768, 411234567, 289876543, 120_000, 4500,
