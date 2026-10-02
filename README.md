@@ -219,6 +219,8 @@ registered). The red part at the top, beside the logo, is the ESP32's ceramic an
 | ESP32 RX ← flight controller TX | **IO42** | **IO3** |
 | Ground | GND | GND |
 
+![Wiring a V2 board: IO2 to the flight controller's RX, IO3 to its TX, GND, and a 5 V BEC of its own on 5V and GND](docs/wiring-v2.png)
+
 The pins are labelled on the board. Do not connect the flight controller's 5 V pin. The pin
 headers may come loose in the box and need soldering. If you need other pins, set them in
 menuconfig; never use GPIO17/18 (the modem's UART, also on header pins 32 and 34: connect nothing
@@ -334,7 +336,7 @@ server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
   module is online at the relay, even with the switches off. **Connected** (blue, next to the
   switch) lights while it is online and that port is on. The bars show its 4G signal. The
   header shows the link to the relay, the *Aircraft* panel the aircraft's link (signal and
-  round trip), packet loss and traffic, and ☰ → Show log the details.
+  round trip), packet loss and traffic, and ☰ → Show log the details, in a window of its own.
 - In Mission Planner pick **UDP**, port **14550**, or **TCP**, host **127.0.0.1**, port **5760**.
   QGroundControl finds UDP 14550 by itself.
 - **From another computer, a tablet or a phone** on the same network: switch the port off, set

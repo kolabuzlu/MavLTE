@@ -612,6 +612,37 @@ class GuiTest(unittest.TestCase):
             self.pump(lambda: board.closed, what="the port closed")
             win.destroy()
 
+    def test_log_window(self):
+        """☰ → Show log opens the log in a window of its own; Hide log, or its own ✕, closes it, and the menu says
+        which (with the log inside the main window, a maximized MavLTE had no room for it and the menu kept
+        saying Hide log)."""
+        app = self.app
+        label = lambda: app.menu.entrycget(1, "label")  # noqa: E731
+        self.root.state("zoomed")  # maximized, as the user had it
+        self.pump(lambda: app.log_history, what="something logged")
+        self.assertEqual(label(), "Show log")
+        app.toggle_log()
+        win = app.log_window
+        win.withdraw()
+        self.assertEqual(label(), "Hide log")
+        text = lambda: win.text.get("1.0", "end")  # noqa: E731
+        self.assertIn(app.log_history[0], text())  # what came before it opened
+        mavlte.log.info("a line while the window is open")
+        self.pump(lambda: "a line while the window is open" in text(), what="the new line in the window")
+        app.toggle_log()
+        self.assertFalse(app.log_shown())
+        self.assertEqual(label(), "Show log")
+        app.toggle_log()
+        app.log_window.destroy()  # its own ✕
+        app._menu_labels()  # as the menu does when it opens
+        self.assertEqual(label(), "Show log")
+        mavlte.log.info("a line while it is closed")
+        self.pump(lambda: any("a line while it is closed" in line for line in app.log_history),
+                  what="kept while closed")
+        app.toggle_log()
+        app.log_window.withdraw()
+        self.assertIn("a line while it is closed", app.log_window.text.get("1.0", "end"))
+
     def test_wrong_key_says_no_answer(self):
         app = self.app
         app.apply_settings(app.settings.name, app.settings.server, KEY_V.hex())  # not the GCS key: no answer

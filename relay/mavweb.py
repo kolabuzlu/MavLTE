@@ -74,6 +74,7 @@ COOKIE = "mavlte"
 SIGNED_IN_S = 180 * 86400  # a phone stays signed in this long after its last visit
 ROUNDS = 600_000  # PBKDF2-SHA256, for the password
 KEEP_PHOTOS = 200  # the newest photos kept in photo_dir
+BODY_MOST = 4096  # bytes in a request's body, at most: the page's are a few dozen
 PHOTO_NAME = re.compile(r"MavLTE_.*_(\d+)\.jpg")
 
 wlog = mr.log.getChild("web")
@@ -445,15 +446,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         return origin is None or urllib.parse.urlsplit(origin).netloc == self.headers.get("Host", "")
 
-    def read_json(self) -> Optional[dict]:
+    def read_body(self) -> Optional[bytes]:
+        """The request's body, all of it, before any answer: bytes left unread when the connection closes turn the
+        close into a reset, which can overtake the answer (seen on Windows; Linux does the same). None if it cannot be
+        one of the page's: then up to 64 KB of it are read and dropped."""
         try:
             n = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            return None
-        if not 0 <= n <= 4096:
+            n = -1
+        if 0 <= n <= BODY_MOST:
+            return self.rfile.read(n)
+        self.close_connection = True
+        left = min(max(n, 0), 64 * 1024)
+        while left > 0:
+            chunk = self.rfile.read(min(left, 8192))
+            if not chunk:
+                break
+            left -= len(chunk)
+        return None
+
+    @staticmethod
+    def parse_json(body: Optional[bytes]) -> Optional[dict]:
+        if body is None:
             return None
         try:
-            data = json.loads(self.rfile.read(n) or b"{}")
+            data = json.loads(body or b"{}")
         except ValueError:
             return None
         return data if isinstance(data, dict) else None
@@ -509,9 +526,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _post(self) -> None:
         path = urllib.parse.urlsplit(self.path).path
+        body = self.read_body()  # first, whatever the answer
         if not self.from_the_page():
             return self.send_json(403, {"error": "Not from the page"})
-        data = self.read_json()
+        data = self.parse_json(body)
         if data is None:
             return self.send_json(400, {"error": "Bad request"})
         if path == "/api/signin":

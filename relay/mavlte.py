@@ -24,6 +24,7 @@ settings_file). Tkinter, and Pillow to show the photos (without it they open in 
 from __future__ import annotations
 
 import asyncio
+import collections
 import ctypes
 import io
 import logging
@@ -618,6 +619,44 @@ class VoiceRow(tk.Frame):
     def show(self, text: str, color: str = DIM) -> None:
         if self.status.cget("text") != text or self.status.cget("fg") != color:
             self.status.configure(text=text, fg=color)
+
+
+class LogWindow(tk.Toplevel):
+    """MavLTE's log (☰ → Show log): what the app did and heard, newest at the bottom, in a window of its own, as the
+    main window has no height to spare on a 1080p laptop (maximized, it had none at all for the log)."""
+
+    def __init__(self, app: "App") -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.configure(bg=BG)
+        if app.icon is not None:
+            self.iconphoto(False, app.icon)
+        self.title(f"{app.settings.name} · {APP} log")
+        frame = tk.Frame(self, bg=BG, padx=round(8 * app.scale), pady=round(8 * app.scale))
+        frame.pack(fill="both", expand=True)
+        self.text = tk.Text(frame, height=24, width=96, font=("Consolas", 9), bg=LOG_BG, fg="#b8bcc2", relief="flat",
+                            highlightbackground=BORDER, highlightthickness=1, wrap="word", insertbackground=TEXT,
+                            state="disabled")
+        scroll = ttk.Scrollbar(frame, command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+        self.bind("<Escape>", lambda _e: self.destroy())
+        dark_title_bar(self)
+        self.add(list(app.log_history))
+
+    def add(self, lines: List[str]) -> None:
+        if not lines:
+            return
+        at_end = self.text.yview()[1] >= 0.999  # scrolled back to read: it stays there
+        self.text.configure(state="normal")
+        self.text.insert("end", "\n".join(lines) + "\n")
+        excess = int(self.text.index("end-1c").split(".")[0]) - App.LOG_LINES
+        if excess > 0:
+            self.text.delete("1.0", f"{excess}.0")
+        if at_end:
+            self.text.see("end")
+        self.text.configure(state="disabled")
 
 
 class PhotoViewer(tk.Toplevel):
@@ -1466,6 +1505,7 @@ def setup_style(root: tk.Tk) -> None:
 
 class App:
     POLL_MS = 250
+    LOG_LINES = 500  # kept for the log window
 
     def __init__(self, root: tk.Tk, config_path: str = CONFIG) -> None:
         self.root = root
@@ -1473,6 +1513,8 @@ class App:
         self.settings = Settings.load(config_path)
         self.runner = AgentRunner()
         self.log_lines: "queue.Queue[str]" = queue.Queue()
+        self.log_history: "collections.deque[str]" = collections.deque(maxlen=self.LOG_LINES)
+        self.log_window: Optional[LogWindow] = None
         self.log_handler = LogHandler(self.log_lines)
         logging.getLogger("mavrelay").addHandler(self.log_handler)
         logging.getLogger("mavrelay").setLevel(logging.INFO)
@@ -1536,11 +1578,12 @@ class App:
         self.menu = tk.Menu(root, tearoff=0, bg=SURFACE, fg=TEXT, activebackground=FIELD, activeforeground=TEXT,
                             bd=0)
         self.menu.add_command(label="Settings…", command=self.open_settings)
-        self.menu.add_command(label="Show log", command=self.toggle_log)
+        self.menu.add_command(label="Show log", command=self.toggle_log)  # entry 1, labelled by _menu_labels
         self.menu.add_command(label="Photo folder", command=self.open_photo_folder)
         self.menu.add_command(label="Flight logs…", command=self.open_logs)
         self.menu.add_separator()
         self.menu.add_command(label="Exit", command=self.close)
+        self.menu.configure(postcommand=self._menu_labels)
         menu_button.bind("<Button-1>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
 
         who = tk.Frame(header, bg=SURFACE)
@@ -1610,15 +1653,6 @@ class App:
         newest = photo_files(self.settings.photo_folder())
         self.camera.thumbnail.show(newest[-1] if newest else None)
         self._show_last(newest[-1] if newest else None)
-
-        self.log_frame = tk.Frame(self.body, bg=BG)
-        self.log_text = tk.Text(self.log_frame, height=7, width=48, font=("Consolas", 9), bg=LOG_BG, fg="#b8bcc2",
-                                relief="flat", highlightbackground=BORDER, highlightthickness=1, wrap="word",
-                                insertbackground=TEXT, state="disabled")
-        scroll = ttk.Scrollbar(self.log_frame, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        self.log_text.pack(side="left", fill="both", expand=True)
         self._update_server_label()
 
     def _update_server_label(self) -> None:
@@ -1755,13 +1789,26 @@ class App:
         self.logs_window.lift()
         self.logs_window.focus_set()
 
+    def log_shown(self) -> bool:
+        return self.log_window is not None and self.log_window.winfo_exists()
+
     def toggle_log(self) -> None:
-        if self.log_frame.winfo_ismapped():
-            self.log_frame.pack_forget()
-            self.menu.entryconfigure(1, label="Show log")
+        """Opens the log window beside the main one, or closes it."""
+        if self.log_shown():
+            self.log_window.destroy()
         else:
-            self.log_frame.pack(fill="both", expand=True, pady=(round(8 * self.scale), 0))
-            self.menu.entryconfigure(1, label="Hide log")
+            self.log_window = win = LogWindow(self)
+            win.update_idletasks()
+            root = self.root
+            x = root.winfo_rootx() + root.winfo_width() + round(8 * self.scale)
+            if x + win.winfo_reqwidth() > root.winfo_screenwidth():  # no room on the right: on the left
+                x = max(0, root.winfo_rootx() - win.winfo_reqwidth() - round(16 * self.scale))
+            win.geometry(f"+{x}+{max(0, root.winfo_rooty() - round(30 * self.scale))}")
+        self._menu_labels()
+
+    def _menu_labels(self) -> None:
+        """Show log or Hide log, as the log window is: it may have been closed with its own ✕."""
+        self.menu.entryconfigure(1, label="Hide log" if self.log_shown() else "Show log")
 
     def close(self) -> None:
         self.root.after_cancel(self.poll_job)
@@ -1976,14 +2023,9 @@ class App:
                 lines.append(self.log_lines.get_nowait())
             except queue.Empty:
                 break
-        if lines:
-            self.log_text.configure(state="normal")
-            self.log_text.insert("end", "\n".join(lines) + "\n")
-            excess = int(self.log_text.index("end-1c").split(".")[0]) - 500
-            if excess > 0:
-                self.log_text.delete("1.0", f"{excess}.0")
-            self.log_text.see("end")
-            self.log_text.configure(state="disabled")
+        self.log_history.extend(lines)
+        if lines and self.log_shown():
+            self.log_window.add(lines)
 
 
 def main() -> None:
