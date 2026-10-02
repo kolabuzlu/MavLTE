@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
-import json
 import logging
 import os
 import queue
@@ -41,7 +40,9 @@ from dataclasses import dataclass
 from tkinter import messagebox, ttk
 from typing import Callable, List, Optional, Tuple
 
+import aircraft_card
 import mavrelay as mr
+from aircraft_card import SIZE_NAMES, photo_caption, photo_files, photo_meta
 
 try:
     from PIL import Image, ImageTk
@@ -86,15 +87,15 @@ AMBER = "#d8a23a"
 RED = "#ff5555"
 LED_OFF = "#3a3b3e"
 TRACK_OFF = "#4a4b4f"
+# the Aircraft card's colours (aircraft_card.py) in this palette
+PALETTE = {aircraft_card.TEXT: TEXT, aircraft_card.MUTED: MUTED, aircraft_card.DIM: DIM, aircraft_card.GREEN: GREEN,
+           aircraft_card.BLUE: BLUE, aircraft_card.AMBER: AMBER, aircraft_card.RED: RED, aircraft_card.OFF: LED_OFF}
 
 log = logging.getLogger("mavrelay.app")
 
 
 # ---------------------------------------------------------------------------------------------
 # Settings
-
-
-SIZE_NAMES = ("small", "medium", "large")  # mr.SNAP_SIZES
 
 
 @dataclass
@@ -179,44 +180,6 @@ def pictures_folder() -> str:
         except (AttributeError, OSError):
             pass
     return os.path.join(os.path.expanduser("~"), "Pictures")
-
-
-def photo_files(folder: str) -> List[str]:
-    """The photos in the folder, oldest first (by photo id: the relay's clock when it was asked for)."""
-    try:
-        names = os.listdir(folder)
-    except OSError:
-        return []
-    found = [(int(m.group(1)), os.path.join(folder, name)) for name in names
-             for m in [re.fullmatch(r"MavLTE_.*_(\d+)\.jpg", name)] if m]
-    return [path for _, path in sorted(found)]
-
-
-def photo_meta(path: str) -> dict:
-    try:
-        with open(path[:-4] + ".json", encoding="utf-8") as f:
-            meta = json.load(f)
-        return meta if isinstance(meta, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def photo_caption(meta: dict, short: bool = False) -> str:
-    """When and where the photo was taken, from the .json beside it."""
-    parts = []
-    when = meta.get("time") or meta.get("photo_id")
-    if isinstance(when, int) and when > 0:
-        parts.append(time.strftime("%H:%M:%S" if short else "%d %b %Y, %H:%M:%S", time.localtime(when)))
-    if not short and isinstance(meta.get("latitude"), (int, float)):
-        parts.append(f"{meta['latitude']:.6f}, {meta.get('longitude', 0):.6f}")
-    if isinstance(meta.get("altitude_m"), (int, float)):
-        parts.append(f"{meta['altitude_m']:.0f} m" + ("" if short else " above home"))
-    heading = meta.get("heading")
-    if isinstance(heading, int) and heading != mr.UNKNOWN_HEADING:
-        parts.append(f"heading {heading / 100:.0f}°")
-    if not short and meta.get("width"):
-        parts.append(f"{meta['width']}×{meta.get('height')}, {meta.get('size', 0) / 1024:.0f} KB")
-    return " · ".join(parts)
 
 
 def reveal(path: str) -> None:
@@ -962,7 +925,7 @@ class App:
                 self.chip_temp = tk.Label(cell, text="", bg=SURFACE, fg=TEXT, font=self.font, anchor="w", padx=0)
                 self.chip_temp.pack(side="left")
         self.shown_fix: Optional[mr.Position] = None  # the position Map and Copy use
-        self.voice_waiting_at: Optional[float] = None  # voice on, aircraft online, not sounding yet: since when
+        self.voice_state = aircraft_card.Voice()
         self.camera = CameraRow(self, craft)
         self.camera.pack(fill="x")
         newest = photo_files(self.settings.photo_folder())
@@ -1021,7 +984,7 @@ class App:
     def choose_size(self, index: int) -> None:
         self.settings.photo_size = SIZE_NAMES[index]
         self._remember("photo_size")
-        self.camera.show(self.SIZE_HINTS[index])
+        self.camera.show(aircraft_card.SIZE_HINTS[index])
 
     def show_photo(self, path: Optional[str] = None) -> None:
         """Opens the photo (the last one: the thumbnail's) in the viewer."""
@@ -1137,20 +1100,13 @@ class App:
             self.relay_led.set(LED_OFF)
             self._set(self.relay_text, "Not connected: set the relay server and key (☰ → Settings)")
         else:
-            client = agent.client
-            if client.session:
-                rtt = f" · {client.rtt_ms} ms" if client.rtt_ms != mr.U16_UNKNOWN else ""
-                self.relay_led.set(GREEN)
-                self._set(self.relay_text, f"Connected to the relay{rtt}")
+            led, text = aircraft_card.relay(agent.client)
+            self.relay_led.set(PALETTE[led])
+            self._set(self.relay_text, text)
+            if agent.client.session:
                 status = agent.vehicle_status()
-            elif client.hellos >= 5:
-                self.relay_led.set(RED)
-                self._set(self.relay_text, "No answer from the relay: check server, UDP port and key")
-            else:
-                self.relay_led.set(AMBER)
-                self._set(self.relay_text, "Connecting to the relay…")
-        online = bool(status and status.online)
-        bars = self._bars(status) if online else None
+        online = aircraft_card.is_online(status)
+        bars = aircraft_card.bars(status)
 
         for card in (self.tcp_card, self.udp_card):
             card.available.set(GREEN if online else LED_OFF)
@@ -1178,9 +1134,6 @@ class App:
         self._take_photos(now)
         self._show_camera(agent, online, now)
         self.poll_job = self.root.after(self.POLL_MS, self.poll)
-
-    # size hints: typical JPEG sizes from the aircraft's OV5640 (bright, detailed scenes: the upper end)
-    SIZE_HINTS = ("320×240, about 5-10 KB", "640×480, about 10-30 KB", "1024×768, about 25-80 KB")
 
     def _take_photos(self, now: float) -> None:
         """Photos the agent saved: the newest goes on the thumbnail; after a Snapshot click, into the
@@ -1216,66 +1169,17 @@ class App:
             self.camera.last.configure(text=text)
 
     def _show_camera(self, agent, online: bool, now: float) -> None:
-        card = self.camera
-        photos = agent.photos if agent is not None else None
-        connected = agent is not None and bool(agent.client.session)
-        arriving = photos.arriving if photos is not None else None
-        busy = False
-        if not connected:
-            card.show("Not connected to the relay")
-        elif arriving is not None:
-            info, got = arriving
-            card.show(f"Arriving: {got / 1024:.0f} of {info.size / 1024:.0f} KB ({info.width}×{info.height})", TEXT,
-                      got / info.size)
-            busy = True
-        elif photos.asked_at is not None:
-            card.show("Asking the aircraft…", TEXT)
-            busy = True
-        elif photos.problem and now - photos.problem_at < 60.0:
-            card.show(f"No photo: {photos.problem}", AMBER)
-        elif not online:
-            card.show("The aircraft is offline")
-        else:
-            card.show(self.SIZE_HINTS[card.size.selected])
-        card.set_enabled(connected and online and not busy)
-        card.size.set_enabled(not busy)
-
-    VOICE_ANSWER_S = 10.0  # an aircraft that has not said it sounds by then may not know the voice
+        cam = aircraft_card.camera(agent, online, self.camera.size.selected, now)
+        self.camera.show(cam.text, PALETTE[cam.color], cam.fraction)
+        self.camera.set_enabled(cam.ready)
+        self.camera.size.set_enabled(not cam.busy)
 
     def _show_voice(self, agent, status: Optional[mr.LinkStatus], now: float) -> None:
-        """The switch shows the relay's: it keeps it, whoever switched it, also while the aircraft is away."""
-        row = self.voice
-        if agent is None or not agent.client.session:
-            row.switch.set(False)
-            row.show("Not connected to the relay")
-            return
-        pending = agent.voice_request
-        if pending is not None:  # sent, and not yet in the relay's STATUS
-            row.switch.set(pending)
-            row.show("Switching on…" if pending else "Switching off…", TEXT)
-            return
-        if status is None:
-            return
-        row.switch.set(status.voice_on)
-        waiting = status.voice_on and status.online and not (status.speaking or status.voice_failed)
-        if not waiting:
-            self.voice_waiting_at = None
-        elif self.voice_waiting_at is None:
-            self.voice_waiting_at = now
-        if not status.voice_on:
-            row.show("Off: switch on to hear the aircraft")
-        elif status.voice_failed:
-            row.show("On, but the aircraft cannot play it", RED)  # its modem refuses
-        elif status.speaking and status.online:
-            row.show("On: the aircraft's speaker is sounding", GREEN)
-        elif status.speaking:  # and it goes on without the relay
-            row.show("On: it was sounding when last heard", AMBER)
-        elif not status.online:
-            row.show("On: sounds once the aircraft is back", AMBER)
-        elif now - self.voice_waiting_at < self.VOICE_ANSWER_S:
-            row.show("On: waiting for the aircraft…", TEXT)
-        else:  # it does not say whether it sounds
-            row.show("On, but no answer: firmware before 1.5.0?", AMBER)
+        shown = self.voice_state.show(agent, status, now)
+        if shown is not None:
+            on, line = shown
+            self.voice.switch.set(on)
+            self.voice.show(line.text, PALETTE[line.color])
 
     def _reached_at(self, host: str, now: float) -> str:
         """The address GCS software connects to, for a port on `host`. On all of them (0.0.0.0): this
@@ -1294,22 +1198,16 @@ class App:
             return f"Waiting for the aircraft\n{gcs or 'Mission Planner: ' + where}", DIM
         return (gcs, GREEN) if gcs else (f"Waiting for Mission Planner: {where}", DIM)
 
-    @staticmethod
-    def _bars(status: mr.LinkStatus) -> int:
-        if status.rssi_dbm != mr.RSSI_UNKNOWN:
-            return sum(status.rssi_dbm >= limit for limit in (-105, -95, -85, -75))
-        worst = max(v for v in (status.up_loss, status.down_loss, 0) if v != mr.U16_UNKNOWN)
-        return 4 if worst < 10 else 3 if worst < 50 else 2 if worst < 150 else 1
-
     def _show_aircraft(self, agent, status: Optional[mr.LinkStatus], now: float) -> None:
         v = self.craft_values
         if agent is not None and now - self.rate_mark[0] >= 1.0:
             t, down, up = self.rate_mark
             self.rates = ((agent.to_gcs_bytes - down) / (now - t), (agent.from_gcs_bytes - up) / (now - t))
             self.rate_mark = (now, agent.to_gcs_bytes, agent.from_gcs_bytes)
+        led, text = aircraft_card.headline(agent, status)
+        self.craft_led.set(PALETTE[led])
+        self._set(self.craft_state, text)
         if agent is None or not agent.client.session:
-            self.craft_led.set(LED_OFF)
-            self._set(self.craft_state, "Not connected to the relay")
             for label in v.values():
                 self._set(label, "-")
             self.craft_bars.set(None)
@@ -1317,83 +1215,24 @@ class App:
             self.rates = (0.0, 0.0)
             self._show_position(agent, False)
             return
-        if status is None:
-            self.craft_led.set(LED_OFF)
-            self._set(self.craft_state, "Waiting for news from the relay…")
-        elif status.online:  # green when available, blue when connected, as the LEDs on the cards
-            self.craft_led.set(GREEN if agent.watching else BLUE)
-            self._set(self.craft_state, "Available: switch TCP or UDP on" if agent.watching else "Online")
-        elif status.idle_ms == mr.U16_UNKNOWN:
-            self.craft_led.set(LED_OFF)
-            self._set(self.craft_state, "Not connected to the relay (yet)")
-        else:
-            self.craft_led.set(RED)
-            silence = agent.vehicle_silence()  # counts on where STATUS tops out (65.5 s)
-            heard = f"{silence:.0f} s ago" if silence is not None else "over a minute ago"
-            self._set(self.craft_state, f"Offline, last heard {heard}")
-        online = bool(status and status.online)
-        self.craft_bars.set(self._bars(status) if online else None)
-        if online:  # the aircraft's radio and its round trip to the relay, on one line
-            link = [mr.RAT_NAMES.get(status.rat, "")] if status.rat != mr.RAT_UNKNOWN else []
-            if status.rssi_dbm != mr.RSSI_UNKNOWN:
-                link.append(f"{status.rssi_dbm} dBm")
-            link = [" ".join(link)] if link else []
-            if status.rtt_ms != mr.U16_UNKNOWN:
-                link.append(f"round trip {status.rtt_ms} ms")
-            self._set(v["Link"], " · ".join(link) or "-")
-            self._set(v["Packet loss"], f"up {mr.fmt_permille(status.up_loss)}, down {mr.fmt_permille(status.down_loss)}")
-        else:
-            for label in ("Link", "Packet loss"):
-                self._set(v[label], "-")
+        self.craft_bars.set(aircraft_card.bars(status))
+        self._set(v["Link"], aircraft_card.link(status))
+        self._set(v["Packet loss"], aircraft_card.loss(status))
         down, up = self.rates
         self._set(v["Traffic"], f"↓ {down / 1000:.1f} KB/s telemetry, ↑ {up / 1000:.1f} KB/s commands")
-        self._show_position(agent, online)
-
-    LIVE_S = 15.0  # a position report older than this (the module sends one every 5 s) is not live
+        self._show_position(agent, aircraft_card.is_online(status))
 
     def _show_position(self, agent, online: bool) -> None:
-        """The aircraft's own GNSS position, whatever its flight controller does: live while it reports,
-        else the last known one (the relay keeps it). Map and Copy take the one shown."""
-        pos = agent.position if agent is not None else None
-        fix = agent.last_fix if agent is not None else None
+        """Map and Copy take the position shown."""
         now_unix = time.time()
-        live = online and pos is not None and now_unix - pos.time < self.LIVE_S
-        shown, color = None, TEXT
-        if live and pos.has_fix:
-            shown = pos
-            text = f"{pos.lat / 1e7:.5f}, {pos.lon / 1e7:.5f} · {pos.sats} satellites"
-        elif fix is not None:
-            shown = fix
-            text = f"last known {fix.lat / 1e7:.5f}, {fix.lon / 1e7:.5f}, {mr.fmt_age(now_unix - fix.time)} ago"
-            color = AMBER if not online else MUTED
-        elif live and pos.flags & mr.POS_NO_GNSS:
-            text, color = "the LTE module cannot read its GNSS", MUTED
-        elif live:
-            text, color = f"GNSS searching ({pos.sats} satellites)", MUTED
-        else:
-            text, color = "-", TEXT
-        self.shown_fix = shown
-        self._paint(self.craft_values["Position"], text, color)
+        where = aircraft_card.position(agent, online, now_unix)
+        self.shown_fix = where.fix
+        self._paint(self.craft_values["Position"], where.text, PALETTE[where.color])
         for link in (self.map_link, self.copy_link):
-            self._paint(link, link.cget("text"), BLUE if shown else LED_OFF)
-
-        module, color = "-", TEXT
-        temp, temp_color = "", TEXT
-        if live:
-            if pos.fc_silent == mr.U16_UNKNOWN:
-                module, color = "flight controller not heard yet", AMBER
-            elif pos.fc_is_silent:
-                module, color = f"flight controller silent for {mr.fmt_age(pos.fc_silent)}", RED
-            else:
-                module = "flight controller talking"
-            power = pos.power_text()  # external power (USB, the BEC), or the module's cell and its charge
-            if power:
-                module += f" · {power}"
-            if pos.temp != mr.TEMP_UNKNOWN:
-                temp = f" · {pos.temp} °C"
-                temp_color = RED if pos.temp >= mr.TEMP_HOT else AMBER if pos.temp >= mr.TEMP_WARM else TEXT
-        self._paint(self.craft_values["Module"], module, color)
-        self._paint(self.chip_temp, temp, temp_color)
+            self._paint(link, link.cget("text"), BLUE if where.fix else LED_OFF)
+        line, temp = aircraft_card.module(agent, online, now_unix)
+        self._paint(self.craft_values["Module"], line.text, PALETTE[line.color])
+        self._paint(self.chip_temp, temp.text, PALETTE[temp.color])
 
     def _link(self, parent: tk.Misc, text: str, command: Callable[[], None]) -> tk.Label:
         link = tk.Label(parent, text=text, bg=SURFACE, fg=LED_OFF, font=self.font_small, cursor="hand2")
@@ -1402,17 +1241,16 @@ class App:
         return link
 
     def open_map(self) -> None:
-        """The position on Google Maps (in the browser, or the Maps app on a phone), satellite view at hand."""
         pos = self.shown_fix
         if pos is not None:
-            webbrowser.open(f"https://www.google.com/maps/search/?api=1&query={pos.lat / 1e7:.6f},{pos.lon / 1e7:.6f}")
+            webbrowser.open(aircraft_card.map_link(pos))
 
     def copy_position(self) -> None:
         pos = self.shown_fix
         if pos is None:
             return
         self.root.clipboard_clear()
-        self.root.clipboard_append(f"{pos.lat / 1e7:.6f}, {pos.lon / 1e7:.6f}")
+        self.root.clipboard_append(aircraft_card.coordinates(pos))
         self.copy_link.configure(text="Copied")
         self.root.after(1500, lambda: self.copy_link.configure(text="Copy"))
 

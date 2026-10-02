@@ -1,0 +1,30 @@
+[Unit]
+Description=MavLTE web page (mavweb): the Aircraft card for a phone
+After=network-online.target mavrelay.service
+Wants=network-online.target
+
+[Service]
+User=mavrelay
+Group=mavrelay
+ExecStart=/usr/bin/python3 /opt/mavrelay/mavweb.py --config /etc/mavrelay/mavrelay.ini
+Restart=always
+RestartSec=2
+# /var/lib/mavrelay, shared with the relay: the photos the page shows go to its web-photos folder
+StateDirectory=mavrelay
+StateDirectoryMode=0750
+
+# hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

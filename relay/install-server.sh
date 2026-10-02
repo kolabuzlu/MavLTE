@@ -12,6 +12,11 @@ id mavrelay >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sb
 install -d -m 755 /opt/mavrelay
 install -m 644 mavrelay.py /opt/mavrelay/mavrelay.py
 install -m 644 mavrelay.service /etc/systemd/system/mavrelay.service
+if [ -f /opt/mavrelay/mavweb.py ]; then  # the web page (install-web.sh) is updated with the relay
+    install -m 644 aircraft_card.py mavweb.py mavlte.png /opt/mavrelay/
+    install -m 644 web/index.html web/app.css web/app.js web/manifest.webmanifest /opt/mavrelay/web/
+    install -m 644 mavweb.service /etc/systemd/system/mavweb.service
+fi
 install -d -m 750 -g mavrelay /etc/mavrelay
 
 if [ ! -f /etc/mavrelay/mavrelay.ini ]; then
@@ -43,6 +48,9 @@ fi
 systemctl daemon-reload
 systemctl enable --now mavrelay
 systemctl restart mavrelay
+if [ -f /opt/mavrelay/mavweb.py ]; then
+    systemctl restart mavweb
+fi
 sleep 1
 systemctl --no-pager status mavrelay | head -n 5
 echo "Logs: journalctl -u mavrelay -f"

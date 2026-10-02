@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#252526">
+<meta name="robots" content="noindex, nofollow">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="MavLTE">
+<title>MavLTE</title>
+<link rel="icon" type="image/png" href="/icon.png">
+<link rel="apple-touch-icon" href="/icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="head">
+  <div class="head-in">
+    <img class="badge" src="/icon.png" alt="" width="48" height="48">
+    <div class="who">
+      <h1 id="name">MavLTE</h1>
+      <p class="relay"><span class="led" id="relay-led"></span><span id="relay-text">Connecting…</span></p>
+    </div>
+  </div>
+</header>
+
+<main>
+  <p class="net" id="net" role="status" hidden></p>
+
+  <form class="card signin" id="signin" hidden>
+    <h2>Sign in</h2>
+    <p class="hint">This phone stays signed in.</p>
+    <input class="unseen" type="text" name="username" value="mavlte" autocomplete="username" tabindex="-1" aria-hidden="true">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" autocapitalize="none" spellcheck="false" required>
+    <button class="accent" id="signin-button" type="submit">Sign in</button>
+    <p class="error" id="signin-error" role="alert"></p>
+  </form>
+
+  <section id="panel" hidden>
+    <h2 class="label">Aircraft</h2>
+    <div class="card">
+      <div class="top">
+        <span class="led" id="craft-led"></span>
+        <span class="headline" id="craft-state">Waiting for news from the relay…</span>
+        <span class="bars" id="bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      </div>
+      <dl class="rows">
+        <dt>Link</dt>
+        <dd id="link">-</dd>
+        <dt>Packet loss</dt>
+        <dd id="loss">-</dd>
+        <dt>Position</dt>
+        <dd>
+          <span id="position">-</span>
+          <span class="actions">
+            <a class="pill" id="map" target="_blank" rel="noopener noreferrer">Map</a>
+            <button class="pill" id="copy" type="button">Copy</button>
+          </span>
+        </dd>
+        <dt>Module</dt>
+        <dd><span id="module">-</span><span id="temp"></span></dd>
+        <dt class="mid">Voice</dt>
+        <dd class="voice">
+          <button class="switch" id="voice" type="button" role="switch" aria-checked="false" aria-label="Locator voice"></button>
+          <span id="voice-text"></span>
+        </dd>
+      </dl>
+      <div class="camera">
+        <div class="controls">
+          <button class="accent" id="snapshot" type="button" disabled>Snapshot</button>
+          <div class="sizes" id="sizes" role="radiogroup" aria-label="Photo size">
+            <button type="button" role="radio" data-size="0">Small</button>
+            <button type="button" role="radio" data-size="1">Medium</button>
+            <button type="button" role="radio" data-size="2">Large</button>
+          </div>
+        </div>
+        <p class="status" id="cam-status"></p>
+        <div class="progress" id="progress" hidden><div id="progress-bar"></div></div>
+        <p class="last" id="last"></p>
+        <button class="photo" id="photo" type="button" hidden><img id="photo-img" alt="The last photo from the aircraft"></button>
+      </div>
+    </div>
+    <footer class="foot">MavLTE <span id="version"></span> · <button class="link" id="signout" type="button">Sign out</button></footer>
+  </section>
+</main>
+
+<div class="viewer" id="viewer" role="dialog" aria-modal="true" aria-label="Photo from the aircraft" hidden>
+  <img id="viewer-img" alt="">
+  <div class="viewer-bar">
+    <button id="older" type="button" aria-label="Older photo">‹</button>
+    <p id="viewer-caption"></p>
+    <button id="newer" type="button" aria-label="Newer photo">›</button>
+  </div>
+  <button class="close" id="viewer-close" type="button" aria-label="Close">×</button>
+</div>
+</body>
+</html>

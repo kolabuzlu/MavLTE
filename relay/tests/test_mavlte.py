@@ -436,7 +436,7 @@ class GuiTest(unittest.TestCase):
         self.pump(lambda: not self.vehicle.voice_on, what="the aircraft told")
 
         modem["answer"] = "before 1.5.0"  # firmware that knows nothing of the voice
-        with mock.patch.object(mavlte.App, "VOICE_ANSWER_S", 0.5):
+        with mock.patch.object(mavlte.aircraft_card.Voice, "ANSWER_S", 0.5):
             app.toggle_voice(True)
             self.pump(lambda: "before 1.5.0" in self.text(row.status), what="hint at old firmware")
 

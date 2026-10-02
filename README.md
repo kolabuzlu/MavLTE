@@ -42,11 +42,14 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
   brought you close. The relay keeps the switch: switched on while the aircraft is out of reach,
   it starts as soon as the aircraft is back, and the aircraft keeps sounding where it has no
   coverage.
+- **On your phone**: the app's *Aircraft* panel also comes as a web page from the relay server,
+  password protected, for the search with only a phone in your pocket: the link, the position
+  with a map link, the voice switch and Snapshot.
 
 | Folder | What |
 |---|---|
 | [firmware/](firmware) | ESP-IDF firmware for the ESP32-S3 (PlatformIO or `idf.py`) |
-| [relay/](relay) | `mavrelay.py`: the relay server, the GCS agent and a Python vehicle for bench tests; `MavLTE.pyw` / `mavlte.py`: the MavLTE app (the GCS agent as a window), `build_release.py` makes it into `MavLTE.exe`; `sitl_demo.py`: the whole link with ArduPilot SITL on one PC; `PlaneSim.pyw` / `plane_sim.py`: SITL as a plane with a battery switch, a virtual LTE module with its GNSS and a backup cell, and a virtual camera |
+| [relay/](relay) | `mavrelay.py`: the relay server, the GCS agent and a Python vehicle for bench tests; `MavLTE.pyw` / `mavlte.py`: the MavLTE app (the GCS agent as a window), `build_release.py` makes it into `MavLTE.exe`; `mavweb.py` and `web/`: the app's *Aircraft* panel as a web page for a phone, on the relay server (`aircraft_card.py`: what that panel says, for both); `sitl_demo.py`: the whole link with ArduPilot SITL on one PC; `PlaneSim.pyw` / `plane_sim.py`: SITL as a plane with a battery switch, a virtual LTE module with its GNSS and a backup cell, and a virtual camera |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | Tunnel protocol |
 
 ## Setup, in order
@@ -56,6 +59,8 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
 3. [Wiring and power](#3-wiring-and-power) in the aircraft.
 4. [ArduPilot parameters](#4-ardupilot-parameters) for the serial port, stream rates and MAVLink signing.
 5. [MavLTE app and Mission Planner](#5-mavlte-app-and-mission-planner) on your laptop.
+6. [The web page on your phone](#6-the-web-page-on-your-phone), if you like: the *Aircraft* panel
+   without the laptop.
 
 Before the board arrives you can try everything else with ArduPilot SITL on your PC, in one
 command: see [Bench tests](#bench-tests).
@@ -87,7 +92,8 @@ The aircraft's photos are kept in `/var/lib/mavrelay/snapshots` for 7 days (`sna
 position is in `/var/lib/mavrelay/locator.json`, the locator voice switch in `voice.json` beside
 it. Updating an older
 relay: run the installer again, which also installs the new service file (it gives the service
-that folder); your keys stay.
+that folder) and updates the web page, if you have it ([section 6](#6-the-web-page-on-your-phone));
+your keys stay.
 
 ## 2. Firmware
 
@@ -382,6 +388,40 @@ server itself may connect: reach it through an SSH tunnel,
 `ssh -N -L 5760:127.0.0.1:5760 you@your-server`, then connect Mission Planner to TCP
 127.0.0.1:5760. To open it to fixed addresses instead, list them in `tcp_allow`.
 
+## 6. The web page on your phone
+
+The app's *Aircraft* panel also comes as a web page, for when you go looking for the aircraft with
+only a phone: its link and signal, **Position** with **Map** and **Copy**, **Module**, the
+**Voice** switch, and **Snapshot** with the last photo (tap it for the whole screen, swipe for the
+ones before). It says what the app says, in the same colours. It runs on the relay server, so no
+laptop has to be on. Telemetry stays with Mission Planner: the page has none.
+
+```bash
+cd relay && sudo sh install-web.sh 203-0-113-10.sslip.io
+```
+
+with your server's address in that name, dashes for dots ([sslip.io](https://sslip.io) turns the
+name back into the address, so no domain is needed), or a name of your own that points at the
+server. The script runs `mavweb` as a service beside the relay, and puts
+[Caddy](https://caddyserver.com) in front of it for HTTPS: Caddy takes TCP ports **80 and 443**
+(open them in your provider's firewall, if it has one) and gets the certificate from Let's Encrypt
+by itself. The first run asks for the page's **password** (run without a terminal, it makes one
+up and prints it).
+
+Open `https://203-0-113-10.sslip.io` on the phone and sign in: the phone stays signed in, for 180
+days after its last visit. Add it to the home screen (browser menu → *Add to Home screen*) and it
+opens like an app.
+
+- **A new password:** `sudo python3 /opt/mavrelay/mavweb.py password` (`--random` makes one up);
+  every phone signs in again. After 5 wrong passwords from one address in 10 minutes, it waits.
+- The page is a GCS agent that only watches, like the app with both switches off, so it costs the
+  aircraft no mobile data. Photos asked for on the phone also come to the MavLTE app, and the
+  other way round; the page keeps the newest 200 (in `/var/lib/mavrelay/web-photos`).
+- `journalctl -u mavweb -f` logs sign-ins (with the phone's address) and every switch of the
+  voice and photo asked for on the page. Its settings, in `[web]` in `/etc/mavrelay/mavrelay.ini`
+  (then `sudo systemctl restart mavweb`): `name`, the aircraft's name on the page; `photo_dir`;
+  `listen`, 127.0.0.1:8090, which only Caddy needs to reach.
+
 ## Bench tests
 
 **The whole link with SITL, on one PC.** `sitl_demo.py` starts ArduPilot SITL (Mission Planner's
@@ -552,6 +592,8 @@ missed while the app was closed) travel over your laptop's internet.
 | MavLTE's *Voice*: `On, but the aircraft cannot play it` | The modem refuses to play the alarm (`AT+CCMXPLAY`; the firmware stores it in the modem's flash first and logs whether that worked) or the phrase (`AT+CTTS`), or did not take its multiplexer (CMUX), which the voice needs during the data call like the GNSS; the ESP32 log says which. Tried and heard on an A7670E-FASE with modem firmware A7670M7_V1.11.1. |
 | MavLTE's *Voice*: `On, but no answer: firmware before 1.5.0?` | The aircraft's firmware is older than 1.5.0: update it. |
 | *Voice* says the aircraft's speaker is sounding, but nothing to hear | The speaker plugged into the board's speaker header; the fuselage muffling it (see *Speaker* in section 3). |
+| The web page does not open, or the browser warns about its certificate | TCP ports 80 and 443 open in the provider's firewall; the name points at the server. `journalctl -u caddy` says whether Let's Encrypt gave the certificate. |
+| The web page says `No connection to the server` | The phone's own internet; it tries again by itself. If other sites work, `systemctl status mavweb` on the server. |
 
 ## Development
 
