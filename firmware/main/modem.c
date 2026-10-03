@@ -60,6 +60,12 @@ static bool fast_baud_failed; /* the modem took AT+IPR but did not answer at tha
 static bool cmux_off;         /* data calls without the multiplexer (it failed, or no locator) */
 static bool in_cmux;          /* this data call runs over CMUX: AT commands still work during it */
 static int baud = BOOT_BAUD;
+#if CONFIG_BRIDGE_GNSS_GPS_BEIDOU_GALILEO
+#define GNSS_MODE 4 /* AT+CGNSSMODE, the A7670E's (a "foreign module"): GPS + BeiDou + Galileo */
+#define GNSS_MODE_SET "AT+CGNSSMODE=4\r"
+#define GNSS_SYSTEMS "GPS + BeiDou + Galileo"
+static bool gnss_mode_set; /* the modem's GNSS uses GNSS_MODE since it last started */
+#endif
 /* the network as last read, for the flight log (guarded by radio_lock) */
 static SemaphoreHandle_t radio_lock;
 static int16_t radio_dbm = BRIDGE_RSSI_UNKNOWN;
@@ -168,6 +174,9 @@ static bool create_dce(void)
     baud = BOOT_BAUD;
 #if CONFIG_BRIDGE_LOCATOR_VOICE
     voice_ready = false; /* perhaps a restarted modem: its audio settings are back to their defaults */
+#endif
+#ifdef GNSS_MODE
+    gnss_mode_set = false; /* and its GNSS on its own satellite systems */
 #endif
     if (!dce) {
         ESP_LOGE(TAG, "cannot set up the modem UART");
@@ -416,6 +425,9 @@ static bool configure(void)
         if (command("AT+CGNSSPWR=1\r", 9000) != ESP_OK) { /* up to 9 s (A76XX AT manual) */
             ESP_LOGW(TAG, "the modem's GNSS did not start (%s)", answer);
         }
+#ifdef GNSS_MODE
+        gnss_mode_set = false; /* started again: on the modem's own satellite systems */
+#endif
     }
     command("AT+CGNSSTST=0\r", 2000);
 #endif
@@ -880,6 +892,24 @@ static const char *degrees(char *out, size_t n, int32_t v)
     return out;
 }
 
+#ifdef GNSS_MODE
+/* The satellite systems asked for in menuconfig, once the GNSS takes the command (after its "+CGNSSPWR:
+ * READY!"; until then it answers ERROR, and this tries again at the next reading). */
+static void set_gnss_mode(void)
+{
+    char mode[16];
+    if (command("AT+CGNSSMODE?\r", 2000) != ESP_OK) {
+        return;
+    }
+    if (atoi(answer_field("+CGNSSMODE:", mode, sizeof(mode))) != GNSS_MODE &&
+        command(GNSS_MODE_SET, 9000) != ESP_OK) {
+        return;
+    }
+    gnss_mode_set = true;
+    ESP_LOGI(TAG, "GNSS: " GNSS_SYSTEMS);
+}
+#endif
+
 /* The GNSS position, over the CMUX command channel while PPP runs on the other. Before the GNSS is
  * ready the modem answers ERROR: then there is simply no reading this time. */
 static void read_gnss(void)
@@ -888,6 +918,11 @@ static void read_gnss(void)
     static bool shown_raw;
     static uint32_t last_time;
     gnss_fix_t fix;
+#ifdef GNSS_MODE
+    if (!gnss_mode_set) {
+        set_gnss_mode();
+    }
+#endif
     if (command("AT+CGNSSINFO\r", 2000) != ESP_OK || !gnss_parse(answer, &fix)) {
         return; /* the next reading, in a few seconds */
     }

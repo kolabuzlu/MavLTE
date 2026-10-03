@@ -119,6 +119,23 @@ menu "MavLTE"
         range 2 300
         default 5
 
+    choice BRIDGE_GNSS_SYSTEMS
+        prompt "Locator: the module's satellite systems"
+        depends on BRIDGE_LOCATOR
+        default BRIDGE_GNSS_MODEM_DEFAULT
+        help
+            Which satellite systems the A7670E's GNSS uses (AT+CGNSSMODE; the modem forgets it at each
+            restart, so the firmware sets it again once the GNSS is ready).
+
+        config BRIDGE_GNSS_MODEM_DEFAULT
+            bool "As the modem has it: GPS + GLONASS + Galileo"
+        config BRIDGE_GNSS_GPS_BEIDOU_GALILEO
+            bool "GPS + BeiDou + Galileo"
+            help
+                BeiDou instead of GLONASS: it has many satellites over Asia, Turkey included, which may
+                give a fix sooner and keep it better.
+    endchoice
+
     config BRIDGE_LOCATOR_VOICE
         bool "Locator voice: the board's speaker, switched on and off in MavLTE"
         depends on BRIDGE_LOCATOR
@@ -175,6 +192,23 @@ menu "MavLTE"
             started for each photo and stopped after it: between photos it takes no memory and
             no power, and it never takes a photo nobody asked for. Without a camera (or with this
             off) the aircraft answers that it has none.
+
+    config BRIDGE_CAMERA_FLIP
+        bool "Camera: flip photos top to bottom"
+        depends on BRIDGE_CAMERA
+        default n
+        help
+            The camera flips the picture itself as it takes it, at no cost in time, memory or mobile
+            data. With the mirror below as well, photos are turned half round: for a camera mounted
+            upside down.
+
+    config BRIDGE_CAMERA_MIRROR
+        bool "Camera: mirror photos left to right"
+        depends on BRIDGE_CAMERA
+        default n
+        help
+            The camera mirrors the picture itself as it takes it, at no cost. With the flip above as
+            well, photos are turned half round.
 
     config BRIDGE_CAMERA_QUALITY
         int "Camera JPEG quality (lower: better and larger)"

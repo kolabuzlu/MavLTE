@@ -1,3 +1,3 @@
 #pragma once
 
-#define FIRMWARE_VERSION "1.8.2"
+#define FIRMWARE_VERSION "1.8.3"

@@ -68,6 +68,19 @@ static esp_err_t start(framesize_t frame_size, size_t buffer)
     esp_err_t err = esp_camera_init(&config);
     if (err == ESP_OK) {
         running = true;
+#if CONFIG_BRIDGE_CAMERA_FLIP || CONFIG_BRIDGE_CAMERA_MIRROR
+        /* as the camera is mounted, by the sensor itself: flipped, mirrored, or both (turned half round), each from
+         * what the driver set up, which differs between sensors and modules */
+        sensor_t *s = esp_camera_sensor_get();
+        if (s && s->set_vflip && s->set_hmirror) {
+#if CONFIG_BRIDGE_CAMERA_FLIP
+            s->set_vflip(s, !s->status.vflip);
+#endif
+#if CONFIG_BRIDGE_CAMERA_MIRROR
+            s->set_hmirror(s, !s->status.hmirror);
+#endif
+        }
+#endif
     }
     return err;
 }

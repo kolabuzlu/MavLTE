@@ -124,8 +124,9 @@ the chip to tell them apart and prints `board version V1` or `V2` at start-up.
 | Board version, flight controller pins | leave on detect / `-1` |
 | Flight controller baud rate | `115200` |
 | Locator | on, every 5 s |
+| Locator: the module's satellite systems | as the modem has it (GPS + GLONASS + Galileo), or GPS + BeiDou + Galileo: BeiDou has many satellites over Asia, Turkey included, and may give a fix sooner and keep it better |
 | Locator voice | on: a two-tone alarm. Or a spoken phrase, `Mav L T E here.` by default (letters and digits written apart are said one by one: a phone number written `0 5 3 2 ...` tells whoever finds the aircraft whom to call) |
-| Camera | on (off, or no camera fitted: the aircraft answers that it has none) |
+| Camera | on (off, or no camera fitted: the aircraft answers that it has none); *flip photos top to bottom* and *mirror photos left to right* as the camera is mounted (both: turned 180°) |
 | Flight log on the SD card | on (V2 boards; without a card the firmware runs as before) |
 
 The rest (modem UART speed, batching, sending with no GCS connected, JPEG quality) can stay as
@@ -279,7 +280,10 @@ modem. Mount the LTE antenna as far as the airframe allows from the RC receiver'
 from the flight controller's GPS.
 
 **Camera.** It sits on the board's own connector, so it needs no wiring. Mount the board (or the
-camera on an extension cable) looking where you want your photos, away from the propeller.
+camera on an extension cable) looking where you want your photos, away from the propeller. If the
+photos come upside down or mirrored, switch on *Camera: flip photos top to bottom* and/or *Camera:
+mirror photos left to right* in menuconfig (both together turn them 180°): the camera then does
+it itself, at no cost.
 
 **Speaker**, for the locator voice: the small speaker that comes with the board, on its speaker
 header. The header is wired straight to the modem's earpiece output (V2 schematic: no amplifier
