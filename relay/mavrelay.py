@@ -36,7 +36,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.8.3"
+__version__ = "1.8.4"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -1272,6 +1272,11 @@ class RelayServer(asyncio.DatagramProtocol):
     ONLINE_TIMEOUT = 3.0  # vehicle counts as online if heard within this time
     GCS_PRESENT_TIMEOUT = 5.0
     SUMMARY_INTERVAL = 300.0
+    # MAVLink for the aircraft that follows other MAVLink to it within this time waits for whatever else comes, and
+    # goes in one DATA. GCS software sends a burst of dozens of small messages at times (Mission Planner: 57 within
+    # 3 ms when a screen reads its parameters); the aircraft's modem holds only about 10 packets while its UART to
+    # the board carries one small packet per 1.2-1.5 ms, so most of a burst sent packet by packet was lost.
+    DOWN_GATHER = 0.005
 
     def __init__(self, keys: Dict[int, bytes], session_timeout: float = 120.0, max_gcs: int = 8,
                  photo_folder: Optional[str] = None, photo_days: float = 7.0,
@@ -1292,6 +1297,9 @@ class RelayServer(asyncio.DatagramProtocol):
         self._last_bad_key_log = -1e9
         self._vehicle_online = False
         self._last_summary = time.monotonic()
+        self._down = bytearray()  # MAVLink for the aircraft, gathered (DOWN_GATHER)
+        self._down_quiet = 0.0  # MAVLink for the aircraft goes at once from this time on (monotonic)
+        self._down_timer: Optional[asyncio.TimerHandle] = None
 
     # -- asyncio.DatagramProtocol
 
@@ -1360,10 +1368,39 @@ class RelayServer(asyncio.DatagramProtocol):
     # -- forwarding
 
     def to_vehicle(self, payload: bytes) -> None:
+        """MAVLink for the aircraft (whole frames, at most MAX_PAYLOAD bytes): at once after a quiet moment; what
+        follows within DOWN_GATHER is gathered and goes together (DOWN_GATHER after the last DATA at the latest)."""
         if self.vehicle is None:
             self.counters["dropped_no_vehicle"] += 1
             return
-        self._send(self.vehicle, DATA, payload)
+        now = time.monotonic()
+        if not self._down and now >= self._down_quiet:
+            self._send(self.vehicle, DATA, payload)
+            self._down_quiet = now + self.DOWN_GATHER
+            return
+        if len(self._down) + len(payload) > MAX_PAYLOAD:
+            self._flush_down()  # full: this one starts the next DATA
+        self._down += payload
+        if self._down_timer is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:  # driven without an event loop (tests): nothing waits
+                self._flush_down()
+                return
+            self._down_timer = loop.call_later(max(0.0, self._down_quiet - now), self._flush_down)
+
+    def _flush_down(self) -> None:
+        if self._down_timer is not None:
+            self._down_timer.cancel()
+            self._down_timer = None
+        data, self._down = bytes(self._down), bytearray()
+        if not data:
+            return
+        if self.vehicle is None:
+            self.counters["dropped_no_vehicle"] += 1
+            return
+        self._send(self.vehicle, DATA, data)
+        self._down_quiet = time.monotonic() + self.DOWN_GATHER
 
     def _from_vehicle(self, payload: bytes) -> None:
         for sess in self.gcs_sessions():

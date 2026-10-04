@@ -27,6 +27,9 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
   vehicle and the GCS side have separate keys. See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - **Saves mobile data**: telemetry is batched (50 ms by default) and held back while no GCS is
   connected; it resumes within about a second when you connect.
+- **Bursts arrive whole**: Mission Planner sends dozens of small messages at once at times (when a
+  screen reads its parameters, say). The relay packs them into a few packets, since the aircraft's
+  modem holds only about ten; a lone message still goes at once.
 - **Recovers by itself** from lost coverage, modem resets, IP address changes and relay restarts.
 - **Link status**: the MavLTE app shows the aircraft's signal, round-trip time and packet loss.
 - **Snapshot on demand**: press *Snapshot* in the MavLTE app and the board's camera takes a photo,

@@ -521,6 +521,22 @@ class LiveTest(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: vehicle.inbox == [v2_frame(76, bytes(33))])
         self.assertEqual(self.relay.vehicle.info, "test")
 
+    async def test_a_burst_to_the_aircraft_goes_in_few_packets(self):
+        # the aircraft's modem holds only about 10 packets: a burst of small messages from GCS software goes
+        # packed, in order; a message after a quiet moment goes at once, by itself
+        vehicle, gcs = await self.connected_pair()
+        burst = [v2_frame(76, bytes([i]) * 33, i) for i in range(57)]  # as Mission Planner sends them at times
+        for frame in burst:
+            self.assertTrue(gcs.send_data(frame))
+        await self.until(lambda: b"".join(vehicle.inbox) == b"".join(burst))
+        self.assertLess(len(vehicle.inbox), 10)
+        await asyncio.sleep(0.05)
+        vehicle.inbox.clear()
+        start = time.monotonic()
+        gcs.send_data(v2_frame(0, bytes(9), 99))
+        await self.until(lambda: vehicle.inbox == [v2_frame(0, bytes(9), 99)])
+        self.assertLess(time.monotonic() - start, 1.0)
+
     async def test_status_and_gcs_presence(self):
         vehicle = self.client(mr.ROLE_VEHICLE)
         await self.until(lambda: vehicle.is_connected)

@@ -30,6 +30,13 @@ fragmented. That leaves at most 1172 bytes of MAVLink per DATA packet. Senders o
 the MAVLink stream at frame boundaries, so losing a datagram loses whole frames and never
 corrupts the frames around it.
 
+The server sends MAVLink for the vehicle at once after a quiet moment, and packs whatever
+follows within 5 ms into one DATA (since 1.8.4). GCS software sends bursts of dozens of small
+messages at times (Mission Planner: 57 within 3 ms when a screen reads its parameters), while
+the vehicle's modem holds only about ten packets as its serial line passes them on (the
+A7670E at 921600 baud: one small packet per 1.2-1.5 ms). Sent one packet each, most of such a
+burst was lost.
+
 ## Packet types
 
 | type | name    | direction | session / seq | body |
