@@ -31,7 +31,8 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
   screen reads its parameters, say). The relay packs them into a few packets, since the aircraft's
   modem holds only about ten; a lone message still goes at once.
 - **Recovers by itself** from lost coverage, modem resets, IP address changes and relay restarts.
-- **Link status**: the MavLTE app shows the aircraft's signal, round-trip time and packet loss.
+- **Link status**: the MavLTE app shows the aircraft's signal and, on LTE, its quality, round-trip time and
+  packet loss.
 - **Snapshot on demand**: press *Snapshot* in the MavLTE app and the board's camera takes a photo,
   which comes to you through the relay without holding up the telemetry, with where and when it
   was taken. Only when you ask: the camera takes nothing by itself. The relay keeps photos for
@@ -350,9 +351,14 @@ server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
   127.0.0.1:5760. Change a port while its switch is off.
 - Each card has two **LEDs**. **Available** (green, on the left) lights while the aircraft's LTE
   module is online at the relay, even with the switches off. **Connected** (blue, next to the
-  switch) lights while it is online and that port is on. The bars show its 4G signal. The
-  header shows the link to the relay, the *Aircraft* panel the aircraft's link (signal and
-  round trip), packet loss and traffic, and ☰ → Show log the details, in a window of its own.
+  switch) lights while it is online and that port is on. The bars show its 4G signal: its
+  strength and, on LTE, its quality (SINR), whichever is lower. The header shows the link to
+  the relay, the *Aircraft* panel the aircraft's link (signal, quality and round trip), packet
+  loss and traffic, and ☰ → Show log the details, in a window of its own. In the air the
+  signal stays strong while the quality falls, as the modem hears many cells at once, and the
+  link falls with the quality: the *Link* line turns amber where drops are likely (-9 to -12 dB),
+  red where the link fails (-13 dB and below). On the first flight it held to about 500 m above
+  home all but a few seconds, and failed for minutes at 1000 m.
 - In Mission Planner pick **UDP**, port **14550**, or **TCP**, host **127.0.0.1**, port **5760**.
   QGroundControl finds UDP 14550 by itself.
 - **From another computer, a tablet or a phone** on the same network: switch the port off, set
@@ -415,7 +421,7 @@ and the agent reports the link to the relay and the aircraft as text:
 
 ```
 2026-09-30 14:02:11 INFO    connected to server 203.0.113.10:14650 (session 5c1e0a77)
-2026-09-30 14:02:12 INFO    vehicle: online, LTE -71 dBm, rtt to server 64 ms, loss up 0.0% down 0.0%; GNSS 41.123457, 28.987654 (9 satellites, 3 s ago)
+2026-09-30 14:02:12 INFO    vehicle: online, LTE -71 dBm, quality 11 dB, rtt to server 64 ms, loss up 0.0% down 0.0%; GNSS 41.123457, 28.987654 (9 satellites, 3 s ago)
 ```
 
 The agent talks UDP to the relay, so a lost packet on a patchy laptop connection (a phone
@@ -669,6 +675,7 @@ missed while the app was closed) travel over your laptop's internet.
 | `no IP address from the network` | Wrong APN. |
 | Relay log says `... has the wrong key` | The key in the firmware (or agent) differs from `vehicle_key` (or `gcs_key`) in `mavrelay.ini`. |
 | Relay log is silent when the aircraft is on | The UDP port is closed in a firewall, or the host or port in the firmware is wrong. |
+| In the air the link drops for seconds or minutes, though MavLTE showed a strong signal | The signal's *quality* fell, not its strength: up there the modem hears many cells at once, and they drown each other out. MavLTE's *Link* line shows the quality (SINR) and turns amber, then red, before the link fails; the bars follow it. On the first flight the link held down to -9 dB and failed below -12 dB, which came above about 500 m over home; the modem falls back to 2G (EDGE) only where LTE fades out altogether. Fly lower, or expect the gaps: MavLTE reconnects by itself. |
 | Agent connects, Mission Planner shows nothing | Mission Planner's port must match `--udp` (default 14550). Check `SERIALn_PROTOCOL` and `SERIALn_BAUD`, and that TX and RX are crossed. |
 | Another computer or phone cannot connect | The MavLTE card's IP must be 0.0.0.0 ([section 5](#5-mavlte-app-and-mission-planner)); for UDP, Mission Planner there connects with UDPCl, not UDP. The first time a port listens, Windows asks whether to let MavLTE through its firewall: tick the kind of network you are on (Windows often calls a home Wi-Fi *Public*). |
 | Mission Planner connects but commands are ignored | Signing is on and this Mission Planner does not have the key. |

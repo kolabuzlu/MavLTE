@@ -39,7 +39,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.8.6"
+__version__ = "1.8.7"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -65,9 +65,13 @@ ROLE_NAMES = {ROLE_SERVER: "server", ROLE_VEHICLE: "vehicle", ROLE_GCS: "gcs"}
 PING_BODY = struct.Struct("<IHHhBB")  # t_ms, rtt_ms, rx_loss_permille, rssi_dbm, rat, reserved
 PONG_BODY = struct.Struct("<IB")  # t_ms (echoed), flags
 STATUS_BODY = struct.Struct("<BBHHHhH")  # flags, rat, rtt_ms, up_loss, down_loss, rssi_dbm, idle_ms
+# after a vehicle's PING_BODY, and after STATUS_BODY (since 1.8.7): the LTE signal's quality, SINR in dB. In the air
+# the signal (rssi_dbm) stays strong while this falls with the many cells heard at once: the link it tells.
+QUALITY = struct.Struct("<b")
 
 U16_UNKNOWN = 0xFFFF
 RSSI_UNKNOWN = 0x7FFF
+SINR_UNKNOWN = -128  # not LTE, or not reported (firmware before 1.8.7)
 RAT_UNKNOWN = 0xFF
 PONG_GCS_PRESENT = 0x01
 PONG_VOICE = 0x02  # to the vehicle: the locator voice is on, sound the speaker
@@ -350,13 +354,16 @@ class LinkStatus(NamedTuple):
     voice_on: bool = False  # the relay has the locator voice switched on
     speaking: bool = False  # the vehicle said its speaker sounds (when last heard)
     voice_failed: bool = False  # the vehicle said it cannot
+    sinr_db: int = SINR_UNKNOWN  # the LTE signal's quality (see QUALITY)
 
     @classmethod
     def unpack(cls, body: bytes) -> "LinkStatus":
+        sinr = (QUALITY.unpack_from(body, STATUS_BODY.size)[0] if len(body) >= STATUS_BODY.size + QUALITY.size
+                else SINR_UNKNOWN)  # (none from relays before 1.8.7)
         body = body[: STATUS_BODY.size] + NO_VEHICLE_STATUS[len(body):]  # missing fields: unknown
         flags, rat, rtt, up, down, rssi, idle = STATUS_BODY.unpack(body)
         return cls(bool(flags & STATUS_VEHICLE_ONLINE), rat, rtt, up, down, rssi, idle, bool(flags & STATUS_VOICE_ON),
-                   bool(flags & STATUS_SPEAKING), bool(flags & STATUS_VOICE_FAILED))
+                   bool(flags & STATUS_SPEAKING), bool(flags & STATUS_VOICE_FAILED), sinr)
 
     @property
     def connected(self) -> bool:
@@ -386,6 +393,8 @@ class LinkStatus(NamedTuple):
             radio = RAT_NAMES.get(self.rat, "") if self.rat != RAT_UNKNOWN else ""
             if self.rssi_dbm != RSSI_UNKNOWN:
                 radio = f"{radio} {self.rssi_dbm} dBm".strip()
+            if self.sinr_db != SINR_UNKNOWN:
+                radio += f", quality {self.sinr_db} dB"
             parts.append(radio)
         if self.rtt_ms != U16_UNKNOWN:
             parts.append(f"rtt to server {self.rtt_ms} ms")
@@ -856,6 +865,7 @@ class Session:
         self.peer_loss = U16_UNKNOWN
         self.rssi_dbm = RSSI_UNKNOWN
         self.rat = RAT_UNKNOWN
+        self.sinr_db = SINR_UNKNOWN
         self.speaking = False  # a vehicle's locator voice sounds (PING_FLAG_SPEAKING)
         self.voice_failed = False  # it was asked to, but its modem does not
 
@@ -1525,6 +1535,8 @@ class RelayServer(asyncio.DatagramProtocol):
             return
         if len(body) >= PING_BODY.size:
             _, sess.rtt_ms, sess.peer_loss, sess.rssi_dbm, sess.rat, ping_flags = PING_BODY.unpack_from(body)
+            sess.sinr_db = (QUALITY.unpack_from(body, PING_BODY.size)[0] if len(body) >= PING_BODY.size + QUALITY.size
+                            else SINR_UNKNOWN)
             if sess.role == ROLE_GCS:
                 watching = bool(ping_flags & PING_FLAG_WATCHING)
                 if watching != sess.watching:
@@ -1603,7 +1615,7 @@ class RelayServer(asyncio.DatagramProtocol):
         voice = STATUS_VOICE_ON if self.voice.on else 0
         v = self.vehicle
         if v is None:
-            return bytes([voice]) + NO_VEHICLE_STATUS[1:]
+            return bytes([voice]) + NO_VEHICLE_STATUS[1:] + QUALITY.pack(SINR_UNKNOWN)
         idle = now - v.last_rx
         up = v.loss.permille()
         return STATUS_BODY.pack(
@@ -1615,7 +1627,7 @@ class RelayServer(asyncio.DatagramProtocol):
             v.peer_loss,
             v.rssi_dbm,
             min(IDLE_CAPPED, int(idle * 1000)),
-        )
+        ) + QUALITY.pack(v.sinr_db)  # (agents before 1.8.7 read the first STATUS_BODY.size bytes)
 
     def summary(self, now: float) -> str:
         v = self.vehicle
@@ -1708,7 +1720,7 @@ class TunnelClient(asyncio.DatagramProtocol):
         on_data: Callable[[bytes], None],
         on_status: Optional[Callable[[LinkStatus], None]] = None,
         info: str = "",
-        radio: Optional[Callable[[], Tuple[int, int]]] = None,
+        radio: Optional[Callable[[], Tuple[int, ...]]] = None,
     ) -> None:
         self.role = role
         self.key = key
@@ -1717,7 +1729,7 @@ class TunnelClient(asyncio.DatagramProtocol):
         self.on_data = on_data
         self.on_status = on_status
         self.info = info.encode()[:INFO_MAX]
-        self.radio = radio  # returns (rssi_dbm, rat) for PINGs
+        self.radio = radio  # returns (rssi_dbm, rat) for PINGs, or (rssi_dbm, rat, sinr_db)
         self.ping_flags = 0  # PING_FLAG_*
         self.transport: Optional[asyncio.DatagramTransport] = None
         self.server_addr = None
@@ -1846,10 +1858,12 @@ class TunnelClient(asyncio.DatagramProtocol):
             self._send_ping()
 
     def _send_ping(self) -> None:
-        rssi, rat = self.radio() if self.radio else (RSSI_UNKNOWN, RAT_UNKNOWN)
+        radio = self.radio() if self.radio else (RSSI_UNKNOWN, RAT_UNKNOWN)
         loss = self.loss.permille()
-        body = PING_BODY.pack(mono_ms(), self.rtt_ms, U16_UNKNOWN if loss is None else loss, rssi, rat,
+        body = PING_BODY.pack(mono_ms(), self.rtt_ms, U16_UNKNOWN if loss is None else loss, radio[0], radio[1],
                               self.ping_flags)
+        if self.role == ROLE_VEHICLE:  # as the board's firmware since 1.8.7
+            body += QUALITY.pack(radio[2] if len(radio) > 2 else SINR_UNKNOWN)
         self._send(PING, body)
 
     def _drop_session(self) -> None:

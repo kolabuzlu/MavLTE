@@ -88,6 +88,10 @@ class ProtocolTest(unittest.TestCase):
         st = mr.LinkStatus.unpack(mr.STATUS_BODY.pack(1, 7, 85, 3, 0, -71, 120))
         self.assertTrue(st.online)
         self.assertEqual(st.describe(), "vehicle: online, LTE -71 dBm, rtt to server 85 ms, loss up 0.3% down 0.0%")
+        self.assertEqual(st.sinr_db, mr.SINR_UNKNOWN)  # from a relay before 1.8.7
+        quality = mr.LinkStatus.unpack(mr.STATUS_BODY.pack(1, 7, 85, 3, 0, -71, 120) + mr.QUALITY.pack(11))
+        self.assertEqual(quality.describe(),
+                         "vehicle: online, LTE -71 dBm, quality 11 dB, rtt to server 85 ms, loss up 0.3% down 0.0%")
         self.assertIn("not connected", mr.LinkStatus.unpack(mr.NO_VEHICLE_STATUS).describe())
         self.assertIn("OFFLINE", mr.LinkStatus.unpack(mr.STATUS_BODY.pack(0, 7, 85, 3, 0, -71, 4200)).describe())
         short = mr.LinkStatus.unpack(b"\x01")  # an older server sending fewer fields
@@ -701,6 +705,18 @@ class LiveTest(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: vehicle.gcs_present, timeout=5)
         # the vehicle reports its round-trip time in the PING after it first measured it
         await self.until(lambda: any(s.online and s.rtt_ms < 1000 and s.up_loss == 0 for s in gcs.status))
+
+    async def test_link_quality_reaches_the_gcs(self):
+        """1.8.7: the vehicle's LTE signal quality (SINR, after its PING's fields) reaches GCS agents in STATUS. A
+        PING without it (firmware before 1.8.7) leaves it unknown, and GCS PINGs carry none."""
+        vehicle, gcs = await self.connected_pair()
+        vehicle.radio = lambda: (-53, 7, -14)
+        vehicle.ping_now()
+        await self.until(lambda: any(s.online and s.sinr_db == -14 and s.rssi_dbm == -53 for s in gcs.status))
+        self.assertEqual(len(self.relay.status_body(time.monotonic())), mr.STATUS_BODY.size + mr.QUALITY.size)
+        self.relay._on_ping(self.relay.vehicle, mr.PING_BODY.pack(0, 50, 0, -60, 7, 0))  # firmware before 1.8.7
+        self.assertEqual((self.relay.vehicle.sinr_db, self.relay.vehicle.rssi_dbm), (mr.SINR_UNKNOWN, -60))
+        self.assertEqual(self.relay.gcs_sessions()[0].sinr_db, mr.SINR_UNKNOWN)
 
     async def test_watching_gcs_gets_status_but_no_telemetry(self):
         vehicle, gcs = await self.connected_pair()

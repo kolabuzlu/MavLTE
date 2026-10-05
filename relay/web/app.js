@@ -76,7 +76,7 @@
     led($("craft-led"), s.aircraft.led);
     paint($("craft-state"), s.aircraft.text, "text");
     [...$("bars").children].forEach((bar, i) => bar.classList.toggle("on", s.aircraft.bars !== null && i < s.aircraft.bars));
-    paint($("link"), s.link, "text");
+    paint($("link"), s.link, s.link_color || "text");
     paint($("loss"), s.loss, "text");
 
     paint($("position"), s.position.text, s.position.color);

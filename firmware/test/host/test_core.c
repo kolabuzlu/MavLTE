@@ -510,18 +510,24 @@ static void test_tunnel(void)
     tun_input(&t, pkt, n, now + 90);
     CHECK(t.voice_on && t.gcs_present && t.rtt_ms == 90);
 
-    /* PINGs once a second carry rtt, radio state and flags */
-    tun_set_radio(&t, -71, 7);
+    /* PINGs once a second carry rtt, radio state and flags, and since 1.8.7 the LTE signal's quality last */
+    CHECK(t.sinr_db == TUN_SINR_UNKNOWN);
+    tun_set_radio(&t, -71, 7, -14);
     tun_set_ping_flags(&t, TUN_PING_SPEAKING);
     f.nsent = 0;
     tun_poll(&t, now + 999);
     CHECK(f.nsent == 0);
     tun_poll(&t, now + 1000);
-    CHECK(f.nsent == 1 && f.sent[0][2] == TUN_PING);
+    CHECK(f.nsent == 1 && f.sent[0][2] == TUN_PING && f.sent_len[0] == 12 + 13 + 16);
     CHECK(f.sent[0][16] == 90 && f.sent[0][17] == 0);            /* rtt 90 ms */
     CHECK((int16_t)(f.sent[0][20] | f.sent[0][21] << 8) == -71); /* rssi */
     CHECK(f.sent[0][22] == 7);                                   /* LTE */
     CHECK(f.sent[0][23] == TUN_PING_SPEAKING);
+    CHECK((int8_t)f.sent[0][24] == -14); /* SINR, dB */
+    tun_set_radio(&t, -71, 7, TUN_SINR_UNKNOWN);
+    f.nsent = 0;
+    tun_poll(&t, now + 2000);
+    CHECK(f.nsent == 1 && f.sent[0][24] == 0x80); /* not known (2G, say) */
 
     /* REJECT for another session is ignored, for ours it starts over */
     n = tun_encode(&k, pkt, TUN_REJECT, TUN_ROLE_SERVER, 0x4321, 0, (const uint8_t *)"\x01", 1);

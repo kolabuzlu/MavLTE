@@ -27,6 +27,7 @@ enum { TUN_ROLE_SERVER = 0, TUN_ROLE_VEHICLE = 1, TUN_ROLE_GCS = 2 };
 #define TUN_U16_UNKNOWN 0xFFFF
 #define TUN_RSSI_UNKNOWN 0x7FFF
 #define TUN_RAT_UNKNOWN 0xFF
+#define TUN_SINR_UNKNOWN (-128) /* the PING's last byte (1.8.7): the LTE signal's quality, SINR in dB */
 #define TUN_PONG_GCS_PRESENT 0x01
 #define TUN_PONG_VOICE 0x02        /* the locator voice is switched on: speak */
 #define TUN_PING_SPEAKING 0x02     /* vehicle: the locator voice speaks */
@@ -90,6 +91,7 @@ typedef struct {
     uint16_t rtt_ms;
     int16_t rssi_dbm;
     uint8_t rat;
+    int8_t sinr_db; /* TUN_SINR_UNKNOWN but on LTE: in the air, rssi_dbm stays strong while this falls */
     /* the relay's clock, from its last WELCOME (since 1.8.0): unix milliseconds at server_ms_at on ours;
      * server_ms is 0 if the relay sent none */
     uint64_t server_ms;
@@ -112,7 +114,7 @@ bool tun_send_data(tun_client_t *t, const uint8_t *data, size_t len);
  * False if there is no session. */
 bool tun_send_packet(tun_client_t *t, uint8_t type, const uint8_t *body, size_t len);
 /* Radio state reported to the server in PINGs. */
-void tun_set_radio(tun_client_t *t, int16_t rssi_dbm, uint8_t rat);
+void tun_set_radio(tun_client_t *t, int16_t rssi_dbm, uint8_t rat, int8_t sinr_db);
 /* Flags reported to the server in PINGs (TUN_PING_*). */
 void tun_set_ping_flags(tun_client_t *t, uint8_t flags);
 /* Downlink loss in per mille over the last seconds, or TUN_U16_UNKNOWN. */

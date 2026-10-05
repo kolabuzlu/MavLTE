@@ -555,11 +555,11 @@ void bridge_set_gnss(const gnss_fix_t *fix)
     }
 }
 
-void bridge_set_radio(int16_t rssi_dbm, uint8_t rat)
+void bridge_set_radio(int16_t rssi_dbm, uint8_t rat, int8_t sinr_db)
 {
     if (lock) {
         xSemaphoreTake(lock, portMAX_DELAY);
-        tun_set_radio(&tun, rssi_dbm, rat);
+        tun_set_radio(&tun, rssi_dbm, rat, sinr_db);
         xSemaphoreGive(lock);
     }
 }

@@ -514,11 +514,17 @@ static int16_t read_radio(char *name, int *act)
 {
     int16_t dbm = signal_dbm();
     operator_name(name, ESP_MODEM_C_API_STR_BUF_SIZE, act);
-    bridge_set_radio(dbm, *act >= 0 && *act < 0xFF ? (uint8_t)*act : BRIDGE_RAT_UNKNOWN);
     cell_info_t cell;
     if (command("AT+CPSI?\r", 2000) != ESP_OK || !cell_parse(answer, &cell)) {
         cell_clear(&cell);
     }
+    /* the signal's quality too (SINR, LTE only): in the air the signal stays strong (-51 dBm) while the quality
+     * falls with the many cells heard at once, and below -12 dB nothing gets through (first flight, 1.8.6) */
+    int8_t sinr = BRIDGE_SINR_UNKNOWN;
+    if (cell.sinr_db != LOG_I16_UNKNOWN) {
+        sinr = (int8_t)(cell.sinr_db < -127 ? -127 : cell.sinr_db > 127 ? 127 : cell.sinr_db);
+    }
+    bridge_set_radio(dbm, *act >= 0 && *act < 0xFF ? (uint8_t)*act : BRIDGE_RAT_UNKNOWN, sinr);
     xSemaphoreTake(radio_lock, portMAX_DELAY);
     radio_dbm = dbm;
     snprintf(radio_operator, sizeof(radio_operator), "%s", name);

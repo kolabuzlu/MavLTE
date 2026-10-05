@@ -69,27 +69,52 @@ def is_online(status: Optional[mr.LinkStatus]) -> bool:
     return bool(status and status.online)
 
 
+# Where each bar of the LTE signal's quality (SINR, dB) starts. On the first flight (1.8.6, up to 1000 m above home)
+# the link held down to -9 dB, faltered from -10 to -12 dB (77 to 96 % of the seconds) and failed below (24 % at
+# -13 dB, none at -14 dB), while the signal itself read -51 to -55 dBm, four bars of strength, all along.
+QUALITY_BARS = (-12, -8, 0, 10)
+
+
+def quality_bars(sinr_db: int) -> int:
+    """0-4 bars for the LTE signal's quality: 1, drops are likely; 0, the link fails."""
+    return sum(sinr_db >= limit for limit in QUALITY_BARS)
+
+
 def bars(status: Optional[mr.LinkStatus]) -> Optional[int]:
-    """Signal strength in 0-4 bars while the aircraft is online, else None (greyed out)."""
+    """Signal in 0-4 bars while the aircraft is online, else None (greyed out): its strength, and on LTE no more
+    than its quality allows (in the air the signal stays strong while the quality falls, and the link with it)."""
     if not is_online(status):
         return None
+    quality = quality_bars(status.sinr_db) if status.sinr_db != mr.SINR_UNKNOWN else 4
     if status.rssi_dbm != mr.RSSI_UNKNOWN:
-        return sum(status.rssi_dbm >= limit for limit in (-105, -95, -85, -75))
+        return min(quality, sum(status.rssi_dbm >= limit for limit in (-105, -95, -85, -75)))
+    if status.sinr_db != mr.SINR_UNKNOWN:
+        return quality
     worst = max(v for v in (status.up_loss, status.down_loss, 0) if v != mr.U16_UNKNOWN)
     return 4 if worst < 10 else 3 if worst < 50 else 2 if worst < 150 else 1
 
 
 def link(status: Optional[mr.LinkStatus]) -> str:
-    """The aircraft's radio and its round trip to the relay, on one line."""
+    """The aircraft's radio (on LTE with its quality) and its round trip to the relay, on one line."""
     if not is_online(status):
         return "-"
     radio = [mr.RAT_NAMES.get(status.rat, "")] if status.rat != mr.RAT_UNKNOWN else []
     if status.rssi_dbm != mr.RSSI_UNKNOWN:
         radio.append(f"{status.rssi_dbm} dBm")
     parts = [" ".join(radio)] if radio else []
+    if status.sinr_db != mr.SINR_UNKNOWN:
+        parts.append(f"quality {status.sinr_db} dB")
     if status.rtt_ms != mr.U16_UNKNOWN:
         parts.append(f"round trip {status.rtt_ms} ms")
     return " · ".join(parts) or "-"
+
+
+def link_color(status: Optional[mr.LinkStatus]) -> str:
+    """The link line's colour: amber where drops are likely (one bar of quality), red where the link fails (none)."""
+    if not is_online(status) or status.sinr_db == mr.SINR_UNKNOWN:
+        return TEXT
+    quality = quality_bars(status.sinr_db)
+    return RED if quality == 0 else AMBER if quality == 1 else TEXT
 
 
 def loss(status: Optional[mr.LinkStatus]) -> str:

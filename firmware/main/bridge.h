@@ -9,13 +9,15 @@
 
 #define BRIDGE_RSSI_UNKNOWN 0x7FFF
 #define BRIDGE_RAT_UNKNOWN 0xFF
+#define BRIDGE_SINR_UNKNOWN (-128)
 
 /* Installs the UART driver and starts the bridge tasks. Traffic flows once the PPP interface
  * has an IP address (IP_EVENT_PPP_GOT_IP). */
 void bridge_start(void);
 
-/* Signal strength (dBm) and access technology (3GPP <AcT>, 7 = LTE) for the relay's link status. */
-void bridge_set_radio(int16_t rssi_dbm, uint8_t rat);
+/* Signal strength (dBm), access technology (3GPP <AcT>, 7 = LTE) and, on LTE, the signal's quality (SINR, dB;
+ * BRIDGE_SINR_UNKNOWN otherwise) for the relay's link status. */
+void bridge_set_radio(int16_t rssi_dbm, uint8_t rat, int8_t sinr_db);
 
 /* The locator: the modem's latest GNSS reading (the bridge reports it to the relay every
  * CONFIG_BRIDGE_LOCATOR_INTERVAL seconds), or NULL when the GNSS cannot be read during the data call. */

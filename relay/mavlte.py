@@ -2046,13 +2046,14 @@ class App:
         if agent is None or not agent.client.session:
             for label in v.values():
                 self._set(label, "-")
+            self._paint(v["Link"], "-", TEXT)  # (amber or red no longer)
             self.craft_bars.set(None)
             self.rate_mark = (now, agent.to_gcs_bytes, agent.from_gcs_bytes) if agent else (now, 0, 0)
             self.rates = (0.0, 0.0)
             self._show_position(agent, False)
             return
         self.craft_bars.set(aircraft_card.bars(status))
-        self._set(v["Link"], aircraft_card.link(status))
+        self._paint(v["Link"], aircraft_card.link(status), PALETTE[aircraft_card.link_color(status)])
         self._set(v["Packet loss"], aircraft_card.loss(status))
         down, up = self.rates
         self._set(v["Traffic"], f"↓ {down / 1000:.1f} KB/s telemetry, ↑ {up / 1000:.1f} KB/s commands")

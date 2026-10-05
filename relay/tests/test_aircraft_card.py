@@ -16,8 +16,10 @@ import mavrelay as mr  # noqa: E402
 ONLINE = mr.STATUS_VEHICLE_ONLINE
 
 
-def status(flags=ONLINE, rat=7, rtt=85, up=3, down=0, rssi=-71, idle=200):
-    return mr.LinkStatus.unpack(mr.STATUS_BODY.pack(flags, rat, rtt, up, down, rssi, idle))
+def status(flags=ONLINE, rat=7, rtt=85, up=3, down=0, rssi=-71, idle=200, sinr=None):
+    """A STATUS as relays send it: with the LTE signal's quality since 1.8.7 (sinr), without it before."""
+    body = mr.STATUS_BODY.pack(flags, rat, rtt, up, down, rssi, idle)
+    return mr.LinkStatus.unpack(body if sinr is None else body + mr.QUALITY.pack(sinr))
 
 
 def agent(session=1, watching=True, silence=None, position=None, last_fix=None, voice_request=None, photos=None):
@@ -64,6 +66,27 @@ class CardTest(unittest.TestCase):
             self.assertEqual((card.link(offline), card.loss(offline), card.bars(offline)), ("-", "-", None))
         self.assertEqual([card.bars(status(rssi=r)) for r in (-110, -100, -90, -80, -70)], [0, 1, 2, 3, 4])
         self.assertEqual([card.bars(status(rssi=mr.RSSI_UNKNOWN, up=up)) for up in (5, 30, 100, 400)], [4, 3, 2, 1])
+
+    def test_link_quality(self):
+        """1.8.7: on LTE the bars and the Link line follow the signal's quality (SINR) too: in the air the signal
+        stays strong while the quality falls, and the link with it (first flight: -51 dBm, four bars, link down)."""
+        flight = status(rssi=-53, sinr=-14)
+        self.assertEqual(card.link(flight), "LTE -53 dBm · quality -14 dB · round trip 85 ms")
+        self.assertEqual((card.bars(flight), card.link_color(flight)), (0, card.RED))
+        self.assertEqual([card.bars(status(rssi=-53, sinr=q)) for q in (-14, -13, -12, -9, -8, -1, 0, 9, 10, 25)],
+                         [0, 0, 1, 1, 2, 2, 3, 3, 4, 4])
+        self.assertEqual([card.link_color(status(rssi=-53, sinr=q)) for q in (-13, -12, -9, -8, 10)],
+                         [card.RED, card.AMBER, card.AMBER, card.TEXT, card.TEXT])
+        self.assertEqual(card.bars(status(rssi=-100, sinr=20)), 1)  # never more than the signal's strength allows
+        self.assertEqual(card.bars(status(rssi=mr.RSSI_UNKNOWN, sinr=-5)), 2)
+        # a relay before 1.8.7 (no quality in STATUS), and 2G (no quality): as before
+        self.assertEqual(status().sinr_db, mr.SINR_UNKNOWN)
+        self.assertEqual((card.bars(status(rssi=-53)), card.link_color(status(rssi=-53))), (4, card.TEXT))
+        edge = status(rat=3, rssi=-60, sinr=mr.SINR_UNKNOWN)
+        self.assertEqual((card.link(edge), card.bars(edge), card.link_color(edge)),
+                         ("EDGE -60 dBm · round trip 85 ms", 4, card.TEXT))
+        for offline in (None, status(0, sinr=-14)):
+            self.assertEqual((card.link_color(offline), card.bars(offline)), (card.TEXT, None))
 
     def test_position_and_module(self):
         now = time.time()

@@ -280,6 +280,10 @@ class WebTest(unittest.TestCase):
         self.assertEqual(s["relay"], {"led": "green", "text": "Connected to the relay"})  # no round trip: it is here
         self.assertEqual(s["loss"][:3], "up ")
         self.assertEqual((s["position"]["text"], s["position"]["map"], s["module"]["text"]), ("-", None, "-"))
+        self.vehicle.radio = lambda: (-53, 7, -14)  # 1.8.7: a strong signal of no quality, as in the air
+        s = self.wait(cookie, lambda s: "quality" in s["link"], "the signal's quality")
+        self.assertEqual((s["link"].split(" · ")[:2], s["link_color"], s["aircraft"]["bars"]),
+                         (["LTE -53 dBm", "quality -14 dB"], "red", 0))
 
         self.report()
         s = self.wait(cookie, lambda s: s["position"]["text"] != "-", "a position")
@@ -295,7 +299,7 @@ class WebTest(unittest.TestCase):
 
         self.aircraft_gone()
         s = self.wait(cookie, lambda s: s["aircraft"]["text"].startswith("Offline, last heard "), "offline")
-        self.assertEqual((s["aircraft"]["led"], s["aircraft"]["bars"], s["link"]), ("red", None, "-"))
+        self.assertEqual((s["aircraft"]["led"], s["aircraft"]["bars"], s["link"], s["link_color"]), ("red", None, "-", "text"))
         self.assertTrue(s["position"]["text"].startswith("last known 41.12346, 28.98765, "))
         self.assertEqual((s["position"]["color"], s["module"]["text"]), ("amber", "-"))
         self.assertEqual(s["position"]["copy"], "41.123457, 28.987654")  # still there to look for it

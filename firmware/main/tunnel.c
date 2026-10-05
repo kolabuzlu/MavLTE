@@ -138,6 +138,7 @@ void tun_init(tun_client_t *t, const tun_config_t *cfg, uint32_t now_ms)
     hmac_sha256_setkey(&t->key, cfg->key, cfg->key_len);
     t->rssi_dbm = TUN_RSSI_UNKNOWN;
     t->rat = TUN_RAT_UNKNOWN;
+    t->sinr_db = TUN_SINR_UNKNOWN;
     t->last_roll = now_ms;
     drop_session(t);
 }
@@ -147,10 +148,11 @@ void tun_restart(tun_client_t *t)
     drop_session(t);
 }
 
-void tun_set_radio(tun_client_t *t, int16_t rssi_dbm, uint8_t rat)
+void tun_set_radio(tun_client_t *t, int16_t rssi_dbm, uint8_t rat, int8_t sinr_db)
 {
     t->rssi_dbm = rssi_dbm;
     t->rat = rat;
+    t->sinr_db = sinr_db;
 }
 
 void tun_set_ping_flags(tun_client_t *t, uint8_t flags)
@@ -195,13 +197,14 @@ static void send_hello(tun_client_t *t)
 
 static void send_ping(tun_client_t *t, uint32_t now_ms)
 {
-    uint8_t body[12];
+    uint8_t body[13];
     put_u32(body, now_ms);
     put_u16(body + 4, t->rtt_ms);
     put_u16(body + 6, tun_loss_permille(t));
     put_u16(body + 8, (uint16_t)t->rssi_dbm);
     body[10] = t->rat;
     body[11] = t->ping_flags;
+    body[12] = (uint8_t)t->sinr_db; /* (relays before 1.8.7 read the first 12 bytes) */
     t->last_ping = now_ms;
     send_packet(t, TUN_PING, body, sizeof(body));
 }

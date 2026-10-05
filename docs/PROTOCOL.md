@@ -44,10 +44,10 @@ burst was lost.
 | 1    | HELLO   | C → S | 0 / 0 | nonce (8 bytes), then optional UTF-8 info text (≤ 64 bytes) |
 | 2    | WELCOME | S → C | new session / 0 | the 8-byte nonce from the HELLO, then (since 1.8.0) the server's clock, `unix_ms u64` |
 | 3    | DATA    | C ↔ S | session / seq | MAVLink bytes (whole frames), ≤ 1172 bytes |
-| 4    | PING    | C → S | session / seq | `t_ms u32, rtt_ms u16, rx_loss_permille u16, rssi_dbm i16, rat u8, flags u8` (GCS: bit 0 watching; vehicle: bit 1 sounding, bit 2 cannot sound) |
+| 4    | PING    | C → S | session / seq | `t_ms u32, rtt_ms u16, rx_loss_permille u16, rssi_dbm i16, rat u8, flags u8`, then (vehicle, since 1.8.7) `sinr_db i8` (GCS: bit 0 watching; vehicle: bit 1 sounding, bit 2 cannot sound) |
 | 5    | PONG    | S → C | session / seq | `t_ms u32` (echo), `flags u8` (bit 0: a GCS is connected; to the vehicle, bit 1: sound the speaker) |
 | 6    | REJECT  | S → C | the rejected session / 0 | `reason u8` (1 = unknown or expired session) |
-| 7    | STATUS  | S → GCS | session / seq | `flags u8, rat u8, rtt_ms u16, up_loss_permille u16, down_loss_permille u16, rssi_dbm i16, idle_ms u16` (flags: bit 0 vehicle online, bits 1-3 the [locator voice](#locator-voice)) |
+| 7    | STATUS  | S → GCS | session / seq | `flags u8, rat u8, rtt_ms u16, up_loss_permille u16, down_loss_permille u16, rssi_dbm i16, idle_ms u16`, then (since 1.8.7) `sinr_db i8` (flags: bit 0 vehicle online, bits 1-3 the [locator voice](#locator-voice)) |
 | 8    | SNAP_REQ  | GCS → S → V | session / seq | `photo_id u32, size u8` (see [Snapshots](#snapshots)) |
 | 9    | SNAP_INFO | V → S → GCS | session / seq | `photo_id u32, bytes u32, width u16, height u16, lat i32, lon i32, alt_mm i32, heading_cdeg u16, status u8, time u32` |
 | 10   | SNAP_DATA | V → S → GCS | session / seq | `photo_id u32, chunk u16`, then the chunk (1024 bytes, the last one shorter) |
@@ -60,16 +60,22 @@ burst was lost.
 | 17   | FILE_DATA | V → S → GCS | session / seq | `req_id u16, status u8, offset u32, size u32`, then up to 1024 bytes of the file |
 | 18   | FILE_ACK  | GCS → S → V | session / seq | `req_id u16, next u32` |
 
-Unknown values are `0xFFFF` for u16 fields, `0x7FFF` for `rssi_dbm` and `0xFF` for `rat`.
+Unknown values are `0xFFFF` for u16 fields, `0x7FFF` for `rssi_dbm`, `0xFF` for `rat` and `-128` for `sinr_db`.
 `rat` uses the 3GPP TS 27.007 access technology numbers (0 GSM, 3 EDGE, 7 LTE, ...).
 Receivers ignore extra trailing bytes in a body and treat missing trailing fields as unknown,
 so fields can be appended in later versions.
 
 STATUS describes the vehicle's link: flag bit 0 means the vehicle was heard within the last
-3 s, `rtt_ms`, `down_loss_permille`, `rssi_dbm` and `rat` are what the vehicle reported in its
+3 s, `rtt_ms`, `down_loss_permille`, `rssi_dbm`, `rat` and `sinr_db` are what the vehicle reported in its
 last PING, `up_loss_permille` is measured by the server, and `idle_ms` is the time since the
 server last heard from the vehicle. It tops out at 65534 (65.5 s or more): a GCS agent that saw it
 count up to there goes on counting by itself, until the server drops the session (120 s by default).
+
+`sinr_db` is the quality of the vehicle's LTE signal, its signal to interference and noise ratio
+as the modem last reported it (every 5 s); unknown when it is not on LTE. In the air it tells
+the link where `rssi_dbm` cannot: there the modem hears many cells at once, so the signal
+stays strong (-51 to -55 dBm on the first flight) while the quality falls, and with it the
+link (it held down to -9 dB and failed below -12 dB).
 
 ## Session setup
 

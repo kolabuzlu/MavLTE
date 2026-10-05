@@ -366,6 +366,7 @@ class WebPage:
             "relay": {"led": relay_led, "text": relay_text},
             "aircraft": {"led": led, "text": headline, "bars": aircraft_card.bars(status)},
             "link": aircraft_card.link(status),
+            "link_color": aircraft_card.link_color(status),
             "loss": aircraft_card.loss(status),
             "position": {"text": where.text, "color": where.color,
                          "map": aircraft_card.map_link(where.fix) if where.fix else None,
