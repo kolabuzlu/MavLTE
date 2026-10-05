@@ -414,21 +414,46 @@ def dark_title_bar(window: tk.Misc) -> None:
         pass
 
 
-def place_on_screen(window: tk.Tk, scale: float) -> None:
-    """Opens a window at the top of the screen when where Windows would put it hides its bottom behind the
-    taskbar (a 1080p laptop at 125% has 1020 pixels above the taskbar)."""
+def work_area() -> Optional[Tuple[int, int, int, int]]:
+    """The screen above the taskbar, (left, top, right, bottom); None but on Windows."""
     if sys.platform != "win32":
-        return
+        return None
     try:
         from ctypes import wintypes
         area = wintypes.RECT()
         if not ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(area), 0):  # SPI_GETWORKAREA
-            return
+            return None
     except (AttributeError, OSError):
+        return None
+    return area.left, area.top, area.right, area.bottom
+
+
+def frame_height() -> Optional[int]:
+    """What Windows adds to a window's height: its title bar with the edge above it (SM_CYCAPTION, SM_CYSIZEFRAME,
+    SM_CXPADDEDBORDER), and the line below (39 pixels at 125 %)."""
+    try:
+        return sum(ctypes.windll.user32.GetSystemMetrics(i) for i in (4, 33, 92)) + 1
+    except (AttributeError, OSError):
+        return None
+
+
+def place_on_screen(window: tk.Tk, scale: float) -> None:
+    """Keeps a window above the taskbar (a 1080p screen at 125% has 1020 pixels there): never taller than that room,
+    its content giving way at the bottom margins as when maximized (MavLTE asks 1002 pixels there, plus 39 for
+    Windows), and opened at the top of the screen when where Windows would put it hides its bottom."""
+    area = work_area()
+    if area is None:
         return
+    left, top, right, bottom = area
     window.update_idletasks()
-    if window.winfo_reqheight() + round(100 * scale) > area.bottom - area.top:  # its title bar, and Windows' offset
-        window.geometry(f"+{area.left + round(24 * scale)}+{area.top}")
+    height = window.winfo_reqheight()
+    frame = frame_height()
+    if frame is not None:  # (maximizing still fills the screen: it is not held to this)
+        most = max(window.minsize()[1], bottom - top - frame)
+        window.maxsize(window.winfo_screenwidth(), most)
+        height = min(height, most)
+    if height + round(100 * scale) > bottom - top:  # its title bar, and Windows' offset
+        window.geometry(f"+{left + round(24 * scale)}+{top}")
 
 
 class ChannelCard(tk.Frame):
@@ -573,7 +598,7 @@ class CameraRow(tk.Frame):
         s, pad = app.scale, round(8 * app.scale)
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
         inner = tk.Frame(self, bg=SURFACE)
-        inner.pack(fill="x", padx=pad, pady=pad)
+        inner.pack(fill="x", padx=pad, pady=round(6 * s))
         self.thumbnail = Thumbnail(inner, s, app.show_photo)  # the last photo: click for the viewer
         self.thumbnail.pack(side="right", anchor="n", padx=(pad, 0))
         left = tk.Frame(inner, bg=SURFACE)
@@ -585,7 +610,7 @@ class CameraRow(tk.Frame):
         self.size = Segments(top, app, self.SIZES, SIZE_NAMES.index(app.settings.photo_size), app.choose_size)
         self.size.pack(side="left", padx=(pad, 0))
         self.status = tk.Label(left, text="", bg=SURFACE, fg=DIM, font=app.font_small, anchor="w", justify="left")
-        self.status.pack(fill="x", pady=(round(5 * s), 0))
+        self.status.pack(fill="x", pady=(round(3 * s), 0))
         self.bar_h = max(3, round(3 * s))
         # arriving: how much (width 1: a canvas asks for 10 cm unless told, and would widen the window)
         self.bar = tk.Canvas(left, width=1, height=self.bar_h, bg=SURFACE, highlightthickness=0)
@@ -1627,7 +1652,7 @@ class App:
         header = tk.Frame(root, bg=SURFACE)
         header.pack(fill="x")
         bar = tk.Frame(header, bg=SURFACE)
-        bar.pack(fill="x", padx=round(10 * s), pady=(round(8 * s), 0))
+        bar.pack(fill="x", padx=round(10 * s), pady=(round(6 * s), 0))  # (the window's spacing fits 1080p at 125%)
         menu_button = tk.Label(bar, text="☰", bg=SURFACE, fg=MUTED, font=(self.font[0], 14), cursor="hand2")
         menu_button.pack(side="left")
         menu_button.bind("<Enter>", lambda _e: menu_button.configure(fg=TEXT))
@@ -1645,7 +1670,7 @@ class App:
         menu_button.bind("<Button-1>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
 
         who = tk.Frame(header, bg=SURFACE)
-        who.pack(fill="x", padx=round(16 * s), pady=(round(8 * s), round(4 * s)))
+        who.pack(fill="x", padx=round(16 * s), pady=(round(6 * s), round(3 * s)))
         if self.icon is not None:
             self.badge = self.icon.subsample(4 if s < 1.5 else 2)  # whole-pixel steps keep the pixel art crisp
             tk.Label(who, image=self.badge, bg=SURFACE).pack(side="left")
@@ -1656,7 +1681,7 @@ class App:
         self.server_label = tk.Label(names, text="", bg=SURFACE, fg=MUTED, font=self.font)
         self.server_label.pack(anchor="w")
         line = tk.Frame(header, bg=SURFACE)
-        line.pack(fill="x", padx=round(16 * s), pady=(0, round(10 * s)))
+        line.pack(fill="x", padx=round(16 * s), pady=(0, round(8 * s)))
         self.relay_led = Led(line, s, SURFACE)
         self.relay_led.pack(side="left")
         self.relay_text = tk.Label(line, text="", bg=SURFACE, fg=TEXT, font=self.font, anchor="w")
@@ -1664,17 +1689,17 @@ class App:
         tk.Frame(root, bg=ACCENT, height=max(2, round(2 * s))).pack(fill="x")
 
         self.body = tk.Frame(root, bg=BG)
-        self.body.pack(fill="both", expand=True, padx=round(12 * s), pady=round(8 * s))
+        self.body.pack(fill="both", expand=True, padx=round(12 * s), pady=round(6 * s))
         tk.Label(self.body, text="Data transfer", bg=BG, fg=MUTED, font=self.font_bold).pack(anchor="w")
         self.tcp_card = ChannelCard(self, "tcp", self.settings.tcp)
-        self.tcp_card.pack(fill="x", pady=(round(4 * s), round(6 * s)))
+        self.tcp_card.pack(fill="x", pady=(round(4 * s), round(5 * s)))
         self.udp_card = ChannelCard(self, "udp", self.settings.udp)
         self.udp_card.pack(fill="x")
 
         tk.Label(self.body, text="Aircraft", bg=BG, fg=MUTED, font=self.font_bold).pack(anchor="w",
-                                                                                       pady=(round(8 * s), 0))
+                                                                                       pady=(round(6 * s), 0))
         craft = tk.Frame(self.body, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
-        craft.pack(fill="x", pady=(round(4 * s), 0))
+        craft.pack(fill="x", pady=(round(3 * s), 0))
         pad = round(8 * s)
         top = tk.Frame(craft, bg=SURFACE)
         top.pack(fill="x", padx=pad, pady=(pad, round(2 * s)))
@@ -2003,9 +2028,10 @@ class App:
     @staticmethod
     def _port_status(online: bool, gcs: str, where: str) -> Tuple[str, str]:
         """A switched-on port's status line and its colour. gcs: what is connected to it, or ''.
-        The switch stays on while the aircraft is away, so that the telemetry comes back by itself."""
+        The switch stays on while the aircraft is away, so that the telemetry comes back by itself. One line,
+        so that the window keeps its height (the longest, UDPCl on a network address: 505 of 552 pixels at 125%)."""
         if not online:
-            return f"Waiting for the aircraft\n{gcs or 'Mission Planner: ' + where}", DIM
+            return f"Waiting for the aircraft · {gcs or 'Mission Planner: ' + where}", DIM
         return (gcs, GREEN) if gcs else (f"Waiting for Mission Planner: {where}", DIM)
 
     def _show_aircraft(self, agent, status: Optional[mr.LinkStatus], now: float) -> None:

@@ -302,8 +302,8 @@ class GuiTest(unittest.TestCase):
         self.pump(lambda: self.text(app.craft_state).startswith("Offline"), what="aircraft offline")
         app.toggle(app.udp_card, True)  # allowed without the aircraft: its telemetry comes when it does
         self.assertTrue(app.udp_card.switch.on)
-        self.pump(lambda: self.text(app.udp_card.status).startswith("Waiting for the aircraft\nMission Planner: UDP"),
-                  what="waiting for the aircraft")
+        self.pump(lambda: self.text(app.udp_card.status).startswith("Waiting for the aircraft · Mission Planner: UDP"),
+                  what="waiting for the aircraft (one line: the window keeps its height)")
         self.assertEqual(app.udp_card.led.color, mavlte.LED_OFF)
 
     def test_close_keeps_what_others_wrote_meanwhile(self):
@@ -670,6 +670,45 @@ class GuiTest(unittest.TestCase):
         self.assertIsNone(old())  # gone, reference cycles and all
         self.assertGreater(gc.get_freeze_count(), 0)  # set aside anew
         self.assertIsNone(app.set_aside_at)
+
+
+@unittest.skipUnless(HAVE_TK, "needs Tk and a display")
+class PlaceOnScreenTest(unittest.TestCase):
+    """1.8.6: MavLTE is never taller than the screen above the taskbar (a 1080p screen at 125%: 1020 pixels, of which
+    Windows' title bar and frame take 39): its content gives way at the bottom margins, as when maximized."""
+
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+        self.root.minsize(450, 525)  # MavLTE's, at 125%
+        tk.Frame(self.root, width=600, height=1002).pack()  # what MavLTE asks there
+
+    def place(self, area, frame=39):
+        with mock.patch.object(mavlte, "work_area", return_value=area), \
+                mock.patch.object(mavlte, "frame_height", return_value=frame):
+            mavlte.place_on_screen(self.root, 1.25)
+
+    def test_held_to_the_room_above_the_taskbar_and_opened_at_the_top(self):
+        self.place((0, 0, 1920, 1020))
+        self.assertEqual(self.root.maxsize()[1], 981)
+        self.assertTrue(self.root.geometry().endswith("+30+0"), self.root.geometry())
+
+    def test_room_to_spare_changes_nothing(self):
+        self.place((0, 0, 2560, 1400))
+        self.assertEqual(self.root.maxsize()[1], 1361)  # more than it asks
+        self.assertFalse(self.root.geometry().endswith("+30+0"))  # where Windows puts it
+
+    def test_a_tiny_screen_keeps_the_smallest_size(self):
+        self.place((0, 0, 800, 480))
+        self.assertEqual(self.root.maxsize()[1], 525)
+
+    def test_not_windows_or_no_metrics(self):
+        with mock.patch.object(self.root, "maxsize", wraps=self.root.maxsize) as maxsize:
+            self.place(None)  # not Windows
+            self.place((0, 0, 1920, 1020), frame=None)  # no title bar metrics: not held, still opened at the top
+        self.assertEqual([c for c in maxsize.call_args_list if c.args], [])  # (Tk's own maximum stays)
+        self.assertTrue(self.root.geometry().endswith("+30+0"))
 
 
 @unittest.skipUnless("mavlte" in sys.modules, "needs tkinter")
