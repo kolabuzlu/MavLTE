@@ -33,6 +33,9 @@ Repository: <https://github.com/kolabuzlu/MavLTE>
 - **Recovers by itself** from lost coverage, modem resets, IP address changes and relay restarts.
 - **Link status**: the MavLTE app shows the aircraft's signal and, on LTE, its quality, round-trip time and
   packet loss.
+- **The right network, up high too**: where LTE fails in the air, the module moves to 2G (EDGE) by
+  itself, and back to LTE once the aircraft is lower down, or after a while. Or choose 2G or LTE
+  yourself, in the MavLTE app or on its web page.
 - **Snapshot on demand**: press *Snapshot* in the MavLTE app and the board's camera takes a photo,
   which comes to you through the relay without holding up the telemetry, with where and when it
   was taken. Only when you ask: the camera takes nothing by itself. The relay keeps photos for
@@ -99,8 +102,8 @@ logs every connection, address change and link loss as it happens.
 
 The aircraft's photos are kept in `/var/lib/mavrelay/snapshots` for 7 days (`snapshot_dir` and
 `snapshot_days` in `mavrelay.ini`), each as a `.jpg` with a `.json` beside it. Its last known
-position is in `/var/lib/mavrelay/locator.json`, the locator voice switch in `voice.json` beside
-it. Updating an older
+position is in `/var/lib/mavrelay/locator.json`, the locator voice switch in `voice.json` and the
+network chosen for the aircraft in `network.json` beside it. Updating an older
 relay: run the installer again, which also installs the new service file (it gives the service
 that folder) and updates the web page, if you have it ([section 6](#6-the-web-page-on-your-phone));
 your keys stay.
@@ -124,7 +127,6 @@ the chip to tell them apart and prints `board version V1` or `V2` at start-up.
 | Vehicle key | the vehicle key the installer printed |
 | APN of the SIM card | `internet` (Turkcell, Vodafone TR and Türk Telekom) |
 | SIM PIN | empty; better remove the PIN with a phone first |
-| Mobile network technology | Automatic (LTE, falls back to 2G) or LTE only |
 | Board version, flight controller pins | leave on detect / `-1` |
 | Flight controller baud rate | `115200` |
 | Locator | on, every 5 s |
@@ -261,7 +263,8 @@ flight controller. Either:
 
 The bursts are strongest on 2G (GSM/EDGE), and the board has less buffer capacitance on the
 modem's supply than SIMCom asks for: keep the supply wires short and thick, and where LTE
-coverage is good, or when the board runs on its cell alone, choose *LTE only* in menuconfig.
+coverage is good, or when the board runs on its cell alone, choose **LTE** in the MavLTE app
+([section 5](#5-mavlte-app-and-mission-planner)).
 
 The 5V pin is wired straight to the USB-C port's power line. Unplug the BEC (or the flight
 battery) before you connect USB-C to a PC.
@@ -359,6 +362,21 @@ server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
   link falls with the quality: the *Link* line turns amber where drops are likely (-9 to -12 dB),
   red where the link fails (-13 dB and below). On the first flight it held to about 500 m above
   home all but a few seconds, and failed for minutes at 1000 m.
+- **Auto · 2G · LTE**, beside the bars in the *Aircraft* panel, is the network the aircraft's
+  module uses. **Auto** (the default) is LTE, and 2G while LTE fails: when nothing has come from
+  the relay for 20 s and LTE's quality is -9 dB or lower, the module moves to 2G (EDGE). It tries
+  LTE again once the aircraft is 50 m below where LTE last worked well (and below where it
+  failed), after 10 s on 2G at least, or else after 30 s on 2G; while LTE keeps failing, after
+  60 s, then every 2 minutes, and LTE that has worked for 2 minutes starts the waits at 30 s
+  again. Meanwhile the *Link* line
+  ends in `LTE failed`, in amber. **2G** and **LTE** keep the module on that one:
+  no fallback at all, not even the modem's own, so with LTE there is no service where only 2G
+  reaches (and the module cannot hear a new choice until it finds LTE again, or restarts: it
+  starts on Auto, until the relay tells it the choice). Each change costs a few seconds without
+  data, as the modem registers again: about 6 s to LTE, 12 s to 2G. The relay keeps the choice,
+  as the voice switch: made while the aircraft is away, it takes it as soon as it is back. The
+  choice shows in green once the aircraft runs it, in amber until then. A second MavLTE, and the
+  web page, show the same choice.
 - In Mission Planner pick **UDP**, port **14550**, or **TCP**, host **127.0.0.1**, port **5760**.
   QGroundControl finds UDP 14550 by itself.
 - **From another computer, a tablet or a phone** on the same network: switch the port off, set
@@ -436,10 +454,11 @@ server itself may connect: reach it through an SSH tunnel,
 ## 6. The web page on your phone
 
 The app's *Aircraft* panel also comes as a web page, for when you go looking for the aircraft with
-only a phone: its link and signal, **Position** with **Map** and **Copy**, **Module**, the
-**Voice** switch, and **Snapshot** with the last photo (tap it for the whole screen, swipe for the
-ones before). It says what the app says, in the same colours. It runs on the relay server, so no
-laptop has to be on. Telemetry stays with Mission Planner: the page has none.
+only a phone: its link and signal, its **Network** (Auto, 2G, LTE), **Position** with **Map** and
+**Copy**, **Module**, the **Voice** switch, and **Snapshot** with the last photo (tap it for the
+whole screen, swipe for the ones before). It says what the app says, in the same colours. It runs
+on the relay server, so no laptop has to be on. Telemetry stays with Mission Planner: the page has
+none.
 
 **Map** opens the moving map on the whole screen, as in the app, with the track the page's server
 kept (the last three hours or so, also while no phone looked): drag it, pinch or **−** and **+**
@@ -470,7 +489,7 @@ opens like an app.
   aircraft no mobile data. Photos asked for on the phone also come to the MavLTE app, and the
   other way round; the page keeps the newest 200 (in `/var/lib/mavrelay/web-photos`).
 - `journalctl -u mavweb -f` logs sign-ins (with the phone's address) and every switch of the
-  voice and photo asked for on the page. Its settings, in `[web]` in `/etc/mavrelay/mavrelay.ini`
+  voice, network and photo asked for on the page. Its settings, in `[web]` in `/etc/mavrelay/mavrelay.ini`
   (then `sudo systemctl restart mavweb`): `name`, the aircraft's name on the page; `photo_dir`;
   `listen`, 127.0.0.1:8090, which only Caddy needs to reach.
 
@@ -512,7 +531,7 @@ goes on from where it ends. **Folder** shows the copies. *From*:
 | `relay`, `rtt_ms`, `loss_pct`, `data_kb`, `gcs` | Connected to the relay (1/0), round-trip time, downlink packet loss, mobile data used since power-on (with the IP and UDP headers your plan counts), a GCS connected |
 | `fc_heard_s`, `fc_mode`, `fc_armed`, `fc_gps_fix`, `fc_gps_sats`, `fc_lat`, `fc_lon`, `fc_alt_m`, `fc_rel_alt_m`, `fc_heading`, `fc_groundspeed_ms`, `fc_airspeed_ms`, `fc_climb_ms`, `fc_throttle`, `fc_battery_v`, `fc_current_a`, `fc_battery_pct`, `fc_rssi` | The flight controller, from its MAVLink: seconds since its last HEARTBEAT, flight mode (ArduPlane's names), armed, its GPS fix and satellites, position, altitude above sea level and above home, heading, ground speed, airspeed, climb rate, throttle, battery voltage, current and remaining, RC signal (0–254). The messages come at the stream rates of [section 4](#4-ardupilot-parameters) |
 | `chip_c`, `power`, `cell_pct`, `rail_mv` | The ESP32-S3's temperature, the board's power (`ext`: USB or the BEC; `cell`: its 18650), the cell's charge, the rail's voltage |
-| `voice`, `events` | The locator voice (`off`, `on`, `sounding`, `cannot`); what happened in that second: `relay connected; photo 1790933700 sent`, the reason for a restart (`brownout`, `watchdog`) in the first line |
+| `voice`, `events` | The locator voice (`off`, `on`, `sounding`, `cannot`); what happened in that second: `relay connected; photo 1790933700 sent`, a change of network and why (`network: 2G: LTE failed (nothing from the relay for 20 s at quality -11 dB); LTE again in 30 s or below 450 m`), the reason for a restart (`brownout`, `watchdog`) in the first line |
 
 It is the link's own record, beside the flight controller's dataflash log, not instead of it:
 open it in a spreadsheet, or plot it with the coverage along the flight.
@@ -597,7 +616,10 @@ section of `mavrelay.ini`.
   | Cell change | every ~60 s, 1.5–4 s without data | handover every ~30 s, 50–150 ms held back |
   | Dropout | every ~5 min, 5–15 s | every ~5 min, 2–8 s |
 
-  Changing between 2G and LTE costs a few seconds without data, as on a real modem.
+  Changing between 2G and LTE costs a few seconds without data, as on a real modem. The network
+  chosen in MavLTE applies as on the board: with 2G the module uses 2G (there wherever LTE is),
+  with LTE it finds nothing where there is only 2G. The simulator has no LTE quality, so *Auto*
+  never falls back to 2G by itself.
 - **Signal**, from *Weak* to *Excellent* (default *Good*), is the level the module reports (the
   bars in MavLTE). A weaker signal slows the link and adds delay and loss, and makes the troubles
   more frequent and longer: twice with *Fair*, four times with *Weak*, half with *Excellent*. From
@@ -675,7 +697,9 @@ missed while the app was closed) travel over your laptop's internet.
 | `no IP address from the network` | Wrong APN. |
 | Relay log says `... has the wrong key` | The key in the firmware (or agent) differs from `vehicle_key` (or `gcs_key`) in `mavrelay.ini`. |
 | Relay log is silent when the aircraft is on | The UDP port is closed in a firewall, or the host or port in the firmware is wrong. |
-| In the air the link drops for seconds or minutes, though MavLTE showed a strong signal | The signal's *quality* fell, not its strength: up there the modem hears many cells at once, and they drown each other out. MavLTE's *Link* line shows the quality (SINR) and turns amber, then red, before the link fails; the bars follow it. On the first flight the link held down to -9 dB and failed below -12 dB, which came above about 500 m over home; the modem falls back to 2G (EDGE) only where LTE fades out altogether. Fly lower, or expect the gaps: MavLTE reconnects by itself. |
+| In the air the link drops for seconds or minutes, though MavLTE showed a strong signal | The signal's *quality* fell, not its strength: up there the modem hears many cells at once, and they drown each other out. MavLTE's *Link* line shows the quality (SINR) and turns amber, then red, before the link fails; the bars follow it. On the first flight the link held down to -9 dB and failed below -12 dB, which came above about 500 m over home; the modem itself goes to 2G (EDGE) only where LTE fades out altogether. Since 1.8.8 the module moves to 2G after 20 s of such a gap (MavLTE's *Link*: `LTE failed`) and back to LTE lower down; for a whole flight up high, choose 2G in MavLTE. MavLTE reconnects by itself either way. |
+| The network chosen stays amber | The aircraft has not taken it: it is away (it takes it as soon as it is back), or its firmware is older than 1.8.8 and stays on automatic: update it. |
+| `the modem did not take AT+CNMP=...` (ESP32 log) | The modem refused the network chosen: it stays on the one it has, and the firmware asks again before the next data call. |
 | Agent connects, Mission Planner shows nothing | Mission Planner's port must match `--udp` (default 14550). Check `SERIALn_PROTOCOL` and `SERIALn_BAUD`, and that TX and RX are crossed. |
 | Another computer or phone cannot connect | The MavLTE card's IP must be 0.0.0.0 ([section 5](#5-mavlte-app-and-mission-planner)); for UDP, Mission Planner there connects with UDPCl, not UDP. The first time a port listens, Windows asks whether to let MavLTE through its firewall: tick the kind of network you are on (Windows often calls a home Wi-Fi *Public*). |
 | Mission Planner connects but commands are ignored | Signing is on and this Mission Planner does not have the key. |
@@ -702,7 +726,7 @@ missed while the app was closed) travel over your laptop's internet.
 
 ```bash
 cd relay && python -m unittest discover -s tests       # relay, protocol, end-to-end over UDP
-cd firmware/test/host && make test                      # C core: SHA-256/HMAC, framing, tunnel, snapshots, positions, GNSS
+cd firmware/test/host && make test                      # C core: SHA-256/HMAC, framing, tunnel, snapshots, positions, GNSS, network
 ```
 
 On Linux, macOS or WSL the relay tests also build `firmware/test/host/tunnel_harness` and run the

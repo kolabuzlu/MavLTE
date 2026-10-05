@@ -262,6 +262,7 @@ class WebPage:
         self.on_failure: Optional[Callable[[], None]] = None
         self.voice = aircraft_card.Voice()
         self.voice_shown = (False, aircraft_card.Shown("", aircraft_card.DIM))
+        self.network_shown = aircraft_card.NetworkShown(None, False, False)  # the network selector
         self.track = aircraft_card.Track()  # for the moving map: kept on the agent's loop
         self.by_id: Dict[int, str] = {}  # the photos kept
         self.newest: Optional[dict] = None
@@ -356,6 +357,9 @@ class WebPage:
         if shown is not None:
             self.voice_shown = shown
         voice_on, voice = self.voice_shown
+        network = aircraft_card.network(agent, status)
+        if network is not None:
+            self.network_shown = network
         camera = aircraft_card.camera(agent, online, size, now)
         fix = agent.last_fix  # the moving map's aircraft
         self.track.add(fix)
@@ -367,6 +371,8 @@ class WebPage:
             "aircraft": {"led": led, "text": headline, "bars": aircraft_card.bars(status)},
             "link": aircraft_card.link(status),
             "link_color": aircraft_card.link_color(status),
+            "network": {"choice": self.network_shown.choice, "can": self.network_shown.usable,
+                        "pending": self.network_shown.pending},
             "loss": aircraft_card.loss(status),
             "position": {"text": where.text, "color": where.color,
                          "map": aircraft_card.map_link(where.fix) if where.fix else None,
@@ -384,6 +390,10 @@ class WebPage:
     def set_voice(self, on: bool) -> bool:
         """False while there is no session with the relay."""
         return self.call(lambda: self.agent.set_voice(on))
+
+    def set_network(self, mode: int) -> bool:
+        """The aircraft's network (mr.NET_*); False while there is no session with the relay."""
+        return self.call(lambda: self.agent.set_network(mode))
 
     def snapshot(self, size: int) -> Optional[str]:
         """Asks the aircraft for a photo; None, or why not (as the card says it)."""
@@ -553,7 +563,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(204, headers=[("Set-Cookie", cookie_header(self.page.access.cookie(time.time())))])
         if path == "/api/signout":
             return self.send(204, headers=[("Set-Cookie", cookie_header("", 0))])
-        if path not in ("/api/voice", "/api/snapshot"):
+        if path not in ("/api/voice", "/api/network", "/api/snapshot"):
             return self.send_json(404, {"error": "Not found"})
         if self.signed_in() is None:
             return self.send_json(401, {"signin": True})
@@ -564,6 +574,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not self.page.set_voice(on):
                 return self.send_json(503, {"error": "Not connected to the relay"})
             wlog.info("the locator voice switched %s on the page, from %s", "on" if on else "off", self.who())
+            return self.send_json(200, {"ok": True})
+        if path == "/api/network":
+            mode = data.get("mode")
+            if isinstance(mode, bool) or mode not in mr.NET_NAMES:
+                return self.send_json(400, {"error": "Bad request"})
+            if not self.page.set_network(mode):
+                return self.send_json(503, {"error": "Not connected to the relay"})
+            wlog.info("the aircraft's network chosen on the page: %s, from %s", mr.NET_NAMES[mode], self.who())
             return self.send_json(200, {"ok": True})
         size = data.get("size")
         if isinstance(size, bool) or size not in (0, 1, 2):

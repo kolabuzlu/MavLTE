@@ -139,6 +139,7 @@ void tun_init(tun_client_t *t, const tun_config_t *cfg, uint32_t now_ms)
     t->rssi_dbm = TUN_RSSI_UNKNOWN;
     t->rat = TUN_RAT_UNKNOWN;
     t->sinr_db = TUN_SINR_UNKNOWN;
+    t->network = TUN_NET_UNKNOWN;
     t->last_roll = now_ms;
     drop_session(t);
 }
@@ -158,6 +159,11 @@ void tun_set_radio(tun_client_t *t, int16_t rssi_dbm, uint8_t rat, int8_t sinr_d
 void tun_set_ping_flags(tun_client_t *t, uint8_t flags)
 {
     t->ping_flags = flags;
+}
+
+void tun_set_net_report(tun_client_t *t, uint8_t report)
+{
+    t->net_report = report;
 }
 
 static bool send_packet(tun_client_t *t, uint8_t type, const uint8_t *body, size_t body_len)
@@ -197,7 +203,7 @@ static void send_hello(tun_client_t *t)
 
 static void send_ping(tun_client_t *t, uint32_t now_ms)
 {
-    uint8_t body[13];
+    uint8_t body[14];
     put_u32(body, now_ms);
     put_u16(body + 4, t->rtt_ms);
     put_u16(body + 6, tun_loss_permille(t));
@@ -205,6 +211,7 @@ static void send_ping(tun_client_t *t, uint32_t now_ms)
     body[10] = t->rat;
     body[11] = t->ping_flags;
     body[12] = (uint8_t)t->sinr_db; /* (relays before 1.8.7 read the first 12 bytes) */
+    body[13] = t->net_report;       /* (... before 1.8.8 the first 13) */
     t->last_ping = now_ms;
     send_packet(t, TUN_PING, body, sizeof(body));
 }
@@ -319,6 +326,8 @@ void tun_input(tun_client_t *t, const uint8_t *pkt, size_t len, uint32_t now_ms)
         t->rtt_ms = rtt < TUN_U16_UNKNOWN ? (uint16_t)rtt : TUN_U16_UNKNOWN - 1;
         t->gcs_present = (body[4] & TUN_PONG_GCS_PRESENT) != 0;
         t->voice_on = (body[4] & TUN_PONG_VOICE) != 0;
+        uint8_t net = (uint8_t)(body[4] >> TUN_PONG_NET_SHIFT & 0x03);
+        t->network = (int8_t)(net <= TUN_NET_LTE ? net : TUN_NET_AUTO); /* (the fourth value is unused) */
     } else if (type >= TUN_SNAP_REQ && t->cfg.on_packet) {
         t->cfg.on_packet(t->cfg.ctx, type, body, body_len);
     }

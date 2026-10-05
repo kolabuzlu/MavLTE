@@ -30,6 +30,17 @@ bool bridge_voice_wanted(void);
 /* What the modem makes of it, for the relay (in every PING): speaking, or asked to but it does not. */
 void bridge_set_voice(bool speaking, bool failed);
 
+/* The mobile network chosen at the relay (TUN_NET_*: automatic, 2G only, LTE only) in its last PONG, or -1 before the
+ * first since power-on. That holds while the relay is out of reach. */
+int bridge_network_wanted(void);
+
+/* The modem's network for the relay (in every PING): the one it is set to, and whether it is on 2G because LTE failed
+ * (TUN_NET_* | TUN_NET_FALLBACK). */
+void bridge_set_net_report(uint8_t report);
+
+/* The flight controller's height above home in metres, from its GLOBAL_POSITION_INT if one came lately. */
+bool bridge_fc_altitude(int32_t *alt_m);
+
 /* Milliseconds since the relay was last heard from, or since mobile data came up if later. */
 uint32_t bridge_relay_silence_ms(void);
 

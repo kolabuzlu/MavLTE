@@ -39,7 +39,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.8.7"
+__version__ = "1.8.8"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -83,6 +83,19 @@ IDLE_CAPPED = 0xFFFE  # STATUS idle_ms tops out here: the relay last heard the v
 STATUS_VOICE_ON = 0x02  # the relay has the locator voice switched on
 STATUS_SPEAKING = 0x04  # the vehicle said in its last PING that it sounds
 STATUS_VOICE_FAILED = 0x08  # ... that it cannot
+# The aircraft's mobile network as GCS agents choose it (NETWORK; docs/PROTOCOL.md, "Network"): automatic (LTE, and
+# 2G while LTE fails), 2G only or LTE only. The relay keeps the choice and passes it on in PONG flag bits 2-3.
+NET_AUTO, NET_2G, NET_LTE = 0, 1, 2
+NET_NAMES = {NET_AUTO: "automatic", NET_2G: "2G only", NET_LTE: "LTE only"}
+PONG_NET_SHIFT = 2
+# One byte after a vehicle's QUALITY in its PING (since 1.8.8): bits 0-1 the network it is set to, bit 2 it is on 2G
+# because LTE failed (automatic's fallback). One byte after STATUS's QUALITY (since 1.8.8): bits 0-1 the network
+# chosen at the relay; bit 2 the vehicle reports its own, then bits 3-4 its network and bit 5 its fallback.
+NET_REPORT = struct.Struct("<B")
+NET_FALLBACK = 0x04
+STATUS_NET_REPORTED = 0x04
+STATUS_NET_SHIFT = 3
+STATUS_NET_FALLBACK = 0x20
 REJECT_UNKNOWN_SESSION = 1
 NO_VEHICLE_STATUS = STATUS_BODY.pack(0, RAT_UNKNOWN, U16_UNKNOWN, U16_UNKNOWN, U16_UNKNOWN, RSSI_UNKNOWN, U16_UNKNOWN)
 
@@ -337,6 +350,11 @@ def fmt_age(seconds: float) -> str:
     return f"{s // 86400} days" if s >= 2 * 86400 else "1 day"
 
 
+def net_mode(bits: int) -> int:
+    """A network (NET_*) from the two bits that carry it; their fourth value, unused, counts as automatic."""
+    return bits & 0x03 if bits & 0x03 in NET_NAMES else NET_AUTO
+
+
 def mono_ms() -> int:
     return int(time.monotonic() * 1000) & 0xFFFFFFFF
 
@@ -355,15 +373,22 @@ class LinkStatus(NamedTuple):
     speaking: bool = False  # the vehicle said its speaker sounds (when last heard)
     voice_failed: bool = False  # the vehicle said it cannot
     sinr_db: int = SINR_UNKNOWN  # the LTE signal's quality (see QUALITY)
+    network: int = NET_AUTO  # the aircraft's network as chosen at the relay (NETWORK)
+    vehicle_network: Optional[int] = None  # the one the aircraft says it is set to; None: it does not say (before 1.8.8)
+    fallback: bool = False  # the aircraft says it is on 2G because LTE failed (automatic's fallback)
 
     @classmethod
     def unpack(cls, body: bytes) -> "LinkStatus":
         sinr = (QUALITY.unpack_from(body, STATUS_BODY.size)[0] if len(body) >= STATUS_BODY.size + QUALITY.size
                 else SINR_UNKNOWN)  # (none from relays before 1.8.7)
+        at = STATUS_BODY.size + QUALITY.size
+        net = body[at] if len(body) >= at + NET_REPORT.size else 0  # (none from relays before 1.8.8: automatic)
+        reported = bool(net & STATUS_NET_REPORTED)
         body = body[: STATUS_BODY.size] + NO_VEHICLE_STATUS[len(body):]  # missing fields: unknown
         flags, rat, rtt, up, down, rssi, idle = STATUS_BODY.unpack(body)
         return cls(bool(flags & STATUS_VEHICLE_ONLINE), rat, rtt, up, down, rssi, idle, bool(flags & STATUS_VOICE_ON),
-                   bool(flags & STATUS_SPEAKING), bool(flags & STATUS_VOICE_FAILED), sinr)
+                   bool(flags & STATUS_SPEAKING), bool(flags & STATUS_VOICE_FAILED), sinr, net_mode(net),
+                   net_mode(net >> STATUS_NET_SHIFT) if reported else None, reported and bool(net & STATUS_NET_FALLBACK))
 
     @property
     def connected(self) -> bool:
@@ -381,8 +406,19 @@ class LinkStatus(NamedTuple):
                     else "on, the aircraft's speaker was sounding when last heard")
         return "on, waiting for the aircraft"
 
+    def network_text(self) -> str:
+        """The aircraft's network, if anything but automatic and as chosen: '' when there is nothing to say."""
+        parts = [f"network {NET_NAMES[self.network]}"] if self.network != NET_AUTO else []
+        if self.vehicle_network is not None and self.vehicle_network != self.network:
+            parts.append(f"the aircraft is still set to {NET_NAMES[self.vehicle_network]}")
+        if self.fallback:
+            parts.append("on 2G because LTE failed")
+        return ", ".join(parts)
+
     def describe(self) -> str:
         voice = f"; locator voice {self.voice_text()}" if self.voice_on else ""
+        if self.network_text():
+            voice = f"; {self.network_text()}" + voice
         if not self.connected:
             return "vehicle: not connected to the server" + voice
         if not self.online:
@@ -692,6 +728,10 @@ TEMP_HOT = 80  # too hot: give the board air, out of the sun
 VOICE = 14
 VOICE_BODY = struct.Struct("<B")  # bit 0: on
 
+# The aircraft's mobile network, chosen by GCS agents (docs/PROTOCOL.md, "Network"); 15-18 are FILE_*
+NETWORK = 19
+NETWORK_BODY = struct.Struct("<B")  # NET_AUTO, NET_2G or NET_LTE
+
 # ---------------------------------------------------------------------------------------------
 # Logs: the aircraft's log files (the ESP32 writes one to its SD card per power-on), listed and
 # downloaded through the relay (docs/PROTOCOL.md, "Logs"). The relay keeps none of it: it passes each
@@ -868,6 +908,7 @@ class Session:
         self.sinr_db = SINR_UNKNOWN
         self.speaking = False  # a vehicle's locator voice sounds (PING_FLAG_SPEAKING)
         self.voice_failed = False  # it was asked to, but its modem does not
+        self.net_report: Optional[int] = None  # a vehicle's network (NET_REPORT); None: it does not say
 
     def describe(self) -> str:
         info = f" ({self.info})" if self.info else ""
@@ -1228,6 +1269,48 @@ class VoiceSwitch:
             slog.warning("cannot save the locator voice switch: %s", exc)
 
 
+class NetworkSwitch:
+    """The aircraft's mobile network as GCS agents choose it (NETWORK): automatic, 2G only or LTE only. Every PONG to
+    the aircraft carries it, until an agent chooses again. Kept in `path`, so that a relay restart does not undo it."""
+
+    WORDS = {NET_AUTO: "auto", NET_2G: "2g", NET_LTE: "lte"}  # in the file
+
+    def __init__(self, path: Optional[str]) -> None:
+        self.path = path
+        self.mode = NET_AUTO
+        self.since = 0  # unix seconds, when it was last chosen
+        if path:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    meta = json.load(f)
+                modes = {word: mode for mode, word in self.WORDS.items()}
+                if meta["mode"] not in modes:
+                    raise ValueError(f"no network {meta['mode']!r}")
+                self.mode, self.since = modes[meta["mode"]], int(meta.get("since", 0))
+                if self.mode != NET_AUTO:
+                    slog.info("the aircraft's network: %s (chosen %s ago)", NET_NAMES[self.mode],
+                              fmt_age(time.time() - self.since))
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                slog.warning("cannot read %s: %s", path, exc)
+
+    def choose(self, mode: int, by: "Session") -> None:
+        if mode == self.mode:
+            return
+        self.mode, self.since = mode, int(time.time())
+        slog.info("%s chose the aircraft's network: %s", by.describe(), NET_NAMES[mode])
+        if not self.path:
+            return
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+            with open(self.path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump({"mode": self.WORDS[mode], "since": self.since}, f)
+            os.replace(self.path + ".tmp", self.path)
+        except OSError as exc:
+            slog.warning("cannot save the network choice: %s", exc)
+
+
 class FileRoutes:
     """The relay's part in logs: passes FILE_REQ and FILE_ACK from GCS agents on to the aircraft, under
     request ids of its own (two agents may use the same id), and the aircraft's FILE_LIST and FILE_DATA
@@ -1327,6 +1410,7 @@ class RelayServer(asyncio.DatagramProtocol):
         self.photos = PhotoStore(self, photo_folder, photo_days)
         self.locator = LocatorStore(self, os.path.join(state_dir, "locator.json") if state_dir else None)
         self.voice = VoiceSwitch(os.path.join(state_dir, "voice.json") if state_dir else None)
+        self.network = NetworkSwitch(os.path.join(state_dir, "network.json") if state_dir else None)
         self.files = FileRoutes(self)
         self.sessions: Dict[int, Session] = {}
         self._pending: Dict[int, Dict[bytes, Session]] = {}  # role -> nonce -> pending session, the oldest first
@@ -1338,6 +1422,7 @@ class RelayServer(asyncio.DatagramProtocol):
         self._last_reject: Dict[int, float] = {}
         self._last_bad_key_log = -1e9
         self._vehicle_online = False
+        self._net_report: Optional[int] = None  # the vehicle's last network report, whichever session it came in
         self._last_summary = time.monotonic()
         self._down = bytearray()  # MAVLink for the aircraft, gathered (DOWN_GATHER)
         self._down_quiet = 0.0  # MAVLink for the aircraft goes at once from this time on (monotonic)
@@ -1399,6 +1484,9 @@ class RelayServer(asyncio.DatagramProtocol):
         elif pkt.type == VOICE:
             if sess.role == ROLE_GCS and len(pkt.body) >= VOICE_BODY.size:
                 self.voice.switch(bool(pkt.body[0] & 0x01), sess)
+        elif pkt.type == NETWORK:
+            if sess.role == ROLE_GCS and len(pkt.body) >= NETWORK_BODY.size and pkt.body[0] in NET_NAMES:
+                self.network.choose(pkt.body[0], sess)
         elif SNAP_REQ <= pkt.type <= SNAP_SYNC:
             self.photos.on_packet(sess, pkt.type, pkt.body, now)
         elif FILE_REQ <= pkt.type <= FILE_ACK:
@@ -1545,9 +1633,11 @@ class RelayServer(asyncio.DatagramProtocol):
             else:
                 self._vehicle_voice(sess, bool(ping_flags & PING_FLAG_SPEAKING),
                                     bool(ping_flags & PING_FLAG_VOICE_FAILED))
+                at = PING_BODY.size + QUALITY.size
+                self._vehicle_network(sess, body[at] if len(body) >= at + NET_REPORT.size else None)
         flags = PONG_GCS_PRESENT if self.gcs_present(time.monotonic()) else 0
-        if sess.role == ROLE_VEHICLE and self.voice.on:
-            flags |= PONG_VOICE
+        if sess.role == ROLE_VEHICLE:
+            flags |= (PONG_VOICE if self.voice.on else 0) | self.network.mode << PONG_NET_SHIFT
         self._send(sess, PONG, body[:4] + bytes([flags]))
 
     @staticmethod
@@ -1557,6 +1647,22 @@ class RelayServer(asyncio.DatagramProtocol):
         if failed and not sess.voice_failed:
             slog.warning("the aircraft cannot play the locator voice: its modem refuses it")
         sess.speaking, sess.voice_failed = speaking, failed
+
+    def _vehicle_network(self, sess: Session, report: Optional[int]) -> None:
+        """A vehicle's network report: logged as it changes, also from one session to the next (each change of network
+        is a new data call, so a new session)."""
+        sess.net_report = report
+        old = self._net_report
+        if report is None or report == old:
+            return
+        self._net_report = report
+        if net_mode(report) != (NET_AUTO if old is None else net_mode(old)):
+            slog.info("the aircraft's network is set to %s", NET_NAMES[net_mode(report)])
+        fallback, was = bool(report & NET_FALLBACK), old is not None and bool(old & NET_FALLBACK)
+        if fallback and not was:
+            slog.warning("the aircraft is on 2G: LTE failed (its automatic fallback)")
+        elif was and not fallback:
+            slog.info("the aircraft's 2G fallback has ended")
 
     def _reject(self, pkt: Packet, key: bytes, addr, now: float) -> None:
         if now - self._last_reject.get(pkt.session, -1e9) < 1.0:
@@ -1611,11 +1717,19 @@ class RelayServer(asyncio.DatagramProtocol):
             slog.info("%s", self.summary(now))
             self.photos.prune(time.time())
 
+    def status_network(self, v: Optional[Session]) -> bytes:
+        """STATUS's last byte: the network chosen here, and the vehicle's own report of it (as last heard)."""
+        net = self.network.mode
+        if v is not None and v.net_report is not None:
+            net |= (STATUS_NET_REPORTED | net_mode(v.net_report) << STATUS_NET_SHIFT
+                    | (STATUS_NET_FALLBACK if v.net_report & NET_FALLBACK else 0))
+        return NET_REPORT.pack(net)
+
     def status_body(self, now: float) -> bytes:
         voice = STATUS_VOICE_ON if self.voice.on else 0
         v = self.vehicle
         if v is None:
-            return bytes([voice]) + NO_VEHICLE_STATUS[1:] + QUALITY.pack(SINR_UNKNOWN)
+            return bytes([voice]) + NO_VEHICLE_STATUS[1:] + QUALITY.pack(SINR_UNKNOWN) + self.status_network(None)
         idle = now - v.last_rx
         up = v.loss.permille()
         return STATUS_BODY.pack(
@@ -1627,7 +1741,7 @@ class RelayServer(asyncio.DatagramProtocol):
             v.peer_loss,
             v.rssi_dbm,
             min(IDLE_CAPPED, int(idle * 1000)),
-        ) + QUALITY.pack(v.sinr_db)  # (agents before 1.8.7 read the first STATUS_BODY.size bytes)
+        ) + QUALITY.pack(v.sinr_db) + self.status_network(v)  # (agents before 1.8.7 read the first 14 bytes)
 
     def summary(self, now: float) -> str:
         v = self.vehicle
@@ -1640,6 +1754,10 @@ class RelayServer(asyncio.DatagramProtocol):
         gcs = self.gcs_sessions()
         watching = sum(s.watching for s in gcs)
         voice = f"; locator voice on for {fmt_age(time.time() - self.voice.since)}" if self.voice.on else ""
+        if self.network.mode != NET_AUTO:
+            voice += f"; network {NET_NAMES[self.network.mode]} for {fmt_age(time.time() - self.network.since)}"
+        if v is not None and v.net_report is not None and v.net_report & NET_FALLBACK:
+            voice += "; the aircraft is on its 2G fallback"
         return f"status: {vs}; {len(gcs)} GCS agent(s) ({watching} only watching), {tcp} TCP client(s)" + voice + (
             f"; {extra}" if extra else ""
         )
@@ -1747,6 +1865,10 @@ class TunnelClient(asyncio.DatagramProtocol):
         # vehicle: the server's last PONG asked for the locator voice; kept without a session, so that an
         # aircraft keeps sounding where it has no coverage
         self.voice_on = False
+        # vehicle: the network the server's last PONG chose (NET_*), kept without a session as the voice; and what to
+        # report of its own in each PING (NET_REPORT), or None for nothing (a vehicle without a network choice)
+        self.network = NET_AUTO
+        self.net_report: Optional[int] = None
         self.last_rx = 0.0
         self.last_ping = 0.0
         self.last_hello = 0.0
@@ -1862,8 +1984,10 @@ class TunnelClient(asyncio.DatagramProtocol):
         loss = self.loss.permille()
         body = PING_BODY.pack(mono_ms(), self.rtt_ms, U16_UNKNOWN if loss is None else loss, radio[0], radio[1],
                               self.ping_flags)
-        if self.role == ROLE_VEHICLE:  # as the board's firmware since 1.8.7
+        if self.role == ROLE_VEHICLE:  # as the board's firmware since 1.8.7, and its network since 1.8.8
             body += QUALITY.pack(radio[2] if len(radio) > 2 else SINR_UNKNOWN)
+            if self.net_report is not None:
+                body += NET_REPORT.pack(self.net_report)
         self._send(PING, body)
 
     def _drop_session(self) -> None:
@@ -1923,6 +2047,7 @@ class TunnelClient(asyncio.DatagramProtocol):
                 self.rtt_ms = min(U16_UNKNOWN - 1, (mono_ms() - t_ms) & 0xFFFFFFFF)
                 self.gcs_present = bool(flags & PONG_GCS_PRESENT)
                 self.voice_on = bool(flags & PONG_VOICE)
+                self.network = net_mode(flags >> PONG_NET_SHIFT)
         elif pkt.type == STATUS and self.on_status is not None:
             self.on_status(LinkStatus.unpack(pkt.body))
         elif pkt.type >= SNAP_REQ and self.on_packet is not None:
@@ -2767,6 +2892,9 @@ class GcsAgent:
         # the locator voice: the switch asked for, sent again until the relay's STATUS shows it
         self.voice_request: Optional[bool] = None
         self.voice_until = 0.0
+        # the aircraft's network: the choice asked for (NET_*), sent again until the relay's STATUS shows it
+        self.network_request: Optional[int] = None
+        self.network_until = 0.0
 
     @property
     def watching(self) -> bool:
@@ -2807,6 +2935,15 @@ class GcsAgent:
                 glog.warning("the relay did not switch the locator voice %s (is it older than 1.5.0?)",
                              "on" if self.voice_request else "off")
                 self.voice_request = None
+        if self.network_request is not None:
+            if status.network == self.network_request:
+                self.network_request = None
+            elif self.status_time < self.network_until:
+                self._send_network()
+            else:
+                glog.warning("the relay did not take the network choice (%s): is it older than 1.8.8?",
+                             NET_NAMES[self.network_request])
+                self.network_request = None
         if self.on_status is not None:
             self.on_status(status)
 
@@ -2824,6 +2961,23 @@ class GcsAgent:
 
     def _send_voice(self) -> None:
         self.client.send_packet(VOICE, VOICE_BODY.pack(1 if self.voice_request else 0))
+
+    NETWORK_TRIES_FOR = 10.0  # seconds
+
+    def set_network(self, mode: int) -> bool:
+        """Chooses the aircraft's mobile network: NET_AUTO, NET_2G or NET_LTE. The relay keeps the choice and passes it
+        on to the aircraft, now or whenever it connects. False without a session with the relay."""
+        if mode not in NET_NAMES:
+            raise ValueError(f"no network {mode!r}")
+        if not self.client.is_connected:
+            return False
+        self.network_request, self.network_until = mode, time.monotonic() + self.NETWORK_TRIES_FOR
+        glog.info("choosing the aircraft's network: %s", NET_NAMES[mode])
+        self._send_network()
+        return True
+
+    def _send_network(self) -> None:
+        self.client.send_packet(NETWORK, NETWORK_BODY.pack(self.network_request))
 
     def _on_packet(self, ptype: int, body: bytes) -> None:
         if ptype == POSITION:

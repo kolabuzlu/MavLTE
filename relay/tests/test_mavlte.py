@@ -471,6 +471,53 @@ class GuiTest(unittest.TestCase):
         report(4012, 88)  # on its own cell
         self.pump(lambda: self.text(module) == "flight controller talking · battery 88%, 4.01 V", what="on the cell")
 
+    def test_network(self):
+        """1.8.8: the network selector beside the bars: the relay's choice; greyed out without the relay. A click
+        reaches the aircraft by way of the relay, and the link line tells what the aircraft makes of it."""
+        app = self.app
+        selector = app.network
+        self.vehicle.net_report = mr.NET_AUTO  # as the firmware since 1.8.8
+
+        async def modem():  # the aircraft, as the firmware: set to the network the relay chooses, and says so
+            while True:
+                await asyncio.sleep(0.05)
+                if self.vehicle.network != self.vehicle.net_report & 0x03:
+                    await asyncio.sleep(0.5)  # it takes a while to switch
+                    self.vehicle.net_report = self.vehicle.network
+                    self.vehicle.ping_now()
+
+        self.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(modem()))
+        self.pump(lambda: app.camera.enabled and selector.enabled, what="aircraft online")
+        self.assertEqual(selector.selected, mr.NET_AUTO)
+        self.assertEqual([label.cget("text") for label in selector.labels], ["Auto", "2G", "LTE"])
+
+        self.assertFalse(selector.pending)
+        selector.select(mr.NET_2G, clicked=True)
+        self.assertEqual((selector.selected, selector.pending), (mr.NET_2G, True))  # amber until the aircraft has it
+        self.assertEqual(selector.labels[mr.NET_2G].cget("bg"), mavlte.AMBER)
+        self.pump(lambda: self.relay.network.mode == mr.NET_2G, what="2G at the relay")
+        self.pump(lambda: self.vehicle.net_report == mr.NET_2G and not selector.pending, what="switched")
+        self.assertEqual((selector.selected, selector.labels[mr.NET_2G].cget("bg")), (mr.NET_2G, mavlte.ACCENT))
+
+        self.relay.network.mode = mr.NET_AUTO  # chosen elsewhere (the web page)
+        self.pump(lambda: selector.selected == mr.NET_AUTO and self.vehicle.net_report == mr.NET_AUTO,
+                  what="automatic, as chosen elsewhere")
+
+        def fall_back():  # LTE fails up there: its 2G fallback
+            self.vehicle.net_report = mr.NET_AUTO | mr.NET_FALLBACK
+            self.vehicle.ping_now()
+
+        self.loop.call_soon_threadsafe(fall_back)
+        self.pump(lambda: self.text(app.craft_values["Link"]).endswith(" · LTE failed"), what="fallback")
+        self.assertEqual(app.craft_values["Link"].cget("fg"), mavlte.AMBER)
+        self.assertEqual((selector.selected, selector.pending), (mr.NET_AUTO, False))
+
+        app._show_network(None, None)  # no relay: greyed out, and a click does nothing
+        self.assertEqual((selector.enabled, selector.selected, selector.pending), (False, -1, False))
+        selector.select(mr.NET_LTE, clicked=True)
+        self.assertEqual(selector.selected, -1)
+        self.assertEqual(self.relay.network.mode, mr.NET_AUTO)
+
     def test_locator_voice(self):
         app = self.app
         row = app.voice

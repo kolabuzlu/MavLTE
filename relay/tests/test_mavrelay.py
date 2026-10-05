@@ -713,7 +713,8 @@ class LiveTest(unittest.IsolatedAsyncioTestCase):
         vehicle.radio = lambda: (-53, 7, -14)
         vehicle.ping_now()
         await self.until(lambda: any(s.online and s.sinr_db == -14 and s.rssi_dbm == -53 for s in gcs.status))
-        self.assertEqual(len(self.relay.status_body(time.monotonic())), mr.STATUS_BODY.size + mr.QUALITY.size)
+        self.assertEqual(len(self.relay.status_body(time.monotonic())),  # (and since 1.8.8 the network)
+                         mr.STATUS_BODY.size + mr.QUALITY.size + mr.NET_REPORT.size)
         self.relay._on_ping(self.relay.vehicle, mr.PING_BODY.pack(0, 50, 0, -60, 7, 0))  # firmware before 1.8.7
         self.assertEqual((self.relay.vehicle.sinr_db, self.relay.vehicle.rssi_dbm), (mr.SINR_UNKNOWN, -60))
         self.assertEqual(self.relay.gcs_sessions()[0].sinr_db, mr.SINR_UNKNOWN)

@@ -210,6 +210,36 @@ class PlaneTest(unittest.TestCase):
         wait_for(self, lambda: not g.fc_clients, "flight controller link closed")
         self.assertIsNone(p.modem)
 
+    def test_network_chosen_at_the_relay(self):
+        """1.8.8: the network chosen in MavLTE, kept by the relay and passed on in its PONGs: 2G is there wherever LTE
+        is, LTE only finds nothing where there is only 2G, and the module reports what it is set to."""
+        p, g = self.plane, self.ground
+
+        def on(report, rat):
+            v = g.relay.vehicle
+            return v is not None and v.net_report == report and v.rat == rat
+
+        p.call(p.set_lte, True)
+        p.call(p.set_battery, True)
+        wait_for(self, lambda: on(mr.NET_AUTO, 7), "automatic, on LTE")
+        g.relay.network.mode = mr.NET_2G
+        wait_for(self, lambda: on(mr.NET_2G, 3), "2G only, on EDGE")
+        g.relay.network.mode = mr.NET_LTE
+        wait_for(self, lambda: on(mr.NET_LTE, 7), "LTE only, on LTE")
+        p.call(p.set_network, plane_sim.NET_2G)  # only 2G here: nothing at all on LTE only
+        wait_for(self, lambda: p.serving() == plane_sim.NO_CONNECTION, "no network")
+        time.sleep(1.0)
+        heard = g.relay.vehicle.last_rx
+        g.relay.network.mode = mr.NET_AUTO  # which the module cannot hear now: it stays on LTE only
+        time.sleep(0.6)
+        self.assertEqual((g.relay.vehicle.last_rx, p.choice), (heard, mr.NET_LTE))
+        p.call(p.set_network, plane_sim.NET_LTE)  # LTE again: the relay's choice comes through
+        wait_for(self, lambda: p.choice == mr.NET_AUTO and on(mr.NET_AUTO, 7), "automatic again")
+        p.call(p.set_lte, False)  # chosen while the module is off: it takes it at its first PONG
+        g.relay.network.mode = mr.NET_2G
+        p.call(p.set_lte, True)
+        wait_for(self, lambda: self.session() and on(mr.NET_2G, 3), "2G once back")
+
     def test_no_signal_no_registration(self):
         p = self.plane
         p.call(p.set_network, plane_sim.NO_CONNECTION)

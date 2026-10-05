@@ -168,6 +168,9 @@ main {
 .sizes button[aria-checked="true"] { background: var(--accent); color: var(--on-accent); }
 .sizes button:disabled { color: var(--dim); cursor: default; }
 .sizes button[aria-checked="true"]:disabled { background: var(--border); color: var(--muted); }
+.network { max-width: 15em; } /* the aircraft's network, beside its Link */
+.network button { padding: 6px 12px; }
+.network.pending button[aria-checked="true"] { background: var(--amber); } /* asked for, not taken yet */
 .status { margin: 10px 0 0; font-size: 14px; }
 .progress { height: 4px; margin-top: 6px; overflow: hidden; border-radius: 2px; background: var(--field); }
 #progress-bar { width: 0; height: 100%; background: var(--accent); transition: width 0.3s; }

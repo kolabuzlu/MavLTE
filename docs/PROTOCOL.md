@@ -44,10 +44,10 @@ burst was lost.
 | 1    | HELLO   | C → S | 0 / 0 | nonce (8 bytes), then optional UTF-8 info text (≤ 64 bytes) |
 | 2    | WELCOME | S → C | new session / 0 | the 8-byte nonce from the HELLO, then (since 1.8.0) the server's clock, `unix_ms u64` |
 | 3    | DATA    | C ↔ S | session / seq | MAVLink bytes (whole frames), ≤ 1172 bytes |
-| 4    | PING    | C → S | session / seq | `t_ms u32, rtt_ms u16, rx_loss_permille u16, rssi_dbm i16, rat u8, flags u8`, then (vehicle, since 1.8.7) `sinr_db i8` (GCS: bit 0 watching; vehicle: bit 1 sounding, bit 2 cannot sound) |
-| 5    | PONG    | S → C | session / seq | `t_ms u32` (echo), `flags u8` (bit 0: a GCS is connected; to the vehicle, bit 1: sound the speaker) |
+| 4    | PING    | C → S | session / seq | `t_ms u32, rtt_ms u16, rx_loss_permille u16, rssi_dbm i16, rat u8, flags u8`, then (vehicle, since 1.8.7) `sinr_db i8`, then (vehicle, since 1.8.8) `network u8` (GCS: bit 0 watching; vehicle: bit 1 sounding, bit 2 cannot sound; see [Network](#network)) |
+| 5    | PONG    | S → C | session / seq | `t_ms u32` (echo), `flags u8` (bit 0: a GCS is connected; to the vehicle, bit 1: sound the speaker, bits 2-3: the [network](#network)) |
 | 6    | REJECT  | S → C | the rejected session / 0 | `reason u8` (1 = unknown or expired session) |
-| 7    | STATUS  | S → GCS | session / seq | `flags u8, rat u8, rtt_ms u16, up_loss_permille u16, down_loss_permille u16, rssi_dbm i16, idle_ms u16`, then (since 1.8.7) `sinr_db i8` (flags: bit 0 vehicle online, bits 1-3 the [locator voice](#locator-voice)) |
+| 7    | STATUS  | S → GCS | session / seq | `flags u8, rat u8, rtt_ms u16, up_loss_permille u16, down_loss_permille u16, rssi_dbm i16, idle_ms u16`, then (since 1.8.7) `sinr_db i8`, then (since 1.8.8) `network u8` (flags: bit 0 vehicle online, bits 1-3 the [locator voice](#locator-voice); see [Network](#network)) |
 | 8    | SNAP_REQ  | GCS → S → V | session / seq | `photo_id u32, size u8` (see [Snapshots](#snapshots)) |
 | 9    | SNAP_INFO | V → S → GCS | session / seq | `photo_id u32, bytes u32, width u16, height u16, lat i32, lon i32, alt_mm i32, heading_cdeg u16, status u8, time u32` |
 | 10   | SNAP_DATA | V → S → GCS | session / seq | `photo_id u32, chunk u16`, then the chunk (1024 bytes, the last one shorter) |
@@ -58,6 +58,7 @@ burst was lost.
 | 15   | FILE_REQ  | GCS → S → V | session / seq | `req_id u16, op u8, offset u32, name` (12 bytes) (see [Logs](#logs)) |
 | 16   | FILE_LIST | V → S → GCS | session / seq | `req_id u16, status u8, files u16, first u16, count u8`, then `count` × (`name` (12 bytes), `bytes u32, start u32, end u32`) |
 | 17   | FILE_DATA | V → S → GCS | session / seq | `req_id u16, status u8, offset u32, size u32`, then up to 1024 bytes of the file |
+| 19   | NETWORK   | GCS → S | session / seq | `network u8` (0 automatic, 1 2G only, 2 LTE only) (see [Network](#network)) |
 | 18   | FILE_ACK  | GCS → S → V | session / seq | `req_id u16, next u32` |
 
 Unknown values are `0xFFFF` for u16 fields, `0x7FFF` for `rssi_dbm`, `0xFF` for `rat` and `-128` for `sinr_db`.
@@ -223,6 +224,32 @@ says a phrase with its text-to-speech).
    the voice is on; bit 2, the vehicle sounds; bit 3, it cannot.
 4. A GCS agent sends VOICE again, once a second, until STATUS shows the switch it asked for, for at
    most 10 s (a server older than 1.5.0 ignores VOICE and never shows it).
+
+## Network
+
+The mobile network the vehicle's modem uses (since 1.8.8): **automatic** (0: LTE, and 2G while LTE
+fails), **2G only** (1) or **LTE only** (2). In the air an LTE signal can stay strong while its
+quality (`sinr_db`) falls with the many cells heard at once, and the link with it; so automatic
+moves to 2G when LTE fails, and back once it may work again (the ESP32 firmware: 20 s with nothing
+from the server at -9 dB or lower; back after 30 s, 60 s, then every 2 minutes, or at once 50 m
+below where LTE last worked well).
+
+1. A GCS agent chooses it with NETWORK. The server keeps the choice, on disk so that it survives a
+   restart, until an agent chooses again: the vehicle does not have to be online.
+2. The server puts it in bits 2-3 of every PONG to the vehicle. The vehicle keeps the last choice
+   it was told while it has no session (not across a restart: one that finds no network where it
+   was told to stay, and so cannot hear the server, starts on automatic again), and one made while
+   it was away takes effect at its first PONG.
+3. The vehicle says in each PING what it makes of it, in a byte after `sinr_db`: bits 0-1 the
+   network it is set to, bit 2 it is on 2G because LTE failed (automatic's fallback). The server
+   passes them on in STATUS's last byte, as they were in the vehicle's last PING, together with its
+   own choice: bits 0-1 the choice, bit 2 the vehicle reports one, then bits 3-4 its network and
+   bit 5 its fallback. Without bit 2 (firmware before 1.8.8, which ignores the choice) bits 3-5
+   mean nothing.
+4. A GCS agent sends NETWORK again, once a second, until STATUS shows the choice it made, for at
+   most 10 s (a server older than 1.8.8 ignores NETWORK and never shows it).
+
+In each place the fourth value of the two bits, unused, counts as automatic.
 
 ## Logs
 

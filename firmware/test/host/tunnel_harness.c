@@ -222,6 +222,7 @@ int main(int argc, char **argv)
     uint32_t duration = (uint32_t)atoi(argv[4]) * 1000;
     uint8_t rx[2048];
     bool voice = false;
+    int network = TUN_NET_UNKNOWN;
     while ((uint32_t)(now_ms() - start) < duration) {
         fd_set fds;
         FD_ZERO(&fds);
@@ -243,6 +244,11 @@ int main(int argc, char **argv)
             voice = tun.voice_on;
             fprintf(stderr, "harness: voice %s\n", voice ? "on" : "off");
             tun_set_ping_flags(&tun, voice ? TUN_PING_SPEAKING : 0);
+        }
+        if (tun.network != network) { /* the network, as the relay chooses it: set at once, as the modem would be */
+            network = tun.network;
+            fprintf(stderr, "harness: network %d\n", network);
+            tun_set_net_report(&tun, (uint8_t)network);
         }
         if (tun_connected(&tun) && (uint32_t)(now - last_frame) >= 5) {
             uint8_t frame[32];

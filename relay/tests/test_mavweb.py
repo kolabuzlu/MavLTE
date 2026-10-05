@@ -1,4 +1,4 @@
-"""The web page (mavweb.py): signing in, the Aircraft card as the phone gets it, the locator voice and a photo,
+"""The web page (mavweb.py): signing in, the Aircraft card as the phone gets it, the network, the locator voice and a photo,
 against a real relay and a fake aircraft. The page's server runs in this process, on a free port.
 Run from the relay directory:  python -m unittest -v"""
 
@@ -68,9 +68,10 @@ class WebTest(unittest.TestCase):
                                                   where=lambda: (411234567, 289876543, 120_000, 4500),
                                                   cap=lambda: 64 * 1024)
             self.vehicle.on_packet, self.vehicle.on_session = outbox.on_packet, outbox.on_session
+            self.vehicle.net_report = mr.NET_AUTO  # as the firmware since 1.8.8
             self.vehicle_task = asyncio.ensure_future(self.vehicle.run())
 
-            async def ticks():  # and the aircraft's speaker, as the firmware reports it
+            async def ticks():  # and the aircraft's speaker and network, as the firmware reports them
                 while True:
                     await asyncio.sleep(0.05)
                     now = time.monotonic()
@@ -80,6 +81,9 @@ class WebTest(unittest.TestCase):
                     flags = mr.PING_FLAG_SPEAKING if self.vehicle.voice_on and self.modem["voice"] == "speaks" else 0
                     if flags != self.vehicle.ping_flags:
                         self.vehicle.ping_flags = flags
+                        self.vehicle.ping_now()
+                    if self.vehicle.network != self.vehicle.net_report:
+                        self.vehicle.net_report = self.vehicle.network
                         self.vehicle.ping_now()
 
             asyncio.ensure_future(ticks())
@@ -191,7 +195,9 @@ class WebTest(unittest.TestCase):
         for path in ("/mavweb.py", "/../mavrelay.ini", "/web/app.js", "/photo/../mavrelay.ini", "/index.html"):
             self.assertEqual(self.request("GET", path)[0], 404, path)
         self.assertEqual(self.request("POST", "/api/voice", {"on": True})[0], 401)
+        self.assertEqual(self.request("POST", "/api/network", {"mode": mr.NET_2G})[0], 401)
         self.assertFalse(self.relay.voice.on)
+        self.assertEqual(self.relay.network.mode, mr.NET_AUTO)
 
     def test_signing_in(self):
         with self.assertLogs("mavrelay.web", "WARNING"):
@@ -268,6 +274,9 @@ class WebTest(unittest.TestCase):
             self.assertEqual(self.request("POST", "/api/voice", body, cookie)[0], 400, body)
         for size in (3, -1, True, "1", None):
             self.assertEqual(self.request("POST", "/api/snapshot", {"size": size}, cookie)[0], 400, size)
+        for body in ({"mode": 3}, {"mode": -1}, {"mode": True}, {"mode": "1"}, {"mode": None}, {}):
+            self.assertEqual(self.request("POST", "/api/network", body, cookie)[0], 400, body)
+        self.assertEqual(self.relay.network.mode, mr.NET_AUTO)
         self.assertEqual(self.request("POST", "/api/voice", b"x" * 5000, cookie)[0], 400)
         self.wait(cookie, lambda s: s["voice"]["can"], "connected to the relay")
         status, _, body = self.request("POST", "/api/voice", {"on": True}, cookie, {"Origin": f"https://{host}"})
@@ -321,6 +330,21 @@ class WebTest(unittest.TestCase):
         self.assertEqual([(lat, lon) for lat, lon, _ in fixes], [(41.1234567, 28.9876543), (41.1244567, 28.9876543)])
         self.assertLess(fixes[0][2], fixes[1][2])
         self.assertIsNone(self.state(cookie)["fix"]["heading"])
+
+    def test_network(self):
+        """1.8.8: the network chosen on the page reaches the aircraft by way of the relay, as MavLTE's selector."""
+        cookie = self.signed_in()
+        s = self.wait(cookie, lambda s: s["network"]["can"], "the selector in use")
+        self.assertEqual(s["network"], {"choice": mr.NET_AUTO, "can": True, "pending": False})
+        with self.assertLogs("mavrelay.web", "INFO") as logs:
+            self.assertEqual(self.request("POST", "/api/network", {"mode": mr.NET_2G}, cookie)[0], 200)
+        self.assertIn("the aircraft's network chosen on the page: 2G only", logs.output[-1])
+        s = self.wait(cookie, lambda s: s["network"]["choice"] == mr.NET_2G, "2G chosen")
+        self.wait(cookie, lambda s: s["network"] == {"choice": mr.NET_2G, "can": True, "pending": False}, "taken")
+        self.assertEqual((self.relay.network.mode, self.vehicle.network), (mr.NET_2G, mr.NET_2G))
+        self.assertEqual(self.request("POST", "/api/network", {"mode": mr.NET_AUTO}, cookie)[0], 200)
+        self.wait(cookie, lambda s: s["network"]["choice"] == mr.NET_AUTO and self.vehicle.network == mr.NET_AUTO,
+                  "automatic again")
 
     def test_locator_voice(self):
         cookie = self.signed_in()

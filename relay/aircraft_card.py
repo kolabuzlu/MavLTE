@@ -94,8 +94,15 @@ def bars(status: Optional[mr.LinkStatus]) -> Optional[int]:
     return 4 if worst < 10 else 3 if worst < 50 else 2 if worst < 150 else 1
 
 
+def network_note(status: Optional[mr.LinkStatus]) -> str:
+    """The end of the link line while the aircraft is on 2G because LTE failed (automatic's fallback, 1.8.8): short, for
+    the line to fit MavLTE's window (its radio, EDGE or GSM, says 2G already)."""
+    return "LTE failed" if is_online(status) and status.fallback else ""
+
+
 def link(status: Optional[mr.LinkStatus]) -> str:
-    """The aircraft's radio (on LTE with its quality) and its round trip to the relay, on one line."""
+    """The aircraft's radio (on LTE with its quality) and its round trip to the relay, on one line; and while it is on
+    2G because LTE failed, that."""
     if not is_online(status):
         return "-"
     radio = [mr.RAT_NAMES.get(status.rat, "")] if status.rat != mr.RAT_UNKNOWN else []
@@ -106,15 +113,46 @@ def link(status: Optional[mr.LinkStatus]) -> str:
         parts.append(f"quality {status.sinr_db} dB")
     if status.rtt_ms != mr.U16_UNKNOWN:
         parts.append(f"round trip {status.rtt_ms} ms")
+    if network_note(status):
+        parts.append(network_note(status))
     return " · ".join(parts) or "-"
 
 
 def link_color(status: Optional[mr.LinkStatus]) -> str:
-    """The link line's colour: amber where drops are likely (one bar of quality), red where the link fails (none)."""
-    if not is_online(status) or status.sinr_db == mr.SINR_UNKNOWN:
+    """The link line's colour: amber where drops are likely (one bar of quality), red where the link fails (none);
+    amber too on 2G because LTE failed."""
+    if not is_online(status):
+        return TEXT
+    if status.fallback:
+        return AMBER
+    if status.sinr_db == mr.SINR_UNKNOWN:
         return TEXT
     quality = quality_bars(status.sinr_db)
     return RED if quality == 0 else AMBER if quality == 1 else TEXT
+
+
+# The network selector's choices (1.8.8), as mr.NET_AUTO, mr.NET_2G and mr.NET_LTE: automatic is LTE, and 2G while LTE
+# fails (the module goes back to LTE once the aircraft is lower down, or after a while); 2G and LTE are that one only.
+NETWORK_NAMES = ("Auto", "2G", "LTE")
+
+
+class NetworkShown(NamedTuple):
+    choice: Optional[int]  # an index into NETWORK_NAMES; None: none
+    usable: bool  # it can be clicked
+    pending: bool  # the aircraft has not taken it (yet): away, switching, or firmware before 1.8.8 (shown in amber)
+
+
+def network(agent: Optional[mr.GcsAgent], status: Optional[mr.LinkStatus]) -> Optional[NetworkShown]:
+    """The network selector. None: no news, keep what is shown. The relay keeps the choice, whoever made it, also while
+    the aircraft is away; the aircraft takes it when it next hears the relay (firmware before 1.8.8: never)."""
+    if agent is None or not agent.client.session:
+        return NetworkShown(None, False, False)
+    if agent.network_request is not None:  # sent, and not yet in the relay's STATUS
+        return NetworkShown(agent.network_request, True, True)
+    if status is None:
+        return None
+    runs = mr.NET_AUTO if status.vehicle_network is None else status.vehicle_network  # (one that does not say: auto)
+    return NetworkShown(status.network, True, status.network != runs)
 
 
 def loss(status: Optional[mr.LinkStatus]) -> str:

@@ -25,6 +25,7 @@
 #include "alarm.h"
 #include "locator.h"
 #include "logrow.h"
+#include "netmode.h"
 #include "sdlog.h"
 #include "status.h"
 
@@ -32,6 +33,7 @@
 #define BOOT_BAUD 115200 /* the A7670E's rate after power-up; AT+IPR changes are not saved */
 #define PPP_UP BIT0
 #define PPP_DOWN BIT1
+#define PPP_ENDED BIT2 /* a PPP status event since hang_up() ended PPP: it is over (lwIP's link callback) */
 #define RELAY_SILENCE_LIMIT_MS (3 * 60 * 1000)
 #define RELAY_SILENCE_EARLY_MS (60 * 1000) /* with the network there: one redial this soon */
 #define NVS_NAMESPACE "modem"
@@ -40,14 +42,7 @@
 #define NVS_NO_CMUX "no_cmux"     /* 1: the modem did not take CMUX: plain data calls, no GNSS during them */
 #define RADIO_EVERY_MS 5000       /* signal, network and cell, read again during a CMUX data call */
 #define RADIO_FRESH_MS 30000      /* older readings are left out of the flight log */
-
-#if CONFIG_BRIDGE_NETWORK_LTE_ONLY
-#define NETWORK_MODE 38 /* AT+CNMP: LTE only */
-#define SET_NETWORK_MODE "AT+CNMP=38\r"
-#else
-#define NETWORK_MODE 2 /* AT+CNMP: automatic */
-#define SET_NETWORK_MODE "AT+CNMP=2\r"
-#endif
+#define NET_REFUSED_MS 10000      /* the modem refused a network: not again before this */
 
 static const char *TAG = "modem";
 
@@ -73,10 +68,18 @@ static int16_t radio_dbm = BRIDGE_RSSI_UNKNOWN;
 static char radio_operator[24];
 static cell_info_t radio_cell;
 static uint32_t radio_ms;
+static int radio_act = -1; /* the access technology then (3GPP AcT), -1 none (modem task only) */
+/* the network (netmode.h): chosen at the relay, and automatic's fallback to 2G (modem task only) */
+static netmode_t netmode;
+static int net_set = -1;          /* the modem's AT+CNMP as last read or set, -1 not known */
+static bool net_refused;          /* ... it refused the last one, at net_refused_at */
+static uint32_t net_refused_at;
+static uint32_t relay_count, relay_heard_ms; /* bridge_relay_packets() as last seen, and when it last changed */
 #if CONFIG_BRIDGE_LOCATOR_VOICE
 static bool voice_ready; /* the modem's audio is set up for the locator voice since it last (re)started */
 #endif
 static void voice_prepare(void);
+static bool apply_network(void);
 
 static uint32_t now_ms(void)
 {
@@ -97,9 +100,12 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
 }
 
 /* PPP errors that end the link without IP_EVENT_PPP_LOST_IP, e.g. the modem stops answering
- * LCP echo requests. NETIF_PPP_ERRORUSER is our own hang-up. */
+ * LCP echo requests. NETIF_PPP_ERRORUSER is our own hang-up. Each of these comes as PPP is over. */
 static void on_ppp_status(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
+    if (id > NETIF_PPP_ERRORNONE && id < NETIF_PP_PHASE_OFFSET) {
+        xEventGroupSetBits(events, PPP_ENDED);
+    }
     if (id > NETIF_PPP_ERRORNONE && id < NETIF_PP_PHASE_OFFSET && id != NETIF_PPP_ERRORUSER) {
         ESP_LOGW(TAG, "PPP error %" PRId32, id);
         xEventGroupClearBits(events, PPP_UP);
@@ -192,7 +198,8 @@ static bool create_dce(void)
  * modem may still run at the faster rate, so try both. */
 static bool sync_modem(uint32_t timeout_ms)
 {
-    const int rates[2] = {BOOT_BAUD, CONFIG_BRIDGE_MODEM_BAUD};
+    /* the rate it was last at first: after a hang-up the fast one (the slow one first cost a second each time) */
+    const int rates[2] = {baud, baud == BOOT_BAUD ? CONFIG_BRIDGE_MODEM_BAUD : BOOT_BAUD};
     uint32_t start = now_ms();
     for (int i = 0; (uint32_t)(now_ms() - start) < timeout_ms; i++) {
         int rate = rates[i % 2];
@@ -412,12 +419,9 @@ static bool configure(void)
     if (!check_sim()) {
         return false;
     }
-    if (esp_modem_at(dce, "AT+CNMP?", out, 1000) == ESP_OK) {
-        const char *p = strstr(out, "+CNMP:");
-        if (!p || atoi(p + 6) != NETWORK_MODE) {
-            command(SET_NETWORK_MODE, 10000); /* the modem saves it, which can take up to 10 s */
-        }
-    }
+    net_set = -1; /* read again: the modem may have restarted (it keeps its last setting), or been set by hand */
+    net_refused = false;
+    apply_network();
     static bool identified;
     if (!identified && command("ATI\r", 2000) == ESP_OK) { /* the GNSS answers differ between them */
         identified = true;
@@ -530,6 +534,7 @@ static int16_t read_radio(char *name, int *act)
     snprintf(radio_operator, sizeof(radio_operator), "%s", name);
     radio_cell = cell;
     radio_ms = now_ms();
+    radio_act = *act;
     xSemaphoreGive(radio_lock);
     return dbm;
 }
@@ -747,6 +752,93 @@ static void pause_ms(uint32_t ms)
     }
 }
 
+/* ---- the network: as chosen at the relay, and automatic's fallback to 2G while LTE fails (netmode.h). The relay keeps
+ * the choice, the module only until it restarts: one that finds no 2G or no LTE where it was chosen, and so cannot hear
+ * the relay any more, starts on automatic again (as the locator voice: off until the relay says). */
+
+/* What netmode goes by, once a second or so (`online`: in the data call, up for online_ms): the relay's choice,
+ * whether the relay answers, the modem's network and LTE's quality as last read, and the aircraft's height. */
+static void network_update(bool online, uint32_t online_ms)
+{
+    uint32_t now = now_ms();
+    uint32_t count = bridge_relay_packets();
+    if (count != relay_count) {
+        relay_count = count;
+        relay_heard_ms = now;
+    }
+    int wanted = bridge_network_wanted();
+    if (wanted >= 0 && wanted != netmode.choice) {
+        if (!netmode_choose(&netmode, (uint8_t)wanted)) { /* the modem stays as it is: say so here */
+            ESP_LOGI(TAG, "network: %s", netmode.why);
+            sdlog_event("network: %s", netmode.why);
+        }
+        bridge_set_net_report(netmode_report(&netmode));
+    }
+    net_in_t in = {.now_ms = now, .online = online, .online_ms = online_ms, .silence_ms = now - relay_heard_ms,
+                   .rat = radio_act >= 0 && radio_act < 0xFF ? (uint8_t)radio_act : 0xFF,
+                   .sinr_db = NET_SINR_UNKNOWN};
+    if (radio_ms && (uint32_t)(now - radio_ms) < 3 * RADIO_EVERY_MS && radio_cell.sinr_db != LOG_I16_UNKNOWN) {
+        in.sinr_db = (int8_t)(radio_cell.sinr_db < -127 ? -127 : radio_cell.sinr_db > 127 ? 127 : radio_cell.sinr_db);
+    }
+    in.alt_known = bridge_fc_altitude(&in.alt_m);
+    if (netmode_tick(&netmode, &in)) {
+        bridge_set_net_report(netmode_report(&netmode));
+    }
+}
+
+/* The modem is to be set to another network (and has not just refused it). */
+static bool network_due(void)
+{
+    return netmode_setting(&netmode) != net_set &&
+           (!net_refused || (uint32_t)(now_ms() - net_refused_at) >= NET_REFUSED_MS);
+}
+
+/* The modem's AT+CNMP, or -1 if it does not say. */
+static int read_network(void)
+{
+    char field[16];
+    return command("AT+CNMP?\r", 2000) == ESP_OK && answer_field("+CNMP:", field, sizeof(field))[0] ? atoi(field) : -1;
+}
+
+/* Sets the modem to the network netmode needs (AT+CNMP, which the modem saves), in command mode: a data call would end
+ * as the modem leaves the network, and esp_modem take 6 s to hang it up (bench, 1.8.8). The modem then registers
+ * again: LTE in about 3 s, 2G in about 8. True if it changed. */
+static bool apply_network(void)
+{
+    if (net_set < 0) {
+        net_set = read_network();
+    }
+    if (!network_due()) {
+        return false;
+    }
+    int want = netmode_setting(&netmode);
+    char at[16], said[64];
+    snprintf(at, sizeof(at), "AT+CNMP=%d\r", want);
+    command(at, 10000); /* up to 10 s */
+    snprintf(said, sizeof(said), "%s", answer);
+    for (int i = 0; (net_set = read_network()) < 0 && i < 3; i++) { /* still busy with the change: ask again */
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (net_set != want) {
+        net_refused = true;
+        net_refused_at = now_ms();
+        for (char *p = said; *p; p++) {
+            *p = *p == '\r' || *p == '\n' ? ' ' : *p;
+        }
+        ESP_LOGW(TAG, "the modem did not take AT+CNMP=%d (%s); it stays on its network for now, and is asked again "
+                      "before the next data call", want, said);
+        return false;
+    }
+    net_refused = false;
+    if (netmode.fallback) {
+        ESP_LOGW(TAG, "network: %s", netmode.why);
+    } else {
+        ESP_LOGI(TAG, "network: %s", netmode.why);
+    }
+    sdlog_event("network: %s", netmode.why);
+    return true;
+}
+
 static bool wait_registration(uint32_t timeout_ms)
 {
     uint32_t start = now_ms(), last_log = start;
@@ -769,6 +861,10 @@ static bool wait_registration(uint32_t timeout_ms)
             denied_logged = true;
             ESP_LOGE(TAG, "the network refused registration: is the SIM active and does it have a data plan?");
             sdlog_event("network refused registration");
+        }
+        network_update(false, 0);
+        if (network_due() && apply_network()) {
+            start = now_ms(); /* registering again, on the other network */
         }
         if ((uint32_t)(now_ms() - last_log) >= 10000) {
             last_log = now_ms();
@@ -876,6 +972,14 @@ static bool dial(void)
  * esp_modem_sync() finds out whether it still answers. */
 static void hang_up(void)
 {
+    /* PPP first, waiting until it is over: esp_modem waits for that too, but a PPP event left over from before ends its
+     * wait at once, and it then closes the multiplexer while PPP still terminates, so that the next data call cannot
+     * start PPP (bench, 1.8.8: 35 s lost). Over at once if it already was (or never ran): lwIP says so straight away. */
+    xEventGroupClearBits(events, PPP_ENDED);
+    esp_netif_action_stop(ppp_netif, NULL, 0, NULL);
+    if (!(xEventGroupWaitBits(events, PPP_ENDED, pdFALSE, pdFALSE, pdMS_TO_TICKS(8000)) & PPP_ENDED)) {
+        ESP_LOGW(TAG, "PPP did not end within 8 s");
+    }
     esp_err_t err = esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
     if (err != ESP_OK && in_cmux) {
         /* The A7670 answers the multiplexer's close-down with a frame esp_modem does not accept: it
@@ -931,7 +1035,7 @@ static void hard_reset(void)
     }
 }
 
-typedef enum { LINK_PPP_LOST, LINK_RELAY_SILENT, LINK_RELAY_QUIET } link_end_t;
+typedef enum { LINK_PPP_LOST, LINK_RELAY_SILENT, LINK_RELAY_QUIET, LINK_NETWORK } link_end_t;
 
 #if CONFIG_BRIDGE_LOCATOR
 /* 1e-7 degrees as text, without floating point in printf */
@@ -1020,7 +1124,7 @@ static bool early_redial_done; /* in this spell of silence from the relay */
 /* Watches the connection until it ends; during a CMUX call, reads the GNSS and the signal too. */
 static link_end_t stay_online(void)
 {
-    uint32_t last_radio = now_ms(), packets = bridge_relay_packets();
+    uint32_t last_radio = now_ms(), packets = bridge_relay_packets(), up_at = now_ms();
 #if CONFIG_BRIDGE_LOCATOR
     uint32_t last_gnss = now_ms() - 60000;
 #endif
@@ -1051,6 +1155,14 @@ static link_end_t stay_online(void)
             return LINK_RELAY_QUIET;
         }
         voice_tick(in_cmux);
+        /* the network: as chosen at the relay, and automatic's fallback to 2G while LTE fails. The data call ends
+         * first, cleanly, and configure() sets the modem in command mode before the next; one the modem refused waits
+         * for the next data call. */
+        network_update(true, now_ms() - up_at);
+        if (netmode_setting(&netmode) != net_set && !net_refused) {
+            ESP_LOGI(TAG, "network: changing it, so ending the data call");
+            return LINK_NETWORK;
+        }
         if (!in_cmux) {
             continue;
         }
@@ -1128,7 +1240,7 @@ static void modem_task(void *arg)
         /* whether the relay answered during this connection: count its packets, as the silence clock
          * restarts when mobile data comes up */
         bool heard = bridge_relay_packets() != relay_packets;
-        if (heard || end == LINK_PPP_LOST) {
+        if (heard || end == LINK_PPP_LOST || end == LINK_NETWORK) {
             silent = 0;
         } else if (end == LINK_RELAY_SILENT && ++silent >= 2) { /* redialling did not help: reset the modem */
             silent = 0;
@@ -1168,6 +1280,9 @@ void modem_start(void)
     if (no_cmux) {
         ESP_LOGI(TAG, "an earlier failure had turned CMUX off for good: trying it again");
     }
+    netmode_init(&netmode, NET_AUTO); /* until the relay says */
+    snprintf(netmode.why, sizeof(netmode.why), "automatic, until the relay says");
+    bridge_set_net_report(netmode_report(&netmode));
     if (slow) {
         fast_baud_failed = true;
         ESP_LOGW(TAG, "modem UART stays at %d baud: it did not work at %d before, with DIP switch \"4G\" on (erase the "

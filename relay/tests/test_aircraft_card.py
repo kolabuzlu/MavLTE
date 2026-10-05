@@ -16,16 +16,28 @@ import mavrelay as mr  # noqa: E402
 ONLINE = mr.STATUS_VEHICLE_ONLINE
 
 
-def status(flags=ONLINE, rat=7, rtt=85, up=3, down=0, rssi=-71, idle=200, sinr=None):
-    """A STATUS as relays send it: with the LTE signal's quality since 1.8.7 (sinr), without it before."""
+def status(flags=ONLINE, rat=7, rtt=85, up=3, down=0, rssi=-71, idle=200, sinr=None, net=None):
+    """A STATUS as relays send it: with the LTE signal's quality since 1.8.7 (sinr), and the network since 1.8.8
+    (net, the byte), without them before."""
     body = mr.STATUS_BODY.pack(flags, rat, rtt, up, down, rssi, idle)
-    return mr.LinkStatus.unpack(body if sinr is None else body + mr.QUALITY.pack(sinr))
+    if sinr is not None or net is not None:
+        body += mr.QUALITY.pack(mr.SINR_UNKNOWN if sinr is None else sinr)
+    return mr.LinkStatus.unpack(body if net is None else body + mr.NET_REPORT.pack(net))
 
 
-def agent(session=1, watching=True, silence=None, position=None, last_fix=None, voice_request=None, photos=None):
+def net(chosen, vehicle=None, fallback=False):
+    """STATUS's network byte: the network chosen at the relay, and the one the vehicle reports (None: none)."""
+    if vehicle is None:
+        return chosen
+    return (chosen | mr.STATUS_NET_REPORTED | vehicle << mr.STATUS_NET_SHIFT
+            | (mr.STATUS_NET_FALLBACK if fallback else 0))
+
+
+def agent(session=1, watching=True, silence=None, position=None, last_fix=None, voice_request=None, photos=None,
+          network_request=None):
     return SimpleNamespace(client=SimpleNamespace(session=session, hellos=0, rtt_ms=42), watching=watching,
                            vehicle_silence=lambda: silence, position=position, last_fix=last_fix,
-                           voice_request=voice_request, photos=photos)
+                           voice_request=voice_request, photos=photos, network_request=network_request)
 
 
 def report(**fields):
@@ -87,6 +99,47 @@ class CardTest(unittest.TestCase):
                          ("EDGE -60 dBm · round trip 85 ms", 4, card.TEXT))
         for offline in (None, status(0, sinr=-14)):
             self.assertEqual((card.link_color(offline), card.bars(offline)), (card.TEXT, None))
+
+    def test_network(self):
+        """1.8.8: the network chosen for the aircraft (automatic, 2G, LTE): the selector, in amber while the aircraft
+        has not taken the choice; and on the link line, the aircraft on 2G because LTE failed."""
+        self.assertEqual(card.NETWORK_NAMES, ("Auto", "2G", "LTE"))
+        self.assertEqual([mr.NET_AUTO, mr.NET_2G, mr.NET_LTE], [0, 1, 2])  # their segments
+        shown = card.NetworkShown
+        # greyed out without the relay; no news: as it was
+        self.assertEqual(card.network(None, None), shown(None, False, False))
+        self.assertEqual(card.network(agent(session=0), status(net=net(mr.NET_2G))), shown(None, False, False))
+        self.assertIsNone(card.network(agent(), None))
+        # the relay's choice, in green once the aircraft runs it
+        self.assertEqual(card.network(agent(), status(net=net(mr.NET_2G, mr.NET_2G))), shown(mr.NET_2G, True, False))
+        self.assertEqual(card.network(agent(), status(net=net(mr.NET_AUTO, mr.NET_AUTO, fallback=True))),
+                         shown(mr.NET_AUTO, True, False))
+        # in amber while it does not: asked for (not yet at the relay), switching, the aircraft away, or its firmware
+        # before 1.8.8 (which does not say, and stays on automatic)
+        self.assertEqual(card.network(agent(network_request=mr.NET_LTE), status(net=net(mr.NET_2G, mr.NET_2G))),
+                         shown(mr.NET_LTE, True, True))
+        self.assertEqual(card.network(agent(), status(net=net(mr.NET_2G, mr.NET_AUTO))), shown(mr.NET_2G, True, True))
+        self.assertEqual(card.network(agent(), status(0, idle=mr.U16_UNKNOWN, net=net(mr.NET_LTE))),
+                         shown(mr.NET_LTE, True, True))
+        self.assertEqual(card.network(agent(), status(net=net(mr.NET_LTE))), shown(mr.NET_LTE, True, True))
+        self.assertEqual(card.network(agent(), status(net=net(mr.NET_AUTO))), shown(mr.NET_AUTO, True, False))
+        self.assertEqual(card.network(agent(), status()), shown(mr.NET_AUTO, True, False))  # a relay before 1.8.8
+
+        # the link line: as before, but on 2G because LTE failed: short (MavLTE's window has no width to spare), amber
+        lte = status(rssi=-53, sinr=12, net=net(mr.NET_AUTO, mr.NET_AUTO))
+        self.assertEqual((card.link(lte), card.link_color(lte)), ("LTE -53 dBm · quality 12 dB · round trip 85 ms",
+                                                                  card.TEXT))
+        two = status(rat=3, rssi=-60, rtt=290, net=net(mr.NET_2G, mr.NET_2G))
+        self.assertEqual((card.link(two), card.link_color(two)), ("EDGE -60 dBm · round trip 290 ms", card.TEXT))
+        fell = status(rat=3, rssi=-60, rtt=290, net=net(mr.NET_AUTO, mr.NET_AUTO, fallback=True))
+        self.assertTrue(fell.fallback)
+        self.assertEqual((card.link(fell), card.link_color(fell), card.network_note(fell)),
+                         ("EDGE -60 dBm · round trip 290 ms · LTE failed", card.AMBER, "LTE failed"))
+        for other in (status(rssi=-53, net=net(mr.NET_2G, mr.NET_AUTO)), status(rssi=-53, net=net(mr.NET_LTE))):
+            self.assertEqual((card.link(other), card.link_color(other)), ("LTE -53 dBm · round trip 85 ms", card.TEXT))
+        # ... offline: nothing (the relay keeps the choice for when it is back)
+        away = status(0, net=net(mr.NET_2G, mr.NET_AUTO, fallback=True))
+        self.assertEqual((card.link(away), card.link_color(away), card.network_note(away)), ("-", card.TEXT, ""))
 
     def test_position_and_module(self):
         now = time.time()

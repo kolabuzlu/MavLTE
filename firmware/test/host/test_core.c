@@ -1,4 +1,4 @@
-/* Host tests for the portable firmware core (sha256, mavframe, tunnel, snapshot, mavpos, locator, alarm).
+/* Host tests for the portable firmware core (sha256, mavframe, tunnel, snapshot, mavpos, locator, alarm, netmode).
  * Build and run: make test */
 #include <math.h>
 #include <stdio.h>
@@ -11,6 +11,7 @@
 #include "logrow.h"
 #include "mavframe.h"
 #include "mavpos.h"
+#include "netmode.h"
 #include "sha256.h"
 #include "snapshot.h"
 #include "tunnel.h"
@@ -466,6 +467,7 @@ static void test_tunnel(void)
     tun_input(&t, pkt, n, now);
     CHECK(tun_connected(&t) && t.session == 0x1234);
     CHECK(f.nevents == 1 && f.events[0] == TUN_EVENT_CONNECTED);
+    CHECK(t.network == TUN_NET_UNKNOWN); /* until the first PONG */
     CHECK(f.nsent == 1 && f.sent[0][2] == TUN_PING && u32(f.sent[0] + 4) == 0x1234 && u32(f.sent[0] + 8) == 1);
     CHECK(u32(f.sent[0] + 12) == now);
     /* a replayed WELCOME changes nothing */
@@ -498,6 +500,7 @@ static void test_tunnel(void)
     tun_input(&t, pkt, n, now + 87);
     CHECK(t.rtt_ms == 87);
     CHECK(!t.gcs_present);
+    CHECK(t.network == TUN_NET_AUTO); /* (a relay before 1.8.8 says nothing more: automatic) */
     pong[4] = TUN_PONG_GCS_PRESENT;
     n = tun_encode(&k, pkt, TUN_PONG, TUN_ROLE_SERVER, 0x1234, 3, pong, 5);
     tun_input(&t, pkt, n, now + 90);
@@ -510,15 +513,36 @@ static void test_tunnel(void)
     tun_input(&t, pkt, n, now + 90);
     CHECK(t.voice_on && t.gcs_present && t.rtt_ms == 90);
 
-    /* PINGs once a second carry rtt, radio state and flags, and since 1.8.7 the LTE signal's quality last */
+    /* the network (1.8.8): chosen in PONG flag bits 2-3; their fourth value, unused, counts as automatic */
+    pong[4] = TUN_PONG_GCS_PRESENT | TUN_PONG_VOICE | TUN_NET_2G << TUN_PONG_NET_SHIFT;
+    n = tun_encode(&k, pkt, TUN_PONG, TUN_ROLE_SERVER, 0x1234, 5, pong, 5);
+    tun_input(&t, pkt, n, now + 90);
+    CHECK(t.network == TUN_NET_2G && t.voice_on && t.gcs_present);
+    pong[4] = TUN_PONG_GCS_PRESENT | TUN_PONG_VOICE | TUN_NET_LTE << TUN_PONG_NET_SHIFT;
+    n = tun_encode(&k, pkt, TUN_PONG, TUN_ROLE_SERVER, 0x1234, 6, pong, 5);
+    tun_input(&t, pkt, n, now + 90);
+    CHECK(t.network == TUN_NET_LTE);
+    pong[4] = TUN_PONG_GCS_PRESENT | TUN_PONG_VOICE | 3 << TUN_PONG_NET_SHIFT;
+    n = tun_encode(&k, pkt, TUN_PONG, TUN_ROLE_SERVER, 0x1234, 7, pong, 5);
+    tun_input(&t, pkt, n, now + 90);
+    CHECK(t.network == TUN_NET_AUTO && t.voice_on);
+    pong[4] = TUN_PONG_GCS_PRESENT | TUN_PONG_VOICE | TUN_NET_2G << TUN_PONG_NET_SHIFT;
+    n = tun_encode(&k, pkt, TUN_PONG, TUN_ROLE_SERVER, 0x1234, 8, pong, 5);
+    tun_input(&t, pkt, n, now + 90);
+    CHECK(t.network == TUN_NET_2G);
+
+    /* PINGs once a second carry rtt, radio state and flags, since 1.8.7 the LTE signal's quality and since 1.8.8 the
+     * vehicle's network last */
     CHECK(t.sinr_db == TUN_SINR_UNKNOWN);
     tun_set_radio(&t, -71, 7, -14);
     tun_set_ping_flags(&t, TUN_PING_SPEAKING);
+    tun_set_net_report(&t, TUN_NET_AUTO | TUN_NET_FALLBACK);
     f.nsent = 0;
     tun_poll(&t, now + 999);
     CHECK(f.nsent == 0);
     tun_poll(&t, now + 1000);
-    CHECK(f.nsent == 1 && f.sent[0][2] == TUN_PING && f.sent_len[0] == 12 + 13 + 16);
+    CHECK(f.nsent == 1 && f.sent[0][2] == TUN_PING && f.sent_len[0] == 12 + 14 + 16);
+    CHECK(f.sent[0][25] == (TUN_NET_AUTO | TUN_NET_FALLBACK));
     CHECK(f.sent[0][16] == 90 && f.sent[0][17] == 0);            /* rtt 90 ms */
     CHECK((int16_t)(f.sent[0][20] | f.sent[0][21] << 8) == -71); /* rssi */
     CHECK(f.sent[0][22] == 7);                                   /* LTE */
@@ -539,6 +563,7 @@ static void test_tunnel(void)
     CHECK(f.events[f.nevents - 1] == TUN_EVENT_REJECTED);
     CHECK(!tun_send_data(&t, (const uint8_t *)"x", 1));
     CHECK(t.voice_on); /* kept without a session: the aircraft goes on speaking where it has no coverage */
+    CHECK(t.network == TUN_NET_2G); /* ... and on the network last chosen */
     f.nsent = 0;
     tun_poll(&t, now + 1101); /* HELLO right away, with a fresh nonce */
     CHECK(f.nsent == 1 && f.sent[0][2] == TUN_HELLO && memcmp(f.sent[0] + 12, nonce, 8) != 0);
@@ -1431,6 +1456,157 @@ static void test_usb_lines(void)
     CHECK(usb_parse("MAVLTE GET LOG00012.CSV 0", name, 12, &num) == USB_CMD_NONE); /* no room for the name */
 }
 
+/* ------------------------------------------------------------------ the network (netmode.c) */
+
+#define NO_ALT INT32_MIN
+#define LTE 7
+#define EDGE 3
+
+/* What modem.c hands netmode_tick() each second: s seconds since boot, the relay silent for silence_s, ... */
+static net_in_t net_at(uint32_t s, uint32_t silence_s, uint8_t rat, int sinr, int32_t alt)
+{
+    net_in_t in = {.now_ms = s * 1000, .online = true, .online_ms = 60000, .silence_ms = silence_s * 1000, .rat = rat,
+                   .sinr_db = (int8_t)sinr, .alt_known = alt != NO_ALT, .alt_m = alt == NO_ALT ? 0 : alt};
+    return in;
+}
+
+static bool net_tick(netmode_t *n, uint32_t s, uint32_t silence_s, uint8_t rat, int sinr, int32_t alt)
+{
+    net_in_t in = net_at(s, silence_s, rat, sinr, alt);
+    return netmode_tick(n, &in);
+}
+
+static void test_netmode(void)
+{
+    netmode_t n;
+    netmode_init(&n, NET_AUTO);
+    CHECK(netmode_setting(&n) == NET_MODE_AUTO && netmode_report(&n) == NET_AUTO && !n.good_known);
+
+    /* LTE that works well is remembered with its height; a poor quality alone, or silence alone, is no failure */
+    CHECK(!net_tick(&n, 100, 0, LTE, 5, 500));
+    CHECK(n.good_known && n.good_alt_m == 500 && n.lte_working);
+    CHECK(!net_tick(&n, 101, 0, LTE, -12, 620)); /* poor: it works, but not well */
+    CHECK(n.good_alt_m == 500 && n.lte_working);
+    CHECK(!net_tick(&n, 130, 25, LTE, -5, 700)); /* silent at a good quality: not for 2G to mend */
+    CHECK(!n.lte_working && !n.fallback);
+    CHECK(!net_tick(&n, 131, 19, LTE, -10, 700)); /* poor and silent, for 19 s */
+
+    /* 20 s silent at -9 dB or lower: LTE has failed, 2G for 30 s once there, or until the aircraft is lower */
+    CHECK(net_tick(&n, 132, 20, LTE, -9, 720));
+    CHECK(n.fallback && netmode_setting(&n) == NET_MODE_GSM && netmode_report(&n) == (NET_AUTO | NET_FALLBACK));
+    CHECK(n.failures == 1 && n.fallback_for_ms == 30000 && !n.on_2g);
+    CHECK(n.retry_known && n.retry_alt_m == 450); /* 50 m below where LTE last worked well (500 m; it failed at 720) */
+    CHECK(strcmp(n.why, "2G: LTE failed (nothing from the relay for 20 s at quality -9 dB); LTE again in 30 s or "
+                        "below 450 m") == 0);
+    CHECK(!net_tick(&n, 135, 0, LTE, NET_SINR_UNKNOWN, 400)); /* the modem on its way to 2G: no wait yet */
+    CHECK(!n.on_2g);
+    CHECK(!net_tick(&n, 141, 0, EDGE, NET_SINR_UNKNOWN, 400)); /* on 2G: low enough, but only just there */
+    CHECK(n.on_2g && n.fallback_ms == 141000);
+    CHECK(!net_tick(&n, 151, 0, EDGE, NET_SINR_UNKNOWN, 451));
+    CHECK(net_tick(&n, 151, 0, EDGE, NET_SINR_UNKNOWN, 450)); /* 10 s on 2G, and down to 450 m */
+    CHECK(!n.fallback && !n.on_2g && netmode_setting(&n) == NET_MODE_AUTO && netmode_report(&n) == NET_AUTO);
+    CHECK(strcmp(n.why, "LTE again, the aircraft is down to 450 m") == 0);
+
+    /* failing again, before LTE has worked for 2 minutes: 60 s on 2G, then 120 s, and no more */
+    CHECK(net_tick(&n, 170, 25, LTE, -13, 440));
+    CHECK(n.failures == 2 && n.fallback_for_ms == 60000 && n.retry_alt_m == 390); /* (below where it failed now) */
+    CHECK(!net_tick(&n, 172, 0, EDGE, NET_SINR_UNKNOWN, 600));
+    CHECK(!net_tick(&n, 231, 0, EDGE, NET_SINR_UNKNOWN, 600));
+    CHECK(net_tick(&n, 232, 0, EDGE, NET_SINR_UNKNOWN, 600));
+    CHECK(strcmp(n.why, "LTE again after 60 s on 2G") == 0);
+    CHECK(net_tick(&n, 260, 22, LTE, -14, 600));
+    CHECK(n.failures == 3 && n.fallback_for_ms == 120000 && n.retry_alt_m == 450);
+    CHECK(!net_tick(&n, 262, 0, EDGE, NET_SINR_UNKNOWN, 600));
+    CHECK(!net_tick(&n, 381, 0, EDGE, NET_SINR_UNKNOWN, 600));
+    CHECK(net_tick(&n, 382, 0, EDGE, NET_SINR_UNKNOWN, 600));
+    CHECK(net_tick(&n, 410, 30, LTE, -14, 600));
+    CHECK(n.failures == 4 && n.fallback_for_ms == 120000);
+    CHECK(!net_tick(&n, 411, 0, EDGE, NET_SINR_UNKNOWN, 600));
+    CHECK(net_tick(&n, 421, 0, EDGE, NET_SINR_UNKNOWN, 300)); /* down low: LTE again */
+    CHECK(strstr(n.why, "down to 300 m") != NULL);
+
+    /* LTE that has worked for 2 minutes starts the waits afresh; a hiccup of 3 s or more starts the 2 minutes again */
+    for (uint32_t s = 422; s <= 541; s++) {
+        CHECK(!net_tick(&n, s, 0, LTE, 3, 300));
+    }
+    CHECK(n.failures == 4);
+    CHECK(!net_tick(&n, 542, 3, LTE, 3, 300));
+    for (uint32_t s = 543; s <= 662; s++) {
+        net_tick(&n, s, 0, LTE, 3, 300);
+    }
+    CHECK(n.failures == 4);
+    net_tick(&n, 663, 0, LTE, 3, 300);
+    CHECK(n.failures == 0);
+    CHECK(net_tick(&n, 700, 21, LTE, -11, 900));
+    CHECK(n.failures == 1 && n.fallback_for_ms == 30000 && n.retry_alt_m == 250);
+
+    /* no 2G to be had within 30 s: LTE again */
+    netmode_t m;
+    netmode_init(&m, NET_AUTO);
+    CHECK(net_tick(&m, 40, 20, LTE, -10, NO_ALT));
+    CHECK(!net_tick(&m, 50, 30, 0xFF, NET_SINR_UNKNOWN, NO_ALT)); /* searching */
+    CHECK(!net_tick(&m, 69, 49, LTE, -10, NO_ALT));
+    CHECK(net_tick(&m, 70, 50, LTE, -10, NO_ALT));
+    CHECK(!m.fallback && strcmp(m.why, "LTE again: no 2G within 30 s") == 0);
+
+    /* without the flight controller's height: the waits alone */
+    netmode_init(&m, NET_AUTO);
+    CHECK(!net_tick(&m, 10, 0, LTE, 5, NO_ALT));
+    CHECK(!m.good_known);
+    CHECK(net_tick(&m, 40, 20, LTE, -10, NO_ALT));
+    CHECK(!m.retry_known && strstr(m.why, "LTE again in 30 s") && !strstr(m.why, "below"));
+    CHECK(!net_tick(&m, 55, 0, EDGE, NET_SINR_UNKNOWN, 0)); /* the flight controller only now: no height to go by */
+    CHECK(!net_tick(&m, 84, 0, EDGE, NET_SINR_UNKNOWN, 0));
+    CHECK(net_tick(&m, 85, 0, EDGE, NET_SINR_UNKNOWN, 0));
+    /* ... or with its height only where LTE failed */
+    CHECK(net_tick(&m, 100, 20, LTE, -10, 800));
+    CHECK(m.retry_known && m.retry_alt_m == 750 && m.fallback_for_ms == 60000);
+
+    /* no failure while the data call is down or has only just come up, off LTE, or with the quality not known */
+    netmode_init(&m, NET_AUTO);
+    net_in_t in = net_at(100, 30, LTE, -12, 500);
+    in.online = false;
+    CHECK(!netmode_tick(&m, &in));
+    in.online = true;
+    in.online_ms = 4999;
+    CHECK(!netmode_tick(&m, &in));
+    in.online_ms = 5000;
+    in.rat = EDGE;
+    CHECK(!netmode_tick(&m, &in));
+    in.rat = 0xFF;
+    CHECK(!netmode_tick(&m, &in));
+    in.rat = LTE;
+    in.sinr_db = NET_SINR_UNKNOWN;
+    CHECK(!netmode_tick(&m, &in));
+    in.sinr_db = -12;
+    CHECK(netmode_tick(&m, &in) && m.fallback);
+    /* the reason fits, whatever the numbers */
+    netmode_init(&m, NET_AUTO);
+    CHECK(net_tick(&m, 4000000, 4000000, LTE, -127, -2000000));
+    CHECK(strlen(m.why) < sizeof(m.why) && strstr(m.why, "LTE failed") != NULL);
+
+    /* 2G only and LTE only never fall back; each new choice starts afresh */
+    netmode_t c;
+    netmode_init(&c, NET_2G);
+    CHECK(netmode_setting(&c) == NET_MODE_GSM && netmode_report(&c) == NET_2G);
+    CHECK(!net_tick(&c, 100, 30, LTE, -12, 500) && netmode_report(&c) == NET_2G);
+    CHECK(netmode_choose(&c, NET_LTE));
+    CHECK(netmode_setting(&c) == NET_MODE_LTE && strcmp(c.why, "LTE only, as chosen") == 0);
+    CHECK(!net_tick(&c, 130, 30, LTE, -12, 500) && netmode_setting(&c) == NET_MODE_LTE);
+    CHECK(!netmode_choose(&c, NET_LTE));
+    CHECK(netmode_choose(&c, NET_AUTO) && netmode_setting(&c) == NET_MODE_AUTO);
+    CHECK(net_tick(&c, 160, 30, LTE, -12, 500) && netmode_setting(&c) == NET_MODE_GSM);
+    CHECK(!net_tick(&c, 170, 0, EDGE, NET_SINR_UNKNOWN, 500) && c.on_2g);
+    CHECK(!netmode_choose(&c, NET_2G)); /* on 2G already: the modem stays as it is */
+    CHECK(netmode_report(&c) == NET_2G && !c.fallback && !c.on_2g && c.failures == 0);
+    CHECK(netmode_choose(&c, NET_AUTO) && netmode_setting(&c) == NET_MODE_AUTO && !c.fallback);
+    CHECK(!netmode_choose(&c, 3)); /* the unused fourth value: automatic */
+    netmode_init(&c, 3);
+    CHECK(c.choice == NET_AUTO);
+    CHECK(strcmp(netmode_name(NET_AUTO), "automatic") == 0 && strcmp(netmode_name(NET_2G), "2G only") == 0 &&
+          strcmp(netmode_name(NET_LTE), "LTE only") == 0);
+}
+
 /* ------------------------------------------------------------------ logs over the tunnel (fileout.c) */
 
 #define CARD_FILES 45
@@ -1732,6 +1908,7 @@ int main(void)
     test_cell_percent();
     test_usb_lines();
     test_fileout();
+    test_netmode();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

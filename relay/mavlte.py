@@ -272,6 +272,13 @@ class AgentRunner:
 
         return self._call(go())
 
+    def set_network(self, mode: int) -> bool:
+        """Chooses the aircraft's mobile network (mr.NET_*). False while there is no session with the relay."""
+        async def go() -> bool:
+            return self.agent is not None and self.agent.set_network(mode)
+
+        return self._call(go())
+
     def files(self, use: Callable[[mr.FileFetcher], bool]) -> bool:
         """use(the agent's FileFetcher), on the agent's loop: its list(), get() or stop(). False without an agent, or
         what use() returns."""
@@ -548,22 +555,28 @@ class Thumbnail(tk.Canvas):
 
 
 class Segments(tk.Frame):
-    """One of a few choices, side by side."""
+    """One of a few choices, side by side (selected -1: none). compact: no taller than a line of text."""
 
     def __init__(self, master, app: "App", labels: Tuple[str, ...], selected: int,
-                 command: Callable[[int], None]) -> None:
+                 command: Callable[[int], None], compact: bool = False) -> None:
         super().__init__(master, bg=BORDER, padx=1, pady=1)
         self.command = command
         self.labels = []
         for i, text in enumerate(labels):
-            label = tk.Label(self, text=text, font=app.font_small, padx=round(8 * app.scale), pady=round(3 * app.scale),
-                             cursor="hand2")
+            label = tk.Label(self, text=text, font=app.font_small, padx=round((6 if compact else 8) * app.scale),
+                             pady=0 if compact else round(3 * app.scale), cursor="hand2")
             label.pack(side="left", padx=(1 if i else 0, 0))
             label.bind("<Button-1>", lambda _e, i=i: self.select(i, True))
             self.labels.append(label)
         self.selected = -1
         self.enabled = True
+        self.pending = False  # the selected one asked for, not in effect yet: in amber
         self.select(selected)
+
+    def set_pending(self, pending: bool) -> None:
+        if pending != self.pending:
+            self.pending = pending
+            self._paint()
 
     def select(self, index: int, clicked: bool = False) -> None:
         if clicked and not self.enabled:
@@ -582,7 +595,7 @@ class Segments(tk.Frame):
         for i, label in enumerate(self.labels):
             on = i == self.selected
             if self.enabled:
-                label.configure(bg=ACCENT if on else FIELD, fg=ON_ACCENT if on else TEXT)
+                label.configure(bg=(AMBER if self.pending else ACCENT) if on else FIELD, fg=ON_ACCENT if on else TEXT)
             else:
                 label.configure(bg=BORDER if on else FIELD, fg=MUTED if on else DIM)
 
@@ -1709,6 +1722,10 @@ class App:
         self.craft_state.pack(side="left", padx=round(8 * s))
         self.craft_bars = Bars(top, s, SURFACE)
         self.craft_bars.pack(side="right")
+        # the aircraft's mobile network (1.8.8): automatic (LTE, and 2G while LTE fails), 2G or LTE only
+        self.network = Segments(top, self, aircraft_card.NETWORK_NAMES, -1, self.choose_network, compact=True)
+        self.network.pack(side="right", padx=(0, round(10 * s)))
+        self.network.set_enabled(False)
         grid = tk.Frame(craft, bg=SURFACE)
         grid.pack(fill="x", padx=pad, pady=(0, pad))
         self.craft_values = {}
@@ -1776,6 +1793,11 @@ class App:
             self.voice.switch.set(on)  # the relay confirms within a second or two (_show_voice)
         else:
             self.voice.show("Not connected to the relay", RED)
+
+    def choose_network(self, index: int) -> None:
+        self.network.set_pending(True)  # asked for: the aircraft takes it within seconds
+        if not (self.runner.running and self.runner.set_network(index)):
+            self._show_network(self.runner.agent, None)  # no session: as it was (the next poll greys it out)
 
     def choose_size(self, index: int) -> None:
         self.settings.photo_size = SIZE_NAMES[index]
@@ -1966,6 +1988,7 @@ class App:
                     where = f"UDP, port {port}" if mr.is_loopback(host) else f"UDP {host}, port {port}"
                 self.udp_card.show(*self._port_status(online, gcs, where))
         self._show_aircraft(agent, status, now)
+        self._show_network(agent, status)
         self._show_voice(agent, status, now)
         self._take_photos(now)
         self._show_camera(agent, online, now)
@@ -2008,6 +2031,15 @@ class App:
         self.camera.show(cam.text, PALETTE[cam.color], cam.fraction)
         self.camera.set_enabled(cam.ready)
         self.camera.size.set_enabled(not cam.busy)
+
+    def _show_network(self, agent, status: Optional[mr.LinkStatus]) -> None:
+        shown = aircraft_card.network(agent, status)
+        if shown is not None:
+            index = -1 if shown.choice is None else shown.choice
+            if index != self.network.selected:
+                self.network.select(index)
+            self.network.set_enabled(shown.usable)
+            self.network.set_pending(shown.pending)
 
     def _show_voice(self, agent, status: Optional[mr.LinkStatus], now: float) -> None:
         shown = self.voice_state.show(agent, status, now)

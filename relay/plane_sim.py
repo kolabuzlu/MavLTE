@@ -16,7 +16,9 @@ ground) and the troubles that make a real link patchy: latency spikes, fades, ce
 dropouts, at random. The A7670E falls back to 2G where there is no LTE. Signal, weak to excellent,
 sets the level the module reports (the bars in the MavLTE app), slows the link, and makes the
 troubles more frequent and longer. From a fair signal down, 2G is slower than the telemetry, so it
-queues up and packets are lost, as they would be in the air.
+queues up and packets are lost, as they would be in the air. The network chosen in MavLTE (Auto, 2G
+or LTE) applies as on the board: 2G is there wherever LTE is, and LTE only finds nothing where there
+is only 2G.
 
 The board's camera is there too, with its own switch (the CAM DIP switch on the board): MavLTE's
 Snapshot button gets a picture of sky and fields, seen as the plane flies, rolls and pitches, of the
@@ -479,7 +481,8 @@ class Plane:
         self.camera = Image is not None  # the board's CAM DIP switch
         self.cell = False  # an 18650 cell in the board's holder: the module runs on without the flight battery
         self.quick = False
-        self.network = NET_LTE
+        self.network = NET_LTE  # what the plane flies through
+        self.choice = mr.NET_AUTO  # the network chosen at the relay (MavLTE's), as the module last heard it
         self.signal = GOOD_SIGNAL
         self.cell_pct = 100.0
         self.cell_at = time.monotonic()
@@ -575,20 +578,35 @@ class Plane:
         target = (SUN_AIR_C if self.sun else AIR_C) + (SELF_HEAT_C if self.modem is not None else 0.0)
         self.chip_c += (target - self.chip_c) * (1 - math.exp(-elapsed / CHIP_LAG_S))
 
-    def set_network(self, network: int) -> None:
-        old, self.network = self.network, network
+    def serving(self) -> int:
+        """The network the module is on: what the plane flies through, as the network chosen at the relay allows.
+        2G is there wherever LTE is; LTE only finds nothing where there is only 2G."""
+        if self.network == NO_CONNECTION or self.choice == mr.NET_AUTO:
+            return self.network
+        if self.choice == mr.NET_2G:
+            return NET_2G
+        return NET_LTE if self.network == NET_LTE else NO_CONNECTION
+
+    def _moved(self, old: int) -> None:
+        """The module's network was old: now it is self.serving()."""
+        new = self.serving()
         m = self.modem
-        if m is not None and m.net is not None and network != old:
+        if m is not None and m.net is not None and new != old:
             # a real modem needs a moment to move between networks, or to register again
-            gap = 0.0 if network == NO_CONNECTION else REGISTER_AGAIN_S if old == NO_CONNECTION else RAT_SWITCH_S
-            m.net.set_network(network, self.signal, gap)
-            log.info("LTE module: %s", "no coverage" if network == NO_CONNECTION else f"now on {NETWORKS[network][0]}")
+            gap = 0.0 if new == NO_CONNECTION else REGISTER_AGAIN_S if old == NO_CONNECTION else RAT_SWITCH_S
+            m.net.set_network(new, self.signal, gap)
+            log.info("LTE module: %s", f"now on {NETWORKS[new][0]}" if new != NO_CONNECTION else "no coverage"
+                     if self.network == NO_CONNECTION else "no LTE here, and LTE only is chosen")
+
+    def set_network(self, network: int) -> None:
+        old, self.network = self.serving(), network
+        self._moved(old)
 
     def set_signal(self, signal: int) -> None:
         self.signal = signal
         m = self.modem
         if m is not None and m.net is not None:
-            m.net.set_network(self.network, signal)
+            m.net.set_network(self.serving(), signal)
 
     def set_camera(self, on: bool) -> None:
         self.camera = on and Image is not None
@@ -693,20 +711,22 @@ class Plane:
         try:
             await asyncio.sleep(start)
             m.stage = "searching"
-            while self.network == NO_CONNECTION:  # no coverage: no network to register with
+            while self.serving() == NO_CONNECTION:  # no coverage: no network to register with
                 await asyncio.sleep(0.2)
             await asyncio.sleep(register)
             m.stage = "registered"
-            log.info("LTE module: registered on %s, signal %d dBm", NETWORKS[self.network][0], SIGNALS[self.signal][1])
+            log.info("LTE module: registered on %s, signal %d dBm", NETWORKS[self.serving()][0],
+                     SIGNALS[self.signal][1])
             await asyncio.sleep(data)
             relay = await self._lookup()
-            m.net = Network(relay, self.network, self.signal)
+            m.net = Network(relay, self.serving(), self.signal)
             await m.net.start()
             m.batcher = mr.Batcher()
             m.client = mr.TunnelClient(mr.ROLE_VEHICLE, self.key, *m.net.address, on_data=self._to_fc,
                                        info=f"mavlte-planesim/{mr.__version__}", radio=self._radio)
+            m.client.network = m.client.net_report = self.choice  # as the board: the last one, until the relay says
             m.photos = mr.PhotoOutbox(m.client, capture=self._capture if self.camera else None, where=self._where,
-                                      cap=lambda: PHOTO_CAP.get(self.network, PHOTO_CAP[NET_2G]))
+                                      cap=lambda: PHOTO_CAP.get(self.serving(), PHOTO_CAP[NET_2G]))
             m.client.on_packet, m.client.on_session = m.photos.on_packet, m.photos.on_session
             m.stage = "data"
             log.info("LTE module: mobile data up")
@@ -743,6 +763,12 @@ class Plane:
                          if m.voice else "off")
                 m.client.ping_flags = mr.PING_FLAG_SPEAKING if m.voice else 0
                 m.client.ping_now()
+            if m.client.network != self.choice:  # the network chosen at the relay, kept while it is out of reach
+                old, self.choice = self.serving(), m.client.network
+                log.info("LTE module: network %s, as chosen in MavLTE", mr.NET_NAMES[self.choice])
+                m.client.net_report = self.choice
+                m.client.ping_now()
+                self._moved(old)
             if now - reported >= LOCATOR_INTERVAL and m.client.session:  # the locator, as the firmware
                 reported = now
                 self._cell_update()
@@ -772,7 +798,7 @@ class Plane:
         return pos._replace(flags=pos.flags | flags, fc_silent=silent, temp=int(round(self.chip_c)))
 
     def _radio(self) -> Tuple[int, int]:
-        rat = NETWORKS[self.network][1]
+        rat = NETWORKS[self.serving()][1]
         if rat is None:
             return mr.RSSI_UNKNOWN, mr.RAT_UNKNOWN
         return SIGNALS[self.signal][1], rat
@@ -1203,7 +1229,8 @@ class SimWindow:
         # the LED, as on the board (README: "The RGB LED"), from worst to best: red without mobile data
         # (blinking while it starts and searches), yellow while the relay does not answer, purple when
         # connected but the flight controller is silent, blue when ready to fly (a GCS connected or not)
-        no_coverage = p.network == NO_CONNECTION
+        serving = p.serving()
+        no_coverage = serving == NO_CONNECTION
         if m is None:
             color = ui.LED_OFF
         elif m.stage != "data" or no_coverage:
@@ -1224,17 +1251,21 @@ class SimWindow:
             since = f" ({now - m.started:.0f} s)"
             if m.stage == "starting":
                 state = "Starting the modem…" + since
+            elif no_coverage and p.network != NO_CONNECTION:
+                state = "No LTE here, and LTE only is chosen in MavLTE"
             elif m.stage == "searching":
                 state = ("No coverage: searching for a network…" if no_coverage
                          else "Searching for the network…") + since
             elif m.stage == "registered":
-                state = f"Registered on {NETWORKS[p.network][0]}, starting mobile data…" + since
+                state = f"Registered on {NETWORKS[serving][0]}, starting mobile data…" + since
             elif no_coverage:
                 state = "No coverage: nothing gets through"
             elif m.net is not None and now < m.net.gap_until:
-                state = f"Moving to {NETWORKS[p.network][0]}: no data for a moment"
+                state = f"Moving to {NETWORKS[serving][0]}: no data for a moment"
             elif session:
-                state = f"Connected to the relay over {NETWORKS[p.network][0].split(' (')[0]}"
+                state = f"Connected to the relay over {NETWORKS[serving][0].split(' (')[0]}"
+                if p.choice != mr.NET_AUTO:
+                    state += f" ({mr.NET_NAMES[p.choice]}, chosen in MavLTE)"
                 trouble = m.net.condition(now) if m.net is not None else ""
                 if trouble:
                     state += f" · {trouble}"
@@ -1245,7 +1276,7 @@ class SimWindow:
         self._set(v["State"], state)
         registered = m is not None and m.stage in ("registered", "data") and not no_coverage
         self.lte_bars.set(p.signal + 1 if registered else None)
-        f = link_figures(p.network, p.signal)
+        f = link_figures(serving, p.signal)
         self._set(v["Link"], "No coverage: nothing gets through" if f is None else
                   f"{speed_text(f[0])} up · +{f[2] * 1000:.0f} ms each way · {f[4] * 100:g}% loss")
         self._set(v["Round trip"], f"{client.rtt_ms} ms, plane ↔ relay"

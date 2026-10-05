@@ -584,6 +584,40 @@ void bridge_set_voice(bool speaking, bool failed)
     }
 }
 
+int bridge_network_wanted(void)
+{
+    int network = TUN_NET_UNKNOWN;
+    if (lock) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        network = tun.network;
+        xSemaphoreGive(lock);
+    }
+    return network;
+}
+
+void bridge_set_net_report(uint8_t report)
+{
+    if (lock) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        tun_set_net_report(&tun, report);
+        xSemaphoreGive(lock);
+    }
+}
+
+bool bridge_fc_altitude(int32_t *alt_m)
+{
+    bool fresh = false;
+    if (lock) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        fresh = position.valid && (uint32_t)(now_ms() - position.when_ms) < POSITION_FRESH_MS;
+        if (fresh) {
+            *alt_m = position.alt_mm / 1000;
+        }
+        xSemaphoreGive(lock);
+    }
+    return fresh;
+}
+
 void bridge_log_row(log_row_t *row)
 {
     if (!lock) {

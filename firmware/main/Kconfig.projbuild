@@ -28,20 +28,6 @@ menu "MavLTE"
         string "SIM PIN (empty if the SIM has no PIN)"
         default ""
 
-    choice BRIDGE_NETWORK_MODE
-        prompt "Mobile network technology"
-        default BRIDGE_NETWORK_AUTO
-
-        config BRIDGE_NETWORK_AUTO
-            bool "Automatic (LTE, falls back to 2G)"
-
-        config BRIDGE_NETWORK_LTE_ONLY
-            bool "LTE only"
-            help
-                2G is slow and draws the largest current peaks. LTE only avoids it, at the
-                cost of no service where there is only 2G coverage.
-    endchoice
-
     choice BRIDGE_BOARD
         prompt "Board version"
         default BRIDGE_BOARD_AUTO

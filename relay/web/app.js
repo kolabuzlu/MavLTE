@@ -18,6 +18,7 @@
   let failures = 0;
   let lastNews = 0; // Date.now() of the last answer
   let voiceSending = false;
+  let networkSending = false;
   let clickedAt = -1e9; // Snapshot: the photo that comes next opens in the viewer
   let shownPhoto = null; // the id on the card
   let photos = []; // the viewer's, newest first
@@ -77,6 +78,12 @@
     paint($("craft-state"), s.aircraft.text, "text");
     [...$("bars").children].forEach((bar, i) => bar.classList.toggle("on", s.aircraft.bars !== null && i < s.aircraft.bars));
     paint($("link"), s.link, s.link_color || "text");
+    const network = $("network");
+    if (!networkSending) network.classList.toggle("pending", s.network.pending); // asked for, not taken yet: amber
+    for (const b of network.children) {
+      if (!networkSending) b.setAttribute("aria-checked", String(Number(b.dataset.net) === s.network.choice));
+      b.disabled = !s.network.can;
+    }
     paint($("loss"), s.loss, "text");
 
     paint($("position"), s.position.text, s.position.color);
@@ -241,6 +248,24 @@
     }
     poll();
   });
+
+  for (const b of $("network").children) {
+    b.addEventListener("click", async () => {
+      for (const other of $("network").children) other.setAttribute("aria-checked", String(other === b));
+      $("network").classList.add("pending");
+      networkSending = true; // the relay confirms within a second or two
+      try {
+        const r = await api("/api/network", { mode: Number(b.dataset.net) });
+        if (r.status === 401) return showSignin();
+        if (!r.ok) paint($("link"), await why(r, "Not connected to the relay"), "red");
+      } catch (e) {
+        paint($("link"), "No connection to the server", "red");
+      } finally {
+        networkSending = false;
+      }
+      poll();
+    });
+  }
 
   $("snapshot").addEventListener("click", async () => {
     $("snapshot").disabled = true;

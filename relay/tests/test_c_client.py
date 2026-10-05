@@ -128,7 +128,7 @@ class CVehicleTest(unittest.IsolatedAsyncioTestCase):
                             on_photo=lambda path, info: saved.append((path, info)))
         for task in (asyncio.ensure_future(ticker()), asyncio.ensure_future(agent.run())):
             self.addCleanup(task.cancel)
-        proc = await asyncio.create_subprocess_exec(self.harness, "127.0.0.1", str(port), KEY_V.hex(), "12",
+        proc = await asyncio.create_subprocess_exec(self.harness, "127.0.0.1", str(port), KEY_V.hex(), "16",
                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await self.until(lambda: relay.vehicle is not None and agent.client.is_connected)
         await asyncio.sleep(0.5)
@@ -158,11 +158,23 @@ class CVehicleTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(agent.set_voice(False))
         await self.until(lambda: not (agent.status.voice_on or agent.status.speaking))
 
-        out, err = await asyncio.wait_for(proc.communicate(), 20)
+        # its network (1.8.8): the agent's choice, kept by the relay and passed on in its PONGs; the C vehicle says in
+        # its PINGs what it is set to
+        await self.until(lambda: agent.status.vehicle_network == mr.NET_AUTO)
+        self.assertTrue(agent.set_network(mr.NET_2G))
+        await self.until(lambda: agent.status.network == agent.status.vehicle_network == mr.NET_2G)
+        self.assertFalse(agent.status.fallback)
+        self.assertTrue(agent.set_network(mr.NET_AUTO))
+        await self.until(lambda: agent.status.vehicle_network == mr.NET_AUTO)
+
+        out, err = await asyncio.wait_for(proc.communicate(), 24)
         self.assertEqual(proc.returncode, 0, err.decode())
         stats = dict(item.split("=") for item in out.decode().split())
         self.assertEqual((stats["photos"], stats["bad"]), ("1", "0"))
-        self.assertIn("harness: voice on\nharness: voice off", err.decode())
+        err = err.decode()
+        self.assertIn("harness: voice on\nharness: voice off", err)
+        self.assertLess(err.index("harness: network 0\n"), err.index("harness: photo"))  # its first PONG
+        self.assertIn("harness: voice off\nharness: network 1\nharness: network 0\n", err)
 
     async def test_c_vehicle_logs(self):
         """The firmware's log sender (C) lists its card and sends a file through the relay to a GCS agent (Python)."""

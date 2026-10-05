@@ -32,6 +32,14 @@ enum { TUN_ROLE_SERVER = 0, TUN_ROLE_VEHICLE = 1, TUN_ROLE_GCS = 2 };
 #define TUN_PONG_VOICE 0x02        /* the locator voice is switched on: speak */
 #define TUN_PING_SPEAKING 0x02     /* vehicle: the locator voice speaks */
 #define TUN_PING_VOICE_FAILED 0x04 /* vehicle: asked to speak, but the modem does not */
+/* The mobile network (1.8.8): chosen at the server, in PONG flag bits 2-3; the vehicle's own report of it, a byte after
+ * the quality in each PING: bits 0-1 the network it is set to, bit 2 it is on 2G because LTE failed */
+#define TUN_PONG_NET_SHIFT 2
+#define TUN_NET_AUTO 0 /* LTE, and 2G where LTE fails */
+#define TUN_NET_2G 1   /* 2G only */
+#define TUN_NET_LTE 2  /* LTE only */
+#define TUN_NET_UNKNOWN (-1) /* no PONG yet */
+#define TUN_NET_FALLBACK 0x04
 
 typedef enum {
     TUN_EVENT_CONNECTED, /* session established */
@@ -87,7 +95,10 @@ typedef struct {
     bool gcs_present; /* from the server's last PONG; true until known */
     bool voice_on;    /* the server's last PONG asked for the locator voice; kept without a session, so an
                          aircraft keeps speaking where it has no coverage */
+    int8_t network;     /* the network the server's last PONG chose (TUN_NET_*), TUN_NET_UNKNOWN before the first;
+                           kept without a session, as voice_on */
     uint8_t ping_flags; /* TUN_PING_*, sent in every PING */
+    uint8_t net_report; /* the vehicle's network, sent in every PING after the quality */
     uint16_t rtt_ms;
     int16_t rssi_dbm;
     uint8_t rat;
@@ -117,6 +128,8 @@ bool tun_send_packet(tun_client_t *t, uint8_t type, const uint8_t *body, size_t 
 void tun_set_radio(tun_client_t *t, int16_t rssi_dbm, uint8_t rat, int8_t sinr_db);
 /* Flags reported to the server in PINGs (TUN_PING_*). */
 void tun_set_ping_flags(tun_client_t *t, uint8_t flags);
+/* The vehicle's network as reported to the server in PINGs (TUN_NET_* | TUN_NET_FALLBACK). */
+void tun_set_net_report(tun_client_t *t, uint8_t report);
 /* Downlink loss in per mille over the last seconds, or TUN_U16_UNKNOWN. */
 uint16_t tun_loss_permille(const tun_client_t *t);
 
