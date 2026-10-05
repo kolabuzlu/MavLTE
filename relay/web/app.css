@@ -205,7 +205,16 @@ main {
   color: var(--amber);
   font-size: 14px;
 }
-body.stale .card, body.stale .relay { opacity: 0.55; }
+body.stale .card, body.stale .relay, body.stale #map-where { opacity: 0.55; }
+/* over the map or a photo too, under their close button: an old position must not look live */
+body.viewing .net {
+  position: fixed;
+  top: calc(64px + env(safe-area-inset-top, 0px));
+  left: 12px;
+  right: 12px;
+  z-index: 12;
+  margin: 0;
+}
 
 .signin { display: grid; gap: 10px; margin-top: 16px; padding: 18px; }
 .signin h2 { margin: 0; font-size: 18px; }
@@ -227,7 +236,7 @@ body.stale .card, body.stale .relay { opacity: 0.55; }
 
 /* a photo, the whole screen */
 body.viewing { overflow: hidden; }
-.viewer { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; background: var(--black); }
+.viewer { position: fixed; inset: 0; z-index: 11; display: flex; flex-direction: column; background: var(--black); } /* over the map */
 .viewer img { flex: 1; width: 100%; min-height: 0; object-fit: contain; }
 .viewer-bar {
   display: flex;
@@ -263,6 +272,7 @@ body.viewing { overflow: hidden; }
 .trail { stroke: var(--trail); stroke-width: 3px; }
 #plane { fill: var(--amber); stroke: var(--casing); stroke-width: 2px; stroke-linejoin: round; }
 #plane.live { fill: var(--green); }
+body.stale #plane.live { fill: var(--amber); } /* no news from the server: no longer live */
 .credit {
   position: absolute;
   right: 0;

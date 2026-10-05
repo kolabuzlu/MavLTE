@@ -123,14 +123,20 @@ static bool start_get(file_outbox_t *o, uint32_t now_ms)
     bool ended = false;
     if (o->sending && o->id == o->get_id && strcmp(o->name, o->get_name) == 0 && o->get_offset < o->size) {
         o->acked = o->next = o->get_offset; /* the same download, from where the receiver has it */
+        o->finished = false;
+        if (o->get_offset < o->from) {
+            o->from = o->get_offset; /* (the bytes sent, for the log, count from here) */
+        }
         o->moved_ms = o->last_ack_ms = now_ms;
         return false;
     }
     if (o->sending) {
-        if (o->id != o->get_id) { /* someone else's download: this one ends it */
+        /* all of it ACKed (the last ACK and the next GET in one pass, as an agent asks for the next log at once):
+         * the download is complete, and its receiver needs no STOPPED */
+        if (!o->finished && o->id != o->get_id) { /* someone else's download: this one ends it */
             send_status(o, o->id, FILE_STOPPED, o->acked, o->size);
         }
-        end(o, false);
+        end(o, o->finished);
         ended = true;
     }
     uint32_t size = 0;

@@ -265,7 +265,9 @@ class LiveLogsTest(unittest.IsolatedAsyncioTestCase):
         await self.connected(plane, agent.client)
         ok, problem, _, _ = await self.download(agent, "LOG00099.CSV")
         self.assertEqual((ok, problem), (False, mr.FILE_PROBLEMS[mr.FILE_NOT_FOUND]))
-        ok, problem, _, _ = await self.download(agent, "../secret.txt")  # only the card's logs
+        ok, problem, _, _ = await self.download(agent, "../secret.txt")  # only the card's logs, not even asked for
+        self.assertEqual((ok, problem), (False, "not a log file's name: '../secret.txt'"))
+        ok, problem, _, _ = await self.download(agent, "log00099.csv")  # (the card's names, in any case)
         self.assertEqual((ok, problem), (False, mr.FILE_PROBLEMS[mr.FILE_NOT_FOUND]))
         self.assertEqual(await self.listing(agent), ([], 0, ""))
 

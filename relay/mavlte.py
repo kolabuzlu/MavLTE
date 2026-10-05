@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import ctypes
+import gc
 import io
 import logging
 import math
@@ -150,6 +151,8 @@ def name_problem(name: str) -> Optional[str]:
     if re.search(r"(^|\s)[#;]", name):
         return ("The vehicle name cannot have a # or ; at the start or after a space: mavrelay.ini "
                 "would read the rest as a comment. Leave out the space, as in UAV#2.")
+    if any(ord(c) < 32 or ord(c) == 127 for c in name):  # a line break pasted in: the file would not read again
+        return "The vehicle name cannot have a line break or a tab in it."
     return None
 
 
@@ -226,6 +229,7 @@ def open_file(path: str) -> None:
 class AgentRunner:
     def __init__(self) -> None:
         self.loop = asyncio.SelectorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
+        self.loop.set_exception_handler(self._loop_error)  # into MavLTE's log (the exe has no console)
         self.thread = threading.Thread(target=self._run, name="agent", daemon=True)
         self.thread.start()
         self.agent: Optional[mr.GcsAgent] = None
@@ -275,6 +279,10 @@ class AgentRunner:
             return self.agent is not None and use(self.agent.files)
 
         return self._call(go())
+
+    @staticmethod
+    def _loop_error(loop, context: dict) -> None:
+        log.error("agent: %s", context.get("message", "unexpected error"), exc_info=context.get("exception"))
 
     @staticmethod
     def _ended(task: asyncio.Task) -> None:
@@ -936,6 +944,7 @@ def log_copy_name(name: str, start: int) -> str:
     """The copy's name: when the log began (this computer's time), then its name on the card, as
     "2026-10-02 12-35 LOG00012.csv"; just "LOG00012.csv" if the board never knew the time."""
     stem = name[:-4] if name.upper().endswith(".CSV") else name
+    stem = re.sub(r"[^A-Za-z0-9_-]", "_", stem)  # (the board's names are LOGnnnnn: nothing else can make a path)
     when = time.strftime("%Y-%m-%d %H-%M ", time.localtime(start)) if start else ""
     return f"{when}{stem}.csv"
 
@@ -1070,14 +1079,22 @@ class UsbLogs:
                     name, offset, write, progress, done = args
                     link.get(name, offset, write, progress, self.stopped)
                     done(True, "")
-            except boardusb.UsbError as exc:
-                if exc.fatal and self.link is not None:  # the cable pulled out, say: open it again next time
-                    self.link.close()
+            except Exception as exc:  # also a full disk while writing, or a line that came broken: the job ends
+                why = str(exc) if isinstance(exc, boardusb.UsbError) else (
+                    getattr(exc, "strerror", None) or f"{type(exc).__name__}: {exc}")
+                if not isinstance(exc, boardusb.UsbError):
+                    log.exception("flight logs over USB")
+                fatal = not isinstance(exc, boardusb.UsbError) or exc.fatal
+                if fatal and self.link is not None:  # the cable pulled out, say: open it again next time
+                    try:
+                        self.link.close()
+                    except Exception:
+                        pass
                     self.link = None
                 if kind == "list":
-                    args[1](None, 0, str(exc))
+                    args[1](None, 0, why)
                 else:
-                    args[4](False, str(exc))
+                    args[4](False, why)
 
 
 class LogsWindow(tk.Toplevel):
@@ -1089,6 +1106,7 @@ class LogsWindow(tk.Toplevel):
     COLUMNS = (("file", "File", 110), ("started", "Started", 170), ("length", "Length", 90), ("size", "Size", 80),
                ("here", "Here", 90))
     QUIET = 45.0  # s without a byte: a download is given up (its source went away)
+    LIST_QUIET = 30.0  # s without the list asked for: given up (4G answers within 12 s, USB within 15 s)
 
     def __init__(self, app: "App") -> None:
         super().__init__(app.root)
@@ -1103,6 +1121,7 @@ class LogsWindow(tk.Toplevel):
         self.entries: List[Entry] = []
         self.total = 0
         self.listing = False
+        self.listing_at = 0.0  # when the list was asked for
         self.download: Optional[dict] = None  # the copy being made
         self.waiting: List[Entry] = []  # to copy after it
 
@@ -1178,6 +1197,12 @@ class LogsWindow(tk.Toplevel):
     def use(self, index: int) -> None:
         """4G or the USB cable."""
         self.stop()
+        if self.download is not None:  # the old source's: it ends here (its last word, when it comes, is passed by)
+            try:
+                self.download["file"].close()
+            except OSError:
+                pass
+            self.download = None
         if self.source is not None:
             self.source.close()
         self.source = AirLogs(self.app.runner) if index == 0 else UsbLogs()
@@ -1210,6 +1235,7 @@ class LogsWindow(tk.Toplevel):
     def _list(self, first: int) -> None:
         source = self.source
         self.listing = True
+        self.listing_at = time.monotonic()
         self._show("Asking the aircraft for its files…" if isinstance(source, AirLogs)
                    else "Looking for the board on the USB ports…")
         problem = source.list(first, lambda entries, total, problem: self.events.put(
@@ -1239,12 +1265,18 @@ class LogsWindow(tk.Toplevel):
     # -- the list
 
     def _copy(self, entry: Entry) -> Tuple[str, int]:
-        """Where the copy of entry goes, and how much of it is there."""
-        path = os.path.join(logs_folder(), log_copy_name(entry[0], entry[2]))
-        try:
-            return path, os.path.getsize(path)
-        except OSError:
-            return path, 0
+        """Where the copy of entry goes, and how much of it is there. A copy larger than the file is of another one
+        with the same name (from a card formatted since, or another board): this one goes beside it, as "(2)"."""
+        base = os.path.join(logs_folder(), log_copy_name(entry[0], entry[2]))
+        for n in range(1, 100):
+            path = base if n == 1 else f"{base[:-4]} ({n}).csv"
+            try:
+                have = os.path.getsize(path)
+            except OSError:
+                return path, 0
+            if have <= entry[1]:
+                return path, have
+        return base, 0
 
     def _fill(self) -> None:
         selected = {self.tree.set(item, "file") for item in self.tree.selection()}
@@ -1307,10 +1339,14 @@ class LogsWindow(tk.Toplevel):
              "t0": time.monotonic(), "news": time.monotonic()}
 
         def write(offset: int, data: bytes) -> None:  # on the source's thread, in order
+            if d.get("error"):
+                return
             try:
                 f.write(data)
             except ValueError:  # closed: the window went
                 pass
+            except OSError as exc:  # a full disk, say: _tick ends the download (not from here, the source's thread)
+                d["error"] = f"cannot write {path}: {exc.strerror or exc}"
 
         def progress(have_: int, size: int) -> None:
             d["have"], d["size"], d["news"] = have_, size, time.monotonic()
@@ -1332,7 +1368,12 @@ class LogsWindow(tk.Toplevel):
         if d is not self.download:
             return
         self.download = None
-        d["file"].close()
+        try:
+            d["file"].close()
+        except OSError as exc:  # the last bytes could not be written either (a full disk)
+            ok, problem = False, d.get("error") or f"cannot write {d['path']}: {exc.strerror or exc}"
+        if d.get("error"):
+            ok, problem = False, d["error"]
         name = d["entry"][0]
         if ok:
             got = d["have"] - d["from"]
@@ -1365,15 +1406,31 @@ class LogsWindow(tk.Toplevel):
     # -- four times a second
 
     def _tick(self) -> None:
+        try:  # an unexpected error must not stop this window for good
+            self._tick_once()
+        except Exception:
+            log.exception("flight logs window")
+        finally:
+            self.job = self.after(250, self._tick)
+
+    def _tick_once(self) -> None:
         while True:
             try:
                 self.events.get_nowait()()
             except queue.Empty:
                 break
+        if self.listing and time.monotonic() - self.listing_at > self.LIST_QUIET:  # its answer will not come
+            self.listing = False  # (the agent restarted with new settings while it asked, say)
+            self._show("No answer to the list: Refresh asks again", RED)
+            self._buttons()
         d = self.download
         if d is not None:
             now = time.monotonic()
-            if now - d["news"] > self.QUIET:  # its source went away (the agent restarted with new settings, say)
+            if d.get("error"):  # the copy could not be written: the download stops
+                if self.source is not None:
+                    self.source.stop()
+                self._done(d, False, d["error"])
+            elif now - d["news"] > self.QUIET:  # its source went away (the agent restarted with new settings, say)
                 if self.source is not None:
                     self.source.stop()
                 self._done(d, False, "no answer: the download stopped")
@@ -1383,7 +1440,6 @@ class LogsWindow(tk.Toplevel):
                            f"{rate / 1024:.1f} KB/s", TEXT, d["have"] / max(1, d["size"]))
         elif self.bar.find_all():
             self.bar.delete("all")
-        self.job = self.after(250, self._tick)
 
     def _show(self, text: str, color: str = DIM, fraction: Optional[float] = None) -> None:
         if self.status.cget("text") != text or self.status.cget("fg") != color:
@@ -1531,6 +1587,8 @@ class App:
         self.shown_where: Tuple[str, str] = ("", TEXT)  # Position's text and colour, for the map too
         self.lan: Optional[str] = None  # this computer's address on its network, for the cards
         self.lan_at = -1e9
+        self.gc_at = time.monotonic()  # the garbage collector runs from poll(), on this thread only (see main)
+        self.set_aside_at: Optional[float] = None  # when to set aside again what lives (see set_aside)
 
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
         family = "Segoe UI" if "Segoe UI" in tkfont.families(root) else "TkDefaultFont"
@@ -1773,6 +1831,9 @@ class App:
             cards = [card for card in (self.tcp_card, self.udp_card) if card.switch.on]
             if self.runner.running:
                 self.runner.stop()
+                if gc.get_freeze_count():  # the old connection was set aside with the rest (see set_aside): let the
+                    gc.unfreeze()  # collections free it, and set aside anew once it is surely gone
+                    self.set_aside_at = time.monotonic() + 10.0
             for card in cards:
                 card.set_on(False)
             self._connect()
@@ -1826,6 +1887,20 @@ class App:
     # -- live state, four times a second
 
     def poll(self) -> None:
+        try:  # an unexpected error must not freeze every LED and line in the window
+            self._poll()
+        except Exception:
+            log.exception("unexpected error while updating the window")
+        finally:
+            self.poll_job = self.root.after(self.POLL_MS, self.poll)
+
+    def _poll(self) -> None:
+        if time.monotonic() - self.gc_at >= 5.0:
+            self.gc_at = time.monotonic()
+            gc.collect()
+            if self.set_aside_at is not None and self.gc_at >= self.set_aside_at:
+                self.set_aside_at = None
+                gc.freeze()  # (just collected: what is left lives on)
         self._drain_log()
         agent = self.runner.agent
         now = time.monotonic()
@@ -1869,7 +1944,6 @@ class App:
         self._show_voice(agent, status, now)
         self._take_photos(now)
         self._show_camera(agent, online, now)
-        self.poll_job = self.root.after(self.POLL_MS, self.poll)
 
     def _take_photos(self, now: float) -> None:
         """Photos the agent saved: the newest goes on the thumbnail; after a Snapshot click, into the
@@ -1960,7 +2034,7 @@ class App:
 
     def _show_position(self, agent, online: bool) -> None:
         """Map and Copy take the position shown."""
-        now_unix = time.time()
+        now_unix = agent.relay_time() if agent is not None else time.time()  # the clock the reports carry
         where = aircraft_card.position(agent, online, now_unix)
         self.shown_fix = where.fix
         live = aircraft_card.live(agent, online, now_unix)
@@ -2028,6 +2102,16 @@ class App:
             self.log_window.add(lines)
 
 
+def set_aside() -> None:
+    """Sets aside (freezes) all that lives now: the collections every 5 s (App._poll) skip it from then on. Nearly all
+    of MavLTE's objects are made at start-up and live as long as it does; checking them all took 7-9 ms each time,
+    while the agent's thread, forwarding telemetry and commands, waited. What is made later is still checked (some
+    0.2 ms). What is set aside is still freed the moment nothing uses it; only reference cycles in it would stay, so
+    App.apply_settings lets them go when it replaces the agent (its connection has some)."""
+    gc.collect()
+    gc.freeze()
+
+
 def main() -> None:
     if sys.platform == "win32":
         try:
@@ -2036,8 +2120,13 @@ def main() -> None:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MavLTE.Agent")  # own taskbar icon
         except (AttributeError, OSError):
             pass
+    # Tk's images and variables in reference cycles must be freed on Tk's own thread. Left to itself, the garbage
+    # collector may run on the agent's thread and wait there on Tk, while Tk waits on the agent (AgentRunner._call):
+    # both stuck for 30 s, telemetry included. So it runs only from App.poll(), every few seconds.
+    gc.disable()
     root = tk.Tk()
     App(root)
+    set_aside()  # before Tk runs anything queued, such as a settings dialog that will close again
     root.mainloop()
 
 

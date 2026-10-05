@@ -303,7 +303,7 @@
 
   function closeViewer() {
     $("viewer").hidden = true;
-    document.body.classList.remove("viewing");
+    document.body.classList.toggle("viewing", !$("mapview").hidden);
   }
 
   function showViewer() {
@@ -460,7 +460,7 @@
 
   function closeMap() {
     $("mapview").hidden = true;
-    document.body.classList.remove("viewing");
+    document.body.classList.toggle("viewing", !$("viewer").hidden);
   }
 
   const fingers = new Map(); // the pointers on the map: one drags it, two pinch

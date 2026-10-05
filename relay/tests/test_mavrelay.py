@@ -364,6 +364,68 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual((given.serial, given.tcp, given.udp), (None, None, "0.0.0.0:14560"))
         self.assertEqual((from_file.tcp, from_file.udp), ("127.0.0.1:5762", None))
 
+    def test_mistakes_in_the_server_config_are_named(self):
+        cases = {
+            "listen = 0.0.0.0\n": "listen: expected host:port",
+            "listen = 0.0.0.0:99999\n": "listen: expected host:port with a port from 0 to 65535",
+            "tcp_allow = relay.example.com\n": "tcp_allow: ",
+            "session_timeout = nan\n": "session_timeout: a number above 0 is needed",
+            "session_timeout = soon\n": "session_timeout: a number above 0 is needed",
+            "snapshot_days = -1\n": "snapshot_days: a number above 0 is needed",
+            f"gcs_key = {KEY_V.hex()}\n": "vehicle_key and gcs_key are the same",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "relay.ini")
+            for line, why in cases.items():
+                with open(path, "w") as f:
+                    f.write(f"[server]\nvehicle_key = {KEY_V.hex()}\n{line}gcs_key = {KEY_G.hex()}\n"
+                            if not line.startswith("gcs_key") else f"[server]\nvehicle_key = {KEY_V.hex()}\n{line}")
+                with self.assertRaises(SystemExit) as caught:
+                    mr.resolve_options(mr.build_parser().parse_args(["server", "--config", path]))
+                self.assertIn(why, str(caught.exception), line)
+
+    def test_update_config_replaces_the_file_whole(self):
+        # a full disk or a crash while writing cannot leave the keys half written
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mavrelay.ini")
+            with open(path, "w") as f:
+                f.write("[server]\nvehicle_key = 00\n")
+            os.chmod(path, 0o640)
+            with mock.patch("os.replace", side_effect=OSError("no space left on device")):
+                with self.assertRaises(OSError):
+                    mr.update_config(path, "web", {"password": "x"})
+            with open(path) as f:
+                self.assertEqual(f.read(), "[server]\nvehicle_key = 00\n")  # untouched
+            self.assertEqual(os.listdir(tmp), ["mavrelay.ini"])  # and nothing left beside it
+            mr.update_config(path, "web", {"password": "x"})
+            with open(path) as f:
+                self.assertEqual(f.read(), "[server]\nvehicle_key = 00\n\n[web]\npassword = x\n")
+            if os.name == "posix":
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o640)  # the mode it had
+            self.assertEqual(os.listdir(tmp), ["mavrelay.ini"])
+
+    def test_a_file_saved_with_a_bom_reads(self):  # as PowerShell 5.1 and older Notepad save UTF-8
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mavrelay.ini")
+            with open(path, "w", encoding="utf-8-sig") as f:
+                f.write("[gcs]\nserver = a:1\n")
+            self.assertEqual(mr.load_config(path, "gcs"), {"server": "a:1"})
+            mr.update_config(path, "gcs", {"key": "k"})
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), b"[gcs]\nserver = a:1\nkey = k\n")  # one [gcs], and the BOM gone
+
+    def test_a_broken_line_is_named_by_its_number_only(self):  # it may hold a key: not into a log or a box
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mavrelay.ini")
+            for text, why in (("[gcs]\nserver = a:1\nkey 00112233445566778899\n", "line 3 is not a 'name = value' line"),
+                              ("key = 00112233445566778899\n[gcs]\n", "line 1 comes before any [section]")):
+                with open(path, "w") as f:
+                    f.write(text)
+                with self.assertRaises(SystemExit) as caught:
+                    mr.load_config(path, "gcs")
+                self.assertIn(why, str(caught.exception))
+                self.assertNotIn("00112233", str(caught.exception))
+
     def test_tcp_allow_default_is_loopback(self):
         args = mr.build_parser().parse_args(["server", "--vehicle-key", KEY_V.hex(), "--gcs-key", KEY_G.hex()])
         port = mr.TcpGcsPort(None, mr.resolve_options(args).tcp_allow)
@@ -398,6 +460,37 @@ class UdpPlanTest(unittest.TestCase):
             self.assertTrue(mr.is_own_address(lan))
 
 
+class AgentSideTest(unittest.TestCase):
+    def test_udp_to_one_computer_takes_commands_from_that_one_only(self):
+        got = []
+        udp = mr.LocalUdp(("192.0.2.50", 14550), got.append)
+        frame = v2_frame(76, bytes(33), 1)
+        udp.datagram_received(frame, ("192.0.2.66", 50000))  # someone else on the network
+        self.assertEqual(got, [])
+        udp.datagram_received(frame, ("192.0.2.50", 14550))  # the computer it sends to
+        self.assertEqual(got, [frame])
+        listening = mr.LocalUdp(None, got.append)  # listening (UDPCl): anyone may connect, as before
+        listening.datagram_received(frame, ("192.0.2.66", 50000))
+        self.assertEqual(len(got), 2)
+
+    def test_reports_are_aged_on_the_relays_clock(self):
+        # this computer's clock 20 s ahead of the relay's: a report the relay stamped just now is live
+        client = mr.TunnelClient(mr.ROLE_GCS, KEY_G, "127.0.0.1", 1, on_data=lambda d: None)
+        client.nonce = b"n0nce-01"
+        client.server_addr = ("127.0.0.1", 1)
+        sent = []
+        client.transport = mock.Mock(sendto=lambda data, addr: sent.append(data))
+        relay_now = time.time() - 20
+        welcome = mr.encode(KEY_G, mr.WELCOME, mr.ROLE_SERVER, 77, 0,
+                            client.nonce + mr.WELCOME_TIME.pack(int(relay_now * 1000)))
+        client.datagram_received(welcome, ("127.0.0.1", 1))
+        self.assertEqual(client.session, 77)
+        self.assertAlmostEqual(client.clock_offset, -20, delta=0.5)
+        agent = mr.GcsAgent(("127.0.0.1", 1), KEY_G)
+        agent.client = client
+        self.assertAlmostEqual(agent.relay_time(), relay_now, delta=0.5)
+
+
 class VersionTest(unittest.TestCase):
     def test_one_version_for_everything(self):
         # the firmware and the PC and server side always carry the same number
@@ -430,6 +523,68 @@ class HelloReplayTest(unittest.TestCase):
 
     def welcomes_to(self, addr):
         return [p.session for p, a in self.sent if a == addr and p.type == mr.WELCOME]
+
+    def ping(self, sid, key=KEY_V, role=mr.ROLE_VEHICLE, addr=None, seq=1):
+        body = mr.PING_BODY.pack(0, mr.U16_UNKNOWN, mr.U16_UNKNOWN, mr.RSSI_UNKNOWN, mr.RAT_UNKNOWN, 0)
+        self.relay.datagram_received(mr.encode(key, mr.PING, role, sid, seq, body), addr or self.PLANE)
+
+    def test_a_hello_replayed_after_its_session_ended_gets_nothing(self):
+        self.hello(KEY_V, mr.ROLE_VEHICLE, b"plane-02", self.PLANE)
+        [sid] = self.welcomes_to(self.PLANE)
+        self.ping(sid)
+        self.relay.tick(time.monotonic() + self.relay.session_timeout + 1)  # the session ends
+        self.assertNotIn(sid, self.relay.sessions)
+        before = len(self.sent)
+        self.hello(KEY_V, mr.ROLE_VEHICLE, b"plane-02", self.ATTACKER)  # captured, replayed later
+        self.assertEqual((len(self.sent), self.relay.sessions), (before, {}))
+
+    def test_replays_from_many_networks_cannot_push_out_the_plane(self):
+        self.hello(KEY_V, mr.ROLE_VEHICLE, b"plane-03", self.PLANE)
+        [sid] = self.welcomes_to(self.PLANE)
+        for i in range(self.relay.MAX_PENDING + 50):  # captured GCS HELLOs, replayed from everywhere
+            self.hello(KEY_G, mr.ROLE_GCS, i.to_bytes(8, "big"), (f"10.{i // 256}.{i % 256}.1", 4000))
+        pending = [s for s in self.relay.sessions.values() if not s.active]
+        self.assertEqual(sum(s.role == mr.ROLE_GCS for s in pending), self.relay.MAX_PENDING)  # the oldest gave way
+        self.assertIn(sid, self.relay.sessions)  # the plane's is in a pool of its own
+        self.ping(sid)
+        self.assertIs(self.relay.vehicle, self.relay.sessions[sid])
+
+    def test_an_agent_starting_over_replaces_its_old_session(self):
+        laptop = ("198.51.100.20", 50000)
+        for n in range(3):  # its link dropped twice for over 10 s: each time a new session, from the same socket
+            self.hello(KEY_G, mr.ROLE_GCS, b"laptop0" + bytes([n]), laptop)
+            self.ping(self.welcomes_to(laptop)[-1], key=KEY_G, role=mr.ROLE_GCS, addr=laptop)
+        self.assertEqual([s.sid for s in self.relay.gcs_sessions()], [self.welcomes_to(laptop)[-1]])
+
+    def test_log_requests_cannot_use_up_the_routes(self):
+        self.hello(KEY_V, mr.ROLE_VEHICLE, b"plane-04", self.PLANE)
+        self.ping(self.welcomes_to(self.PLANE)[-1])
+        laptop = ("198.51.100.21", 50001)
+        self.hello(KEY_G, mr.ROLE_GCS, b"laptop-1", laptop)
+        sid = self.welcomes_to(laptop)[-1]
+        self.ping(sid, key=KEY_G, role=mr.ROLE_GCS, addr=laptop)
+        gcs = self.relay.sessions[sid]
+        start = time.monotonic()
+        for agent_id in range(70000):  # (before 1.8.5 the 65536th new id hung the relay)
+            body = mr.FILE_REQ_BODY.pack(agent_id & 0xFFFF, mr.FILE_OP_LIST, 0, b"")
+            self.relay.files.from_gcs(gcs, mr.FILE_REQ, body, time.monotonic())
+        self.assertLess(time.monotonic() - start, 60)
+        self.assertLessEqual(len(self.relay.files.routes), mr.FileRoutes.PER_SESSION)
+
+    def test_broken_state_files_do_not_stop_the_relay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for text in ("null", "[]", "{", '"x"'):
+                with open(os.path.join(tmp, "locator.json"), "w") as f:
+                    f.write(text)
+                with self.assertLogs(mr.slog, "WARNING"):
+                    relay = mr.RelayServer({mr.ROLE_VEHICLE: KEY_V, mr.ROLE_GCS: KEY_G}, state_dir=tmp)
+                self.assertIsNone(relay.locator.last_fix)
+            photos = os.path.join(tmp, "snapshots")
+            os.makedirs(photos)
+            for name in ("100.jpg.tmp", "101.json.tmp", "102.jpg", "103.json", "notes.txt"):  # a crash's leftovers
+                open(os.path.join(photos, name), "w").close()
+            mr.RelayServer({mr.ROLE_VEHICLE: KEY_V, mr.ROLE_GCS: KEY_G}, photo_folder=photos)
+            self.assertEqual(os.listdir(photos), ["notes.txt"])
 
     def test_replays_and_floods_do_not_block_a_new_session(self):
         self.hello(KEY_V, mr.ROLE_VEHICLE, b"plane-01", self.PLANE)

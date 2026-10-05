@@ -45,6 +45,7 @@ class FakeBoard:
         self.noise = b""  # a piece of the board's log in front of the next reply
         self.commands = []
         self.closed = False
+        self.bad_size = 0  # @SIZE answers that go out garbled
 
     def _synced(self):
         if self.broken and self.baudrate == boardusb.SLOW:  # the board went back by itself
@@ -110,6 +111,10 @@ class FakeBoard:
                 self._reply("@ERR 2 no such file")
             else:
                 size = len(self.files[name])
+                if self.bad_size:
+                    self.bad_size -= 1
+                    self._reply(f"@SIZE {name} 12x4")
+                    return
                 self.get = [name, min(offset, size), size]
                 self._reply(f"@SIZE {name} {size}")
         elif cmd == "SPEED":
@@ -153,6 +158,31 @@ class BoardLinkTest(unittest.TestCase):
 
         size = link.get(name, offset, write, lambda have, size: seen.append((have, size)), stopped)
         return bytes(got), size, seen
+
+    def test_after_a_pause_the_board_is_found_again(self):
+        # the board goes back to SLOW after 20 s without a command; a list or download after a longer look at the
+        # list found it again at either rate (1.8.5 review: before, the first one failed)
+        board = FakeBoard(files={"LOG00001.CSV": b"x" * 2000})
+        link = self.link(board)
+        self.assertEqual(board.rate, boardusb.FAST)
+        board.rate = boardusb.SLOW  # what 20 s without a command did
+        link.last_cmd -= boardusb.IDLE_BACK + 1
+        self.assertEqual(link.list()[1], 1)
+        self.assertEqual((board.rate, link.ser.baudrate), (boardusb.FAST, boardusb.FAST))
+        board.rate = boardusb.SLOW
+        link.last_cmd -= boardusb.IDLE_BACK + 1
+        self.assertEqual(self.download(link, "LOG00001.CSV")[0], b"x" * 2000)
+
+    def test_broken_answers_and_strange_names_are_passed_by(self):
+        board = FakeBoard(files={"LOG00002.CSV": b"y" * 100, "NOTES.TXT": b"z", "LOG2.CSV": b"w"})
+        link = self.link(board)
+        entries, total = link.list()
+        self.assertEqual([e[0] for e in entries], ["LOG00002.CSV"])  # only log files' names
+        board.bad_size = 2  # garbled answers to GET: asked again
+        self.assertEqual(self.download(link, "LOG00002.CSV")[0], b"y" * 100)
+        with self.assertRaises(boardusb.UsbError) as caught:
+            link.get("..\\..\\boot.ini", 0, lambda at, data: None, lambda have, size: None)
+        self.assertIn("not a log file's name", str(caught.exception))
 
     def test_hello_then_fast(self):
         board = FakeBoard(files={"LOG00001.CSV": b"x"})

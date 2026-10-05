@@ -106,11 +106,12 @@ rejected as unknown sessions.
 HELLO carries no sequence number, so a captured HELLO can be replayed. Clients use a new
 random nonce for every attempt, and the server gives one nonce at most one session: a HELLO
 whose nonce belongs to a pending session gets that session's WELCOME again (a client
-retrying), and one whose nonce belongs to an active session is ignored (a replay). When the
-capped pool of pending sessions is full, the server first drops the oldest pending session
-from the new HELLO's own IP address, so replayed HELLOs from one address cannot push out other
-clients' sessions before they can answer. WELCOME is bound to the client's current nonce and
-REJECT to the client's current session.
+retrying), and one whose nonce once started an active session is ignored, even after that
+session has ended (a replay; the server remembers the last 8192 such nonces). Pending sessions
+are kept per client role, up to 1024 each, the oldest giving way: replayed HELLOs of one role
+cannot touch the other's, and they would have to come faster than the round trip of a client
+answering its WELCOME to push its session out. WELCOME is bound to the client's current nonce
+and REJECT to the client's current session.
 
 ## Link state hints
 

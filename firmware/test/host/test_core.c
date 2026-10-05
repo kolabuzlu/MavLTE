@@ -982,6 +982,14 @@ static void test_gnss_parse(void)
     CHECK(f.fix == GNSS_FIX_NONE && f.sats == 0 && f.lat == LOCATOR_UNKNOWN_I32);
     CHECK(gnss_parse("+CGNSSINFO: 1,03,00,01,,,,,,,,,,,,", &f));
     CHECK(f.fix == GNSS_FIX_NONE && f.sats == 4);
+    /* a mode that says no fix, with a position beside it (an old one): no position (1.8.5 review) */
+    CHECK(gnss_parse("+CGNSSINFO: 1,03,00,01,41.1234567,N,28.9876543,E,011026,145023.00,128.6,0.0,,5.4,4.3,3.3", &f));
+    CHECK(f.fix == GNSS_FIX_NONE && f.lat == LOCATOR_UNKNOWN_I32 && f.sats == 4);
+    CHECK(gnss_parse("+CGNSSINFO: 0,,,,41.1234567,N,28.9876543,E,011026,145023.00,128.6,0.0,,5.4,4.3,3.3", &f));
+    CHECK(f.fix == GNSS_FIX_NONE && f.lat == LOCATOR_UNKNOWN_I32);
+    /* no position, numbers further on (DOPs): not satellites (they once made 255) */
+    CHECK(gnss_parse("+CGNSSINFO: ,,,,,,,,,,,,,99.,99.,99.", &f) && f.fix == GNSS_FIX_NONE && f.sats == 0);
+    CHECK(gnss_parse("+CGNSSINFO: 1,05,02,,,,,,,,,,,99.,99.,99.,07", &f) && f.sats == 7);
 
     /* not an answer, or garbage where the position should be */
     CHECK(!gnss_parse("ERROR", &f));
@@ -1642,6 +1650,58 @@ static void test_fileout(void)
     fileout_poll(&o, now, 60, 65536.0f);
     CHECK(c.n == 2 && c.type[0] == TUN_FILE_LIST && c.body[0][2] == FILE_NO_CARD && c.body[0][7] == 0);
     CHECK(c.type[1] == TUN_FILE_DATA && c.body[1][2] == FILE_NO_CARD);
+
+    /* a download begun at 4096, asked again from 1024, before where it began, then stopped (1.8.5 review): the
+     * bytes it sent count from 1024 (they once wrapped around to some 4 GB) */
+    c.no_card = false;
+    file_req(&o, 18, FILE_OP_GET, 4096, "LOG00045.CSV", now);
+    fileout_poll(&o, now, 60, 65536.0f);
+    file_req(&o, 18, FILE_OP_GET, 1024, "LOG00045.CSV", now + 10);
+    fileout_poll(&o, now + 10, 60, 65536.0f);
+    file_ack(&o, 18, 2048, now + 20);
+    fileout_poll(&o, now + 20, 60, 65536.0f);
+    file_req(&o, 18, FILE_OP_STOP, 0, "LOG00045.CSV", now + 30);
+    CHECK(fileout_poll(&o, now + 30, 60, 65536.0f) && !o.sending && o.last_bytes == 1024 && c.closes == c.opens);
+
+    /* the last ACK and the next GET in one pass (an agent asks for the next log at once): the first download ended
+     * complete ("sent" in the flight log, not "stopped") and its receiver hears no STOPPED (1.8.5, seen live) */
+    now += 1000;
+    file_req(&o, 19, FILE_OP_GET, 0, "LOG00044.CSV", now);
+    for (int k = 0; k < 300 && o.next < 2500; k++) {
+        now += 10;
+        fileout_poll(&o, now, 60, 65536.0f);
+        if (o.next < 2500) {
+            file_ack(&o, 19, o.next, now); /* the receiver has what was sent (the last ACK comes below) */
+        }
+    }
+    CHECK(o.sending && o.next == 2500 && o.id == 19 && !o.finished);
+    c.n = 0;
+    file_ack(&o, 19, 2500, now);
+    file_req(&o, 20, FILE_OP_GET, 0, "LOG00045.CSV", now);
+    CHECK(fileout_poll(&o, now, 60, 65536.0f) && o.sending && o.id == 20);
+    CHECK(strcmp(o.last_name, "LOG00044.CSV") == 0 && o.last_complete && o.last_bytes == 2500);
+    for (int k = 0; k < 100 && c.n == 0; k++) { /* the new download's first chunk, as its rate allows */
+        now += 10;
+        fileout_poll(&o, now, 60, 65536.0f);
+    }
+    int stopped = 0, others = 0;
+    for (int k = 0; k < c.n && k < LOG_PACKETS; k++) {
+        stopped += c.body[k][2] == FILE_STOPPED;
+        others += get16(c.body[k]) != 20;
+    }
+    CHECK(c.n >= 1 && stopped == 0 && others == 0 && u32(c.body[0] + 3) == 0);
+    /* all of it ACKed, then the same download asked again from the start: sent again, not ended at once */
+    file_ack(&o, 20, 40000, now);
+    file_req(&o, 20, FILE_OP_GET, 0, "LOG00045.CSV", now);
+    c.n = 0;
+    CHECK(!fileout_poll(&o, now, 60, 65536.0f) && o.sending && o.acked == 0 && !o.finished);
+    for (int k = 0; k < 100 && c.n == 0; k++) {
+        now += 10;
+        CHECK(!fileout_poll(&o, now, 60, 65536.0f) && o.sending);
+    }
+    CHECK(c.n >= 1 && u32(c.body[0] + 3) == 0 && get16(c.body[0]) == 20 && c.body[0][2] == FILE_OK);
+    file_req(&o, 20, FILE_OP_STOP, 0, "LOG00045.CSV", now);
+    CHECK(fileout_poll(&o, now, 60, 65536.0f) && !o.sending && c.closes == c.opens);
 }
 
 int main(void)

@@ -512,7 +512,10 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
 
 uint32_t bridge_relay_silence_ms(void)
 {
-    return now_ms() - relay_contact_ms;
+    /* the contact first: one the relay task stamps after our clock reading would make the silence wrap around to
+     * some 49 days (and the modem redial for nothing) */
+    uint32_t contact = relay_contact_ms;
+    return now_ms() - contact;
 }
 
 uint32_t bridge_relay_packets(void)
@@ -524,8 +527,8 @@ bridge_state_t bridge_state(void)
 {
     bridge_state_t state = {false, false, false};
     if (lock) {
-        uint32_t now = now_ms();
         xSemaphoreTake(lock, portMAX_DELAY);
+        uint32_t now = now_ms(); /* (under the lock: a HEARTBEAT stamped after it would look 49 days old) */
         state.relay = tun_connected(&tun);
         state.gcs = state.relay && tun.gcs_present;
         state.fc = position.heartbeat && (uint32_t)(now - position.heartbeat_ms) < LOCATOR_FC_SILENT_S * 1000;
@@ -586,8 +589,8 @@ void bridge_log_row(log_row_t *row)
     if (!lock) {
         return;
     }
-    uint32_t now = now_ms();
     xSemaphoreTake(lock, portMAX_DELAY);
+    uint32_t now = now_ms(); /* (under the lock: a reading stamped after it would look 49 days old) */
     if (clock_set) {
         row->utc = (uint32_t)time(NULL);
     }
@@ -707,6 +710,12 @@ void bridge_start(void)
     ESP_ERROR_CHECK(uart_set_pin(FC_UART, board->fc_tx_gpio, board->fc_rx_gpio, UART_PIN_NO_CHANGE,
                                  UART_PIN_NO_CHANGE));
     gpio_pullup_en((gpio_num_t)board->fc_rx_gpio); /* keep the line idle-high if the FC is unplugged */
+    /* Until the UART took it, our TX pin floated (reset, boot): the flight controller may have taken that noise
+     * for the start of a MAVLink frame and now waits for up to MAV_MAX_FRAME bytes of it, which would swallow the
+     * first messages from the GCS (seen: up to 10 parameter reads after 3 of 4 resets). Zero bytes complete such a
+     * frame, which then fails its CRC, and are ignored between frames. */
+    static const uint8_t zeros[MAV_MAX_FRAME] = {0};
+    uart_write_bytes(FC_UART, zeros, sizeof(zeros));
 
     const tun_config_t tun_config = {
         .role = TUN_ROLE_VEHICLE,

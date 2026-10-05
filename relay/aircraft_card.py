@@ -41,6 +41,8 @@ def relay(client: mr.TunnelClient, rtt: bool = True) -> Tuple[str, str]:
         ms = f" · {client.rtt_ms} ms" if rtt and client.rtt_ms != mr.U16_UNKNOWN else ""
         return GREEN, f"Connected to the relay{ms}"
     if client.hellos >= 5:
+        if getattr(client, "send_error", ""):
+            return RED, f"Cannot reach the relay ({client.send_error}): is this computer online?"
         return RED, "No answer from the relay: check server, UDP port and key"
     return AMBER, "Connecting to the relay…"
 

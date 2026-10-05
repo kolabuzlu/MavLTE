@@ -151,8 +151,9 @@ bool gnss_parse(const char *answer, gnss_fix_t *out)
             break;
         }
     }
-    /* satellites: the fields between the mode and the latitude (all of them without a fix) */
-    int last_sv = ns > 0 ? ns - 2 : count - 1;
+    /* satellites: the fields between the mode and the latitude; without a position, the four that can be
+     * satellite fields (GPS, GLONASS, BeiDou, Galileo), not the DOPs and the rest further on */
+    int last_sv = ns > 0 ? ns - 2 : (count - 1 < 4 ? count - 1 : 4);
     unsigned sats = 0;
     for (int i = 1; i <= last_sv && i < count; i++) {
         int64_t v;
@@ -166,11 +167,13 @@ bool gnss_parse(const char *answer, gnss_fix_t *out)
         (lat == 0 && lon == 0)) { /* (some firmware reports a "fix" at 0, 0) */
         return true; /* no position */
     }
+    int64_t v;
+    int64_t mode = -1;
+    if (fixed(field[0], 0, &mode) && mode < 2) {
+        return true; /* the mode says no fix: a position beside it would be an old one */
+    }
     out->lat = field[ns][0] == 'S' ? -lat : lat;
     out->lon = field[ns + 2][0] == 'W' ? -lon : lon;
-    int64_t v;
-    int64_t mode = 0;
-    fixed(field[0], 0, &mode);
     out->fix = mode == 2 ? GNSS_FIX_2D : GNSS_FIX_3D; /* a position given is at least a 2D fix */
     if (ns + 4 < count && digits(field[ns + 3], 6) && digits(field[ns + 4], 6)) { /* ddmmyy, hhmmss.s */
         const char *d = field[ns + 3], *t = field[ns + 4];

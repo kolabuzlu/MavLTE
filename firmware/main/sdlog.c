@@ -139,6 +139,18 @@ static void trouble(FRESULT fr, const char *doing)
     }
 }
 
+/* The same for a reader (a download, the list): a failed read ends that reading only, and the logger's own
+ * writes decide whether the card has failed (a glitch while downloading must not cut the flight's log). */
+static void reader_trouble(FRESULT fr, const char *doing)
+{
+    static uint32_t said_ms;
+    if ((fr == FR_DISK_ERR || fr == FR_NOT_READY || fr == FR_INT_ERR || fr == FR_NO_FILESYSTEM) &&
+        (uint32_t)(now_ms() - said_ms) > 10000) {
+        said_ms = now_ms();
+        ESP_LOGW(TAG, "the SD card failed %s (FatFs error %d)", doing, (int)fr);
+    }
+}
+
 /* Closes a file, also one on a failing card: f_close() keeps a file it cannot write open, with its buffer. */
 static void close_file(FIL *f)
 {
@@ -228,7 +240,7 @@ static void file_times(uint32_t number, uint32_t size, uint32_t *start, uint32_t
     FIL f;
     FRESULT fr = f_open(&f, path, FA_READ);
     if (fr != FR_OK) {
-        trouble(fr, "opening a log");
+        reader_trouble(fr, "opening a log");
         return;
     }
     UINT got = 0;
@@ -247,7 +259,7 @@ static void file_times(uint32_t number, uint32_t size, uint32_t *start, uint32_t
         }
     }
     close_file(&f);
-    trouble(fr, "reading a log");
+    reader_trouble(fr, "reading a log");
     if (fr == FR_OK) {
         cached[cached_next] = (times_t){number, size, *start, *end};
         cached_next = (cached_next + 1) % TIMES_CACHED;
@@ -325,8 +337,8 @@ int sdlog_list(unsigned first, file_entry_t *out, unsigned max, unsigned *total)
         }
         f_closedir(&dir);
     }
-    trouble(fr, "listing the logs");
-    bool failed = card_failed;
+    reader_trouble(fr, "listing the logs");
+    bool failed = card_failed || fr != FR_OK;
     xSemaphoreGive(card_lock);
     if (failed) {
         free(heap);
@@ -373,7 +385,7 @@ int sdlog_open(sdlog_file_t *file, const char *name, uint32_t *size)
         } else if (fr == FR_NO_FILE || fr == FR_NO_PATH) {
             status = FILE_NOT_FOUND;
         } else {
-            trouble(fr, "opening a log");
+            reader_trouble(fr, "opening a log");
         }
     }
     xSemaphoreGive(card_lock);
@@ -391,7 +403,7 @@ bool sdlog_read(sdlog_file_t *file, uint32_t offset, uint8_t *buf, size_t len)
     if (fr == FR_OK) {
         fr = f_read(&file->fil, buf, (UINT)len, &got);
     }
-    trouble(fr, "reading a log");
+    reader_trouble(fr, "reading a log");
     xSemaphoreGive(card_lock);
     return fr == FR_OK && got == len;
 }
@@ -439,6 +451,10 @@ static bool start_file(uint32_t number)
         }
         if (fr != FR_OK) {
             trouble(fr, "starting a log file");
+            if (!card_failed) {
+                ESP_LOGW(TAG, "cannot start a log file on the SD card (FatFs error %d): trying again in %d s", (int)fr,
+                         MOUNT_EVERY_MS / 1000);
+            }
             return false;
         }
         log_open = true;
@@ -457,6 +473,7 @@ static bool start_file(uint32_t number)
     }
     ESP_LOGW(TAG, "the SD card's " FOLDER " folder holds log number %d: no more fit. Make room for the flight log.",
              NUMBER_MOST);
+    card_full = true; /* no file to log to on this card: not tried again until another one is in */
     return false;
 }
 
@@ -549,6 +566,7 @@ static void sdlog_task(void *arg)
     static char happened[LOG_EVENTS_MOST + 1];
     bool first_file = true;
     uint32_t mount_at = now_ms();
+    uint32_t failed_ms = now_ms() - 2 * 60000, restart_at = now_ms();
     TickType_t wake = xTaskGetTickCount();
     for (;;) {
         xSemaphoreTake(card_lock, portMAX_DELAY);
@@ -560,14 +578,21 @@ static void sdlog_task(void *arg)
             if (!readers) { /* their files closed: a failed read ends a download */
                 xSemaphoreGive(card_lock);
                 unmount();
-                mount_at = now_ms() + MOUNT_EVERY_MS;
+                /* again at once the first time (a glitch); if it fails again within a minute, every 30 s */
+                uint32_t now = now_ms();
+                mount_at = (uint32_t)(now - failed_ms) > 60000 ? now : now + MOUNT_EVERY_MS;
+                failed_ms = now;
                 xSemaphoreTake(card_lock, portMAX_DELAY);
             }
         }
         bool look = !card && (int32_t)(now_ms() - mount_at) >= 0;
+        /* a card that works but took no log file (a full folder cluster, little memory at the 16 MB split, a file
+         * named MAVLTE): tried again every 30 s */
+        bool restart = card && !card_failed && !card_full && !log_open && (int32_t)(now_ms() - restart_at) >= 0;
         xSemaphoreGive(card_lock);
         if (look) {
             mount_at = now_ms() + MOUNT_EVERY_MS;
+            restart_at = now_ms() + MOUNT_EVERY_MS;
             if (mount()) {
                 xSemaphoreTake(card_lock, portMAX_DELAY);
                 bool started = start_card();
@@ -581,6 +606,17 @@ static void sdlog_task(void *arg)
                 }
             }
             wake = xTaskGetTickCount(); /* no catching up on the seconds that took */
+        } else if (restart) {
+            restart_at = now_ms() + MOUNT_EVERY_MS;
+            xSemaphoreTake(card_lock, portMAX_DELAY);
+            bool started = start_card();
+            xSemaphoreGive(card_lock);
+            if (started) {
+                sdlog_event(first_file ? "MavLTE " FIRMWARE_VERSION " started; the log could start only now"
+                                       : "the log goes on");
+                first_file = false;
+            }
+            wake = xTaskGetTickCount();
         }
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(1000));
         take_events(happened); /* those of a second without a log file are lost */

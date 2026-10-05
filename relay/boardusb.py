@@ -35,6 +35,8 @@ FAST = 921600
 BROKEN_MOST = 5  # lines in a row that arrive broken: the cable or port does not carry this
 HELLO_WAIT = 1.0  # s for the answer to HELLO
 SPEED_CHECK = 2.0  # the board's: after SPEED, the first command must come within this at the new rate
+IDLE_BACK = 15.0  # s without a command: the board may be back at SLOW soon (it goes after 20 s, USB_IDLE_MS)
+LOG_NAME = re.compile(r"LOG\d{5}\.CSV", re.IGNORECASE)  # the only names the board's card holds
 REPLY = re.compile(rb"@(MAVLTE|FILE|END|SIZE|D|DONE|ERR|SPEED)\b ?([^\r\n]*)")
 Entry = Tuple[str, int, int, int]  # name, bytes, start, end (unix seconds, 0: unknown)
 
@@ -68,6 +70,7 @@ class BoardLink:
         self.buf = b""
         self.version = ""
         self.card = False
+        self.last_cmd = 0.0  # when the last command went (monotonic)
 
     def open(self, fast: bool = True) -> None:
         if self.opener is not None:
@@ -118,6 +121,21 @@ class BoardLink:
             self.ser.write(text.encode("ascii") + b"\n")
         except Exception as exc:  # the cable pulled out
             raise UsbError(f"{self.port}: {exc}", fatal=True) from exc
+        self.last_cmd = time.monotonic()
+
+    def _awake(self) -> None:
+        """After a pause (the list looked at for a while, say) the board may be back at SLOW: found at either rate,
+        then at FAST again."""
+        if self.ser.baudrate == SLOW or time.monotonic() - self.last_cmd < IDLE_BACK:
+            return
+        self.buf = b""
+        try:
+            self.hello(tries=1)  # still at FAST: that keeps it there
+        except UsbError:
+            self.ser.baudrate = SLOW
+            self.buf = b""
+            self.hello()
+            self.speed(FAST)
 
     def _reply(self, until: set, timeout: float) -> Tuple[str, bytes]:
         """The next reply whose keyword is in `until`: a line with a known keyword anywhere in it (a piece of the
@@ -173,6 +191,7 @@ class BoardLink:
 
     def list(self, first: int = 0) -> Tuple[List[Entry], int]:
         """Up to 40 files, newest first, from index `first` on, and how many the card has."""
+        self._awake()
         self._send(f"MAVLTE LIST {first}")
         entries: List[Entry] = []
         while True:
@@ -183,16 +202,21 @@ class BoardLink:
             if kind == "ERR":
                 raise UsbError(self._problem(rest))
             if kind == "END":
-                return entries, int(rest.split()[0]) if rest.strip() else len(entries)
+                words = rest.split()
+                return entries, int(words[0]) if words and words[0].isdigit() else len(entries)
             words = rest.decode("ascii", "replace").split()
-            if len(words) >= 4:
+            if len(words) >= 4 and LOG_NAME.fullmatch(words[0]) and all(w.isdigit() for w in words[1:4]):
                 entries.append((words[0], int(words[1]), int(words[2]), int(words[3])))
+            # (anything else came broken, or is not a log file: passed by)
 
     def get(self, name: str, offset: int, write: Callable[[int, bytes], None], progress: Callable[[int, int], None],
             stopped: Optional[threading.Event] = None) -> int:
         """Downloads `name` from `offset` on; returns its size. A line that arrives broken (or not at all) asks again
         from where the good ones end. stopped: set to stop it (UsbError "stopped")."""
+        if not LOG_NAME.fullmatch(name):
+            raise UsbError(f"not a log file's name: {name!r}")
         size, broken = -1, 0
+        self._awake()
         while True:
             self._send(f"MAVLTE GET {name} {offset}")
             try:
@@ -201,7 +225,14 @@ class BoardLink:
                 raise UsbError("the board did not answer", fatal=True) from None
             if kind == "ERR":
                 raise UsbError(self._problem(rest))
-            size = int(rest.split()[1])
+            words = rest.split()
+            if len(words) < 2 or not words[1].isdigit():  # came broken: ask again
+                broken += 1
+                if broken > BROKEN_MOST:
+                    raise UsbError("too many broken lines: try another cable or USB port", fatal=True)
+                self.stop()
+                continue
+            size = int(words[1])
             progress(offset, size)
             while True:
                 if stopped is not None and stopped.is_set():

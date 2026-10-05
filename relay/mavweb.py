@@ -68,9 +68,10 @@ HEADERS = (
     ("X-Content-Type-Options", "nosniff"),
     ("Referrer-Policy", "no-referrer"),
     ("X-Frame-Options", "DENY"),
+    ("Strict-Transport-Security", "max-age=31536000"),  # the phone asks over HTTPS only, even for a typed http://
 )
 
-COOKIE = "mavlte"
+COOKIE = "__Host-mavlte"  # __Host-: no other site under the same parent name (sslip.io) can set or overwrite it
 SIGNED_IN_S = 180 * 86400  # a phone stays signed in this long after its last visit
 ROUNDS = 600_000  # PBKDF2-SHA256, for the password
 KEEP_PHOTOS = 200  # the newest photos kept in photo_dir
@@ -211,21 +212,27 @@ class Access:
         with self.lock:
             self._reload(now)
             wait = self._wait(who, now)
-            stored = self.password
-        if wait > 0:
-            return 429, f"Too many wrong passwords: try again in {math.ceil(wait / 60)} min"
-        with self.hashing:
-            right = check_password(password, stored)
-        with self.lock:
-            if right:
-                self.fails.pop(who, None)
-                return 204, ""
+            if wait > 0:
+                return 429, f"Too many wrong passwords: try again in {math.ceil(wait / 60)} min"
             if len(self.fails) > 1000:  # many addresses: forget the ones that have waited long enough
                 for other in list(self.fails):
                     self._wait(other, now)
+            # counted as wrong before the check, which takes a moment, and taken back if it was right: tries sent
+            # together cannot all slip past the limit while the first ones are still being checked
             self.fails.setdefault(who, deque()).append(now)
             self.all_fails.append(now)
-        return 401, "Wrong password"
+            stored = self.password
+        with self.hashing:
+            right = check_password(password, stored)
+        if not right:
+            return 401, "Wrong password"
+        with self.lock:
+            self.fails.pop(who, None)
+            try:
+                self.all_fails.remove(now)
+            except ValueError:  # gone already (more than TRIES_S ago)
+                pass
+        return 204, ""
 
 
 # ---------------------------------------------------------------------------------------------

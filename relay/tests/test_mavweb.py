@@ -123,7 +123,7 @@ class WebTest(unittest.TestCase):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         sent = dict(headers or {})
         if cookie:
-            sent["Cookie"] = f"mavlte={cookie}"
+            sent["Cookie"] = f"{mavweb.COOKIE}={cookie}"
         data = None
         if body is not None:
             data = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -181,6 +181,7 @@ class WebTest(unittest.TestCase):
         self.assertIn("script-src 'self'", r.getheader("Content-Security-Policy"))
         self.assertIn("img-src 'self' https://server.arcgisonline.com;", r.getheader("Content-Security-Policy"))
         self.assertEqual((r.getheader("X-Frame-Options"), r.getheader("X-Content-Type-Options")), ("DENY", "nosniff"))
+        self.assertEqual(r.getheader("Strict-Transport-Security"), "max-age=31536000")
         for path, ctype in (("/app.js", "text/javascript"), ("/app.css", "text/css"), ("/icon.png", "image/png"),
                             ("/manifest.webmanifest", "application/manifest+json")):
             status, r, _ = self.request("GET", path)
@@ -198,7 +199,7 @@ class WebTest(unittest.TestCase):
         status, r, _ = self.request("POST", "/api/signin", {"password": PASSWORD})
         self.assertEqual(status, 204)
         cookie = r.getheader("Set-Cookie")
-        self.assertRegex(cookie, r"^mavlte=\d+\.[0-9a-f]{64}; Max-Age=15552000; Path=/; HttpOnly; Secure; "
+        self.assertRegex(cookie, r"^__Host-mavlte=\d+\.[0-9a-f]{64}; Max-Age=15552000; Path=/; HttpOnly; Secure; "
                                  r"SameSite=Strict$")
         value = cookie.split(";")[0].split("=", 1)[1]
         s = self.state(value)
@@ -216,7 +217,7 @@ class WebTest(unittest.TestCase):
         two_days = int(time.time()) + mavweb.SIGNED_IN_S - 2 * 86400
         status, r, _ = self.request("GET", "/api/state", cookie=f"{two_days}.{access._tag(two_days).decode()}")
         self.assertEqual(status, 200)
-        self.assertTrue(r.getheader("Set-Cookie", "").startswith("mavlte="))
+        self.assertTrue(r.getheader("Set-Cookie", "").startswith("__Host-mavlte="))
 
         status, r, _ = self.request("POST", "/api/signout", {})
         self.assertEqual(status, 204)
@@ -234,6 +235,27 @@ class WebTest(unittest.TestCase):
             for who in ("192.0.2.1", "192.0.2.2"):
                 self.assertEqual(self.sign_in("guess", who=who)[0], 401)
             self.assertEqual(self.sign_in(who="198.51.100.4")[0], 429)  # many wrong ones from all over
+
+    def test_wrong_passwords_sent_together_still_wait(self):
+        # many tries at once from one address: only TRIES of them get a password check, while the first ones are
+        # still being checked (which takes a moment with the real rounds)
+        real = mavweb.check_password
+
+        def slow(password, stored):
+            time.sleep(0.3)
+            return real(password, stored)
+
+        results = []
+        with mock.patch.object(mavweb, "check_password", slow), self.assertLogs("mavrelay.web", "WARNING"):
+            threads = [threading.Thread(target=lambda: results.append(self.sign_in("guess", who="203.0.113.7")[0]))
+                       for _ in range(12)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+        self.assertEqual(sorted(results), [401] * mavweb.Access.TRIES + [429] * (12 - mavweb.Access.TRIES))
+        self.assertEqual(self.sign_in(who="198.51.100.5")[0], 204)  # the right one, from another phone
+        self.assertEqual(len(self.page.access.all_fails), mavweb.Access.TRIES)  # it counts for none
 
     def test_posts_come_from_the_page_only(self):
         cookie = self.signed_in()

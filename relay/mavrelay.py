@@ -25,18 +25,21 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
 import socket
+import stat
 import struct
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.8.4"
+__version__ = "1.8.5"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -302,6 +305,8 @@ def parse_hostport(text: str, default_host: str = "") -> Tuple[str, int]:
         host, sep, port = text.rpartition(":")
         if not sep:
             raise ValueError(f"expected host:port, got {text!r}")
+    if not port.strip().isdigit() or int(port) > 65535:
+        raise ValueError(f"expected host:port with a port from 0 to 65535, got {text!r}")
     return host or default_host, int(port)
 
 
@@ -701,7 +706,7 @@ FILE_PROBLEMS = {
 FILE_CHUNK = 1024
 FILE_LIST_MOST = 40  # entries in one FILE_LIST
 FILE_WINDOW = 32 * 1024  # bytes a sender sends beyond the receiver's last ACK
-LOG_NAME = re.compile(r"LOG\d{5}\.CSV")
+LOG_NAME = re.compile(r"LOG\d{5}\.CSV", re.IGNORECASE)  # the only names an aircraft's card holds (any case)
 LOG_SCAN = 2048  # bytes read at each end of a log file for its times: a line is at most 640
 WELCOME_TIME = struct.Struct("<Q")  # after the nonce, since 1.8.0: the relay's clock (unix milliseconds)
 
@@ -898,6 +903,15 @@ class PhotoStore:
             slog.warning("cannot use the photo folder %s (%s): photos are kept in memory only", self.folder, exc)
             self.folder = None
             return
+        present = set(names)
+        for name in names:  # what a full disk or a crash left half written: never loaded below, so never pruned
+            stem, _, ext = name.partition(".")
+            partner = {"jpg": "json", "json": "jpg"}.get(ext)
+            if stem.isdigit() and (ext in ("jpg.tmp", "json.tmp") or (partner and f"{stem}.{partner}" not in present)):
+                try:
+                    os.remove(os.path.join(self.folder, name))
+                except OSError:
+                    pass
         for name in names:
             if name.endswith(".json") and os.path.exists(os.path.join(self.folder, name[:-5] + ".jpg")):
                 try:
@@ -1110,6 +1124,8 @@ class LocatorStore:
             try:
                 with open(path, encoding="utf-8") as f:
                     meta = json.load(f)
+                if not isinstance(meta, dict):
+                    raise ValueError("not a position")
                 meta.setdefault("temp", TEMP_UNKNOWN)  # files from before 1.4.0 have none
                 self.last_fix = Position(*(int(meta[field]) for field in Position._fields))
                 slog.info("last known position of the aircraft: %s", self.last_fix.describe())
@@ -1208,6 +1224,8 @@ class FileRoutes:
     back to the agent that asked. It keeps nothing else."""
 
     FORGET = 120.0  # seconds after a request's last packet
+    MOST = 256  # routes kept at most, and per GCS session (an agent asks for one log at a time): the least
+    PER_SESSION = 16  # recently used give way, so that no agent can use up the 65535 ids
 
     def __init__(self, relay: "RelayServer") -> None:
         self.relay = relay
@@ -1255,7 +1273,12 @@ class FileRoutes:
                 self.ids.pop((sid, agent_id), None)
 
     def _new(self, sid: int, agent_id: int) -> int:
-        while True:
+        mine = [ours for ours, route in self.routes.items() if route[0] == sid]
+        if len(mine) >= self.PER_SESSION:
+            self._drop(min(mine, key=lambda ours: self.routes[ours][2]))
+        if len(self.routes) >= self.MOST:
+            self._drop(min(self.routes, key=lambda ours: self.routes[ours][2]))
+        while True:  # a free id within MOST + 1 tries
             self.last_id = self.last_id % 0xFFFF + 1
             if self.last_id not in self.routes:
                 break
@@ -1263,11 +1286,18 @@ class FileRoutes:
         self.ids[(sid, agent_id)] = self.last_id
         return self.last_id
 
+    def _drop(self, ours: int) -> None:
+        sid, agent_id, _ = self.routes.pop(ours)
+        self.ids.pop((sid, agent_id), None)
+
 
 class RelayServer(asyncio.DatagramProtocol):
     """Forwards MAVLink between the vehicle session and all GCS sessions (and plain TCP clients)."""
 
-    MAX_PENDING = 32
+    # sessions WELCOMEd but not yet confirmed by the client's first packet, per client role (the oldest give way):
+    # enough that captured HELLOs replayed from anywhere cannot push a client's out within its round trip
+    MAX_PENDING = 1024
+    USED_NONCES = 8192  # nonces that started a session, remembered: their HELLOs, replayed, get nothing
     PENDING_TIMEOUT = 15.0
     ONLINE_TIMEOUT = 3.0  # vehicle counts as online if heard within this time
     GCS_PRESENT_TIMEOUT = 5.0
@@ -1289,6 +1319,8 @@ class RelayServer(asyncio.DatagramProtocol):
         self.voice = VoiceSwitch(os.path.join(state_dir, "voice.json") if state_dir else None)
         self.files = FileRoutes(self)
         self.sessions: Dict[int, Session] = {}
+        self._pending: Dict[int, Dict[bytes, Session]] = {}  # role -> nonce -> pending session, the oldest first
+        self._used: Dict[Tuple[int, bytes], None] = {}  # (role, nonce) of sessions that became active, oldest first
         self.vehicle: Optional[Session] = None
         self.tcp: Optional[TcpGcsPort] = None
         self.transport: Optional[asyncio.DatagramTransport] = None
@@ -1435,24 +1467,23 @@ class RelayServer(asyncio.DatagramProtocol):
             return
         nonce = pkt.body[:NONCE_LEN]
         # A HELLO carries no sequence number, so a captured one can be replayed at will. Clients use a
-        # new nonce for every attempt: one nonce never gets a second session.
-        known = next((s for s in self.sessions.values() if s.role == pkt.role and s.nonce == nonce), None)
-        if known is not None:
-            if not known.active:  # the client retrying before our WELCOME reached it
-                self.transport.sendto(encode(key, WELCOME, ROLE_SERVER, known.sid, 0, self._welcome(nonce)), addr)
-            return  # else a replay of the HELLO that started an active session
-        pending = [s for s in self.sessions.values() if not s.active]
-        if len(pending) >= self.MAX_PENDING:
-            # make room among this address's own attempts first, so that one sender cannot push out
-            # everyone else's before they can answer
-            own = [s for s in pending if s.addr[0] == addr[0]]
-            del self.sessions[min(own or pending, key=lambda s: s.created).sid]
+        # new nonce for every attempt, and one nonce gets one session at most: a replay of a HELLO that
+        # started a session gets nothing, even after that session has ended.
+        if (pkt.role, nonce) in self._used:
+            return
+        pending = self._pending.setdefault(pkt.role, {})
+        known = pending.get(nonce)
+        if known is not None:  # the client retrying before our WELCOME reached it
+            self.transport.sendto(encode(key, WELCOME, ROLE_SERVER, known.sid, 0, self._welcome(nonce)), addr)
+            return
+        if len(pending) >= self.MAX_PENDING:  # the oldest of this role gives way; the other role's are untouched
+            self.sessions.pop(pending.pop(next(iter(pending))).sid, None)
         sid = 0
         while sid == 0 or sid in self.sessions:
             sid = secrets.randbits(32)
         info = pkt.body[NONCE_LEN:NONCE_LEN + INFO_MAX].decode("utf-8", "replace")
         info = "".join(c for c in info if c.isprintable())
-        self.sessions[sid] = Session(sid, pkt.role, key, addr, info, now, nonce)
+        self.sessions[sid] = pending[nonce] = Session(sid, pkt.role, key, addr, info, now, nonce)
         self.transport.sendto(encode(key, WELCOME, ROLE_SERVER, sid, 0, self._welcome(nonce)), addr)
         slog.debug("HELLO from %s %s -> session %08x", ROLE_NAMES.get(pkt.role), fmt_addr(addr), sid)
 
@@ -1463,6 +1494,10 @@ class RelayServer(asyncio.DatagramProtocol):
 
     def _activate(self, sess: Session) -> None:
         sess.active = True
+        self._pending.get(sess.role, {}).pop(sess.nonce, None)
+        self._used[(sess.role, sess.nonce)] = None
+        if len(self._used) > self.USED_NONCES:
+            del self._used[next(iter(self._used))]
         if sess.role == ROLE_VEHICLE:
             old = self.vehicle
             if old is not None and self.sessions.get(old.sid) is old:
@@ -1472,6 +1507,11 @@ class RelayServer(asyncio.DatagramProtocol):
             slog.info("%s connected%s", sess.describe(), " (new session)" if old is not None else "")
         else:
             gcs = self.gcs_sessions()
+            for old in [s for s in gcs if s is not sess and s.addr == sess.addr]:
+                # the same agent (same socket) starting over: its old session would get every packet a second time
+                del self.sessions[old.sid]
+                gcs.remove(old)
+                slog.info("%s replaced by a new session", old.describe())
             while len(gcs) > self.max_gcs:
                 victim = min((s for s in gcs if s is not sess), key=lambda s: s.last_rx)
                 del self.sessions[victim.sid]
@@ -1528,6 +1568,8 @@ class RelayServer(asyncio.DatagramProtocol):
                     self.vehicle = None
                 if sess.active:
                     slog.info("%s session expired", sess.describe())
+                elif self._pending.get(sess.role, {}).get(sess.nonce) is sess:
+                    del self._pending[sess.role][sess.nonce]
             else:
                 sess.loss.roll()
 
@@ -1685,6 +1727,10 @@ class TunnelClient(asyncio.DatagramProtocol):
         self.loss = LossMeter()
         self.nonce = b""
         self.rtt_ms = U16_UNKNOWN
+        # the relay's clock minus ours, in seconds, from its WELCOME: it stamps the aircraft's reports with its
+        # clock, so their age is reckoned on it, whatever this computer's clock says
+        self.clock_offset = 0.0
+        self.send_error = ""  # why the last datagram could not be sent ("": it went)
         self.gcs_present = True  # until the server says otherwise
         # vehicle: the server's last PONG asked for the locator voice; kept without a session, so that an
         # aircraft keeps sounding where it has no coverage
@@ -1713,7 +1759,11 @@ class TunnelClient(asyncio.DatagramProtocol):
                 now = time.monotonic()
                 if self.need_resolve and now >= self.next_resolve:
                     await self._resolve(loop)
-                self.tick(now)
+                try:  # an unexpected error must not end the session for good
+                    self.tick(now)
+                except Exception:
+                    self.log.exception("unexpected error; carrying on")
+                    await asyncio.sleep(1.0)
                 await asyncio.sleep(0.1)
         finally:
             if self.transport is not None:
@@ -1784,7 +1834,9 @@ class TunnelClient(asyncio.DatagramProtocol):
     def _sendto(self, data: bytes) -> None:
         try:
             self.transport.sendto(data, self.server_addr)
-        except OSError as exc:
+            self.send_error = ""
+        except OSError as exc:  # no network on this computer, say
+            self.send_error = exc.strerror or str(exc)
             self.log.debug("send failed: %s", exc)
 
     def ping_now(self) -> None:
@@ -1829,6 +1881,9 @@ class TunnelClient(asyncio.DatagramProtocol):
                 self.hellos = 0
                 self.last_rx = now
                 self.last_ping = now
+                if len(pkt.body) >= NONCE_LEN + WELCOME_TIME.size:  # (relays since 1.8.0)
+                    relay_ms = WELCOME_TIME.unpack_from(pkt.body, NONCE_LEN)[0]
+                    self.clock_offset = relay_ms / 1000 - time.time()
                 self._send_ping()  # activates the session on the server
                 self.connected.set()
                 self.log.info("connected to server %s (session %08x)", fmt_addr(self.server_addr), self.session)
@@ -2019,6 +2074,9 @@ class FileFetcher:
         ends the one before. False without a session."""
         if not self.client.is_connected:
             return False
+        if not LOG_NAME.fullmatch(name):
+            done(False, f"not a log file's name: {name!r}")
+            return True
         self.stop()
         now = time.monotonic()
         self.download = {"id": self._new_id(), "name": name, "next": offset, "acked": offset, "write": write,
@@ -2061,7 +2119,9 @@ class FileFetcher:
                 if at + FILE_ENTRY.size > len(body):
                     break
                 name, size, start, end = FILE_ENTRY.unpack_from(body, at)
-                entries.append((name.rstrip(b"\0").decode("ascii", "replace"), size, start, end))
+                text = name.rstrip(b"\0").decode("ascii", "replace")
+                if LOG_NAME.fullmatch(text):  # (anything else is no log file of a MavLTE board: passed by)
+                    entries.append((text, size, start, end))
             done(entries, files, "")
         elif ptype == FILE_DATA and self.download is not None and len(body) >= FILE_DATA_HEAD.size:
             d = self.download
@@ -2252,7 +2312,7 @@ class FileOutbox:
             return FILE_NO_CARD
         if LOG_NAME.fullmatch(name):
             for found in os.listdir(self.folder):
-                if found.upper() == name:
+                if found.upper() == name.upper():  # (as the board: any case)
                     try:
                         return open(os.path.join(self.folder, found), "rb")
                     except OSError:
@@ -2419,6 +2479,9 @@ class LocalUdp(asyncio.DatagramProtocol):
             self.transport = None
 
     def datagram_received(self, data: bytes, addr) -> None:
+        if self.target is not None and addr[0] != self.target[0] and not (is_loopback(addr[0])
+                                                                           and is_loopback(self.target[0])):
+            return  # sending to one computer, it takes commands from that one only, not from anyone on the network
         now = time.monotonic()
         self.last_rx = now
         if addr not in self.peers and len(self.peers) >= self.MAX_PEERS:
@@ -2616,10 +2679,14 @@ async def run_server(opts) -> None:
     while True:
         await asyncio.sleep(0.05)  # photos move in small steps; the rest once a second
         now = time.monotonic()
-        relay.photos.pump(now)
-        if now - last_tick >= 1.0:
-            last_tick = now
-            relay.tick(now)
+        try:  # whatever goes wrong here, the relay goes on forwarding (systemd would restart it, sessions lost)
+            relay.photos.pump(now)
+            if now - last_tick >= 1.0:
+                last_tick = now
+                relay.tick(now)
+        except Exception:
+            slog.exception("unexpected error in the relay's timers; carrying on")
+            await asyncio.sleep(1.0)  # not a tight loop if it keeps happening
 
 
 class StatusPrinter:
@@ -2755,12 +2822,17 @@ class GcsAgent:
 
     POSITION_LIVE = 15.0  # seconds: an older report (the relay's last known one) is history
 
+    def relay_time(self) -> float:
+        """Now on the relay's clock (unix seconds), which the aircraft's reports carry: a computer clock that runs
+        ahead must not make a live report look old."""
+        return time.time() + self.client.clock_offset
+
     def _got_position(self, pos: Position) -> None:
         old = self.position
         self.position = pos
         if pos.has_fix and (self.last_fix is None or pos.time >= self.last_fix.time):
             self.last_fix = pos
-        age = time.time() - pos.time
+        age = self.relay_time() - pos.time
         if pos.time and age >= self.POSITION_LIVE:
             glog.info("last known position of the aircraft, %s ago: %s", fmt_age(age), pos.describe())
         elif pos.fc_is_silent and not (old and old.fc_is_silent):
@@ -2790,7 +2862,7 @@ class GcsAgent:
         pos = self.last_fix
         if pos is None:
             return ""
-        age = f", {fmt_age(time.time() - pos.time)} ago" if pos.time else ""
+        age = f", {fmt_age(self.relay_time() - pos.time)} ago" if pos.time else ""
         return f"GNSS {pos.lat / 1e7:.6f}, {pos.lon / 1e7:.6f} ({pos.sats} satellites{age})"
 
     def _to_gcs(self, payload: bytes) -> None:
@@ -2890,9 +2962,13 @@ class GcsAgent:
         while True:
             await asyncio.sleep(0.1)
             now = time.monotonic()
-            if self.photos is not None:
-                self.photos.pump(now)
-            self.files.pump(now)
+            try:  # whatever goes wrong with one photo or log, the next ones still move
+                if self.photos is not None:
+                    self.photos.pump(now)
+                self.files.pump(now)
+            except Exception:
+                glog.exception("unexpected error with a photo or a log; carrying on")
+                await asyncio.sleep(1.0)
 
 
 async def run_gcs(opts) -> None:
@@ -2976,8 +3052,14 @@ def load_config(path: Optional[str], section: str) -> Dict[str, str]:
     # update_config wrote a second [gcs] after a header line with a comment on it)
     parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None, strict=False)
     try:
-        if not parser.read(path, encoding="utf-8"):
+        if not parser.read(path, encoding="utf-8-sig"):  # (-sig: a file saved with a BOM, as some editors do)
             raise SystemExit(f"cannot read config file {path}")
+    # (the line numbers, not the lines: a broken line may hold a key, which must not reach a log or a message box)
+    except configparser.MissingSectionHeaderError as exc:
+        raise SystemExit(f"cannot read config file {path}: line {exc.lineno} comes before any [section]") from None
+    except configparser.ParsingError as exc:
+        lines = ", ".join(str(n) for n, _ in exc.errors)
+        raise SystemExit(f"cannot read config file {path}: line {lines} is not a 'name = value' line") from None
     except (configparser.Error, UnicodeDecodeError) as exc:
         raise SystemExit(f"cannot read config file {path}: {exc}") from None
     return dict(parser[section]) if parser.has_section(section) else {}
@@ -2994,7 +3076,7 @@ def update_config(path: str, section: str, values: Dict[str, str], remove=()) ->
     """Sets keys in one section of an INI file (and drops those in `remove`), keeping everything else,
     comments included."""
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:  # (a BOM goes: the file is written back without one)
             lines = f.read().splitlines()
     except FileNotFoundError:
         lines = []
@@ -3024,8 +3106,28 @@ def update_config(path: str, section: str, values: Dict[str, str], remove=()) ->
     for name, value in pending.items():
         lines.insert(insert_at, f"{name} = {value}")
         insert_at += 1
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(lines) + "\n")
+    # a new file beside it, then swapped in: a full disk or a crash midway cannot leave the keys half written
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".mavrelay-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            st = None  # a new file: mkstemp's owner-only mode, fitting for keys
+        if st is not None:  # the old file's mode and, as root, its owner and group (root:mavrelay 640 on a server)
+            os.chmod(tmp, stat.S_IMODE(st.st_mode))
+            if hasattr(os, "chown") and hasattr(os, "geteuid") and os.geteuid() == 0:
+                os.chown(tmp, st.st_uid, st.st_gid)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3109,16 +3211,34 @@ def resolve_options(args: argparse.Namespace) -> argparse.Namespace:
         value = o.get(name, default)
         if value is None or str(value).lower() in ("off", "no", "none", ""):
             return None
-        return parse_hostport(str(value))
+        try:
+            return parse_hostport(str(value))
+        except ValueError as exc:
+            raise SystemExit(f"{name}: {exc}") from None
+
+    def number(name: str, default: float, zero_ok: bool = False) -> float:
+        value = o.get(name, default)
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            result = float("nan")
+        if not math.isfinite(result) or result < 0 or (result == 0 and not zero_ok):
+            raise SystemExit(f"{name}: a number above 0{' (or 0)' if zero_ok else ''} is needed, not {value!r}")
+        return result
 
     if args.role == "server":
         out.listen = endpoint("listen", "0.0.0.0:14650")
         out.vehicle_key = key("vehicle_key")
         out.gcs_key = key("gcs_key")
+        if out.vehicle_key == out.gcs_key:  # every GCS could then pose as the aircraft
+            raise SystemExit("vehicle_key and gcs_key are the same: they must differ (mavrelay.py genkey makes keys)")
         out.tcp_listen = endpoint("tcp_listen", None)
         allow = o.get("tcp_allow", "127.0.0.1/32, ::1/128")
-        out.tcp_allow = [ipaddress.ip_network(n.strip(), strict=False) for n in allow.split(",") if n.strip()]
-        out.session_timeout = float(o.get("session_timeout", 120))
+        try:
+            out.tcp_allow = [ipaddress.ip_network(n.strip(), strict=False) for n in allow.split(",") if n.strip()]
+        except ValueError as exc:
+            raise SystemExit(f"tcp_allow: {exc} (addresses or networks, such as 192.168.1.0/24)") from None
+        out.session_timeout = number("session_timeout", 120)
         # photos, the aircraft's last known position and the locator voice switch: in systemd's StateDirectory
         # (/var/lib/mavrelay) when run as the service
         home = os.environ.get("STATE_DIRECTORY") or os.path.dirname(os.path.abspath(getattr(args, "config", None)
@@ -3126,7 +3246,7 @@ def resolve_options(args: argparse.Namespace) -> argparse.Namespace:
         out.state_dir = home
         folder = str(o.get("snapshot_dir", os.path.join(home, "snapshots")))
         out.snapshot_dir = None if folder.lower() in ("off", "no", "none", "") else folder
-        out.snapshot_days = float(o.get("snapshot_days", 7))
+        out.snapshot_days = number("snapshot_days", 7)
     elif args.role == "gcs":
         out.server = endpoint("server", None)
         if out.server is None:
@@ -3134,7 +3254,7 @@ def resolve_options(args: argparse.Namespace) -> argparse.Namespace:
         out.key = key("key")
         out.udp = endpoint("udp", "127.0.0.1:14550")
         out.tcp = endpoint("tcp", "127.0.0.1:5760")
-        out.status_interval = float(o.get("status_interval", 10))
+        out.status_interval = number("status_interval", 10)
     else:
         out.server = endpoint("server", None)
         if out.server is None:
@@ -3146,7 +3266,7 @@ def resolve_options(args: argparse.Namespace) -> argparse.Namespace:
             out.serial, out.tcp, out.udp = o.get("serial"), o.get("tcp"), o.get("udp")
         if not (out.serial or out.tcp or out.udp):
             raise SystemExit("give one of --serial, --tcp or --udp")
-        out.batch_ms = float(o.get("batch_ms", 50))
+        out.batch_ms = number("batch_ms", 50, zero_ok=True)
         out.logs = o.get("logs")
         value = o.get("always_send", False)
         out.always_send = value if isinstance(value, bool) else str(value).lower() in ("1", "yes", "true", "on")

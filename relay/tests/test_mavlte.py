@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
@@ -649,6 +650,27 @@ class GuiTest(unittest.TestCase):
         self.pump(lambda: self.text(app.relay_text).startswith("No answer from the relay"), timeout=10,
                   what="no-answer message")
 
+    def test_start_up_set_aside_and_another_relay_frees_the_old_connection(self):
+        """1.8.5: the collections every 5 s skip what start-up made (set aside: some 0.2 ms instead of 7-9 ms, which
+        the agent's thread waited too); another relay or key frees the old connection, set aside with the rest, and
+        sets aside anew once it is gone."""
+        app = self.app
+        self.addCleanup(gc.unfreeze)  # (the test process goes on as before)
+        self.pump(lambda: self.text(app.relay_text).startswith("Connected to the relay"), what="connected")
+        old = weakref.ref(app.runner.agent)
+        mavlte.set_aside()
+        self.assertGreater(gc.get_freeze_count(), 0)
+        app.apply_settings(app.settings.name, app.settings.server, KEY_V.hex())  # another key: a new connection
+        self.assertEqual(gc.get_freeze_count(), 0)  # the old one is collected again
+        self.assertIsNotNone(app.set_aside_at)
+        self.pump(lambda: self.text(app.relay_text).startswith("No answer from the relay"), timeout=10,
+                  what="the new connection under way")
+        app.gc_at = app.set_aside_at = time.monotonic() - 10  # both due
+        app._poll()
+        self.assertIsNone(old())  # gone, reference cycles and all
+        self.assertGreater(gc.get_freeze_count(), 0)  # set aside anew
+        self.assertIsNone(app.set_aside_at)
+
 
 @unittest.skipUnless("mavlte" in sys.modules, "needs tkinter")
 class SettingsFileTest(unittest.TestCase):
@@ -682,6 +704,27 @@ class SettingsFileTest(unittest.TestCase):
             self.assertIsNone(mavlte.name_problem(fine), fine)
         for cut_short in ("UAV #2", "#1 UAV", "Plane ;blue"):  # the INI file would read a comment there
             self.assertIsNotNone(mavlte.name_problem(cut_short), cut_short)
+        for broken in ("Talon\nblue", "Talon\tblue"):  # pasted with a line break: the file would not read again
+            self.assertIsNotNone(mavlte.name_problem(broken), repr(broken))
+
+
+class LogCopiesTest(unittest.TestCase):
+    def test_copy_names(self):
+        self.assertEqual(mavlte.log_copy_name("LOG00012.CSV", 0), "LOG00012.csv")
+        self.assertEqual(mavlte.log_copy_name("..\\..\\x.CSV", 0), "______x.csv")  # never a path
+        self.assertTrue(mavlte.log_copy_name("LOG00012.CSV", 1790000000).endswith(" LOG00012.csv"))
+
+    def test_a_larger_copy_of_the_same_name_is_another_file(self):
+        # a card formatted since, or another board: its LOG00012.CSV must not go on at the end of the old copy
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(mavlte, "logs_folder", lambda: tmp.name):
+            with open(os.path.join(tmp.name, "LOG00012.csv"), "wb") as f:
+                f.write(b"x" * 5000)
+            path, have = mavlte.LogsWindow._copy(None, ("LOG00012.CSV", 3000, 0, 0))
+            self.assertEqual((os.path.basename(path), have), ("LOG00012 (2).csv", 0))
+            path, have = mavlte.LogsWindow._copy(None, ("LOG00012.CSV", 8000, 0, 0))  # the same one, grown
+            self.assertEqual((os.path.basename(path), have), ("LOG00012.csv", 5000))
 
     def test_a_commented_header_survives_saving(self):
         """The 1.5.2 review: "[gcs]  # ..." got a second [gcs] on saving, and MavLTE did not start again."""

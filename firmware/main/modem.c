@@ -33,6 +33,7 @@
 #define PPP_UP BIT0
 #define PPP_DOWN BIT1
 #define RELAY_SILENCE_LIMIT_MS (3 * 60 * 1000)
+#define RELAY_SILENCE_EARLY_MS (60 * 1000) /* with the network there: one redial this soon */
 #define NVS_NAMESPACE "modem"
 #define NVS_BAD_PIN "bad_pin"     /* the menuconfig SIM PIN that the SIM card rejected */
 #define NVS_SLOW_UART "slow_uart" /* 1: the modem did not answer at CONFIG_BRIDGE_MODEM_BAUD */
@@ -87,7 +88,9 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
     if (id == IP_EVENT_PPP_GOT_IP) {
         xEventGroupClearBits(events, PPP_DOWN);
         xEventGroupSetBits(events, PPP_UP);
-    } else if (id == IP_EVENT_PPP_LOST_IP) {
+    } else if (id == IP_EVENT_PPP_LOST_IP && (xEventGroupGetBits(events) & PPP_UP)) {
+        /* (only for the call that is up: ESP-IDF's lost-IP timer can post one about an earlier call, 120 s later,
+         * which would end a dial still waiting for its address) */
         xEventGroupClearBits(events, PPP_UP);
         xEventGroupSetBits(events, PPP_DOWN);
     }
@@ -229,17 +232,21 @@ static bool set_fast_baud(void)
         }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
-    /* Remembered in flash: with DIP "4G" on, a modem stuck at a rate the link cannot carry only
-     * comes back with a power cycle of the whole board, after which it must not happen again. */
+    /* Until the next power-on; remembered in flash only with DIP "4G" on: then a modem stuck at a rate the link
+     * cannot carry comes back only with a power cycle of the whole board, after which it must not happen again.
+     * With the switch off the firmware power-cycles the modem itself, and a passing failure (a brownout just
+     * after AT+IPR, say) must not slow the link for good. */
     fast_baud_failed = true;
-    nvs_handle_t nvs;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
-        nvs_set_u8(nvs, NVS_SLOW_UART, 1);
-        nvs_commit(nvs);
-        nvs_close(nvs);
+    if (!power_switchable) {
+        nvs_handle_t nvs;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+            nvs_set_u8(nvs, NVS_SLOW_UART, 1);
+            nvs_commit(nvs);
+            nvs_close(nvs);
+        }
     }
-    ESP_LOGW(TAG, "the modem does not answer at %d baud; using %d from now on (erase the flash to try again)",
-             CONFIG_BRIDGE_MODEM_BAUD, BOOT_BAUD);
+    ESP_LOGW(TAG, "the modem does not answer at %d baud; using %d %s", CONFIG_BRIDGE_MODEM_BAUD, BOOT_BAUD,
+             power_switchable ? "until the next power-on" : "from now on (erase the flash to try again)");
     esp_modem_set_baud(dce, BOOT_BAUD); /* reaches it if only its answers get lost at the fast rate */
     uart_set_baudrate(MODEM_UART, BOOT_BAUD);
     baud = BOOT_BAUD;
@@ -396,6 +403,9 @@ static bool check_sim(void)
 static bool configure(void)
 {
     char out[ESP_MODEM_C_API_STR_BUF_SIZE];
+#if CONFIG_BRIDGE_LOCATOR_VOICE
+    voice_ready = false; /* the modem may have restarted by itself since: its audio is back to its defaults */
+#endif
     esp_modem_set_echo(dce, false);
     esp_modem_at(dce, "AT+CMEE=2", out, 1000); /* readable error messages in the log */
     esp_modem_at(dce, "AT+COPS=3,0", out, 1000); /* the operator's name in AT+COPS?, not its number */
@@ -436,14 +446,17 @@ static bool configure(void)
 }
 
 /* 3GPP registration status from +CEREG (LTE) or +CGREG (2G packet data):
- * 1 = home network, 5 = roaming, 2 = searching, 3 = denied, 0 = not searching. */
+ * 1 = home network, 5 = roaming, 2 = searching, 3 = denied, 0 = not searching; -1: no answer to either. */
 static int registration(void)
 {
     static const char *const query[2][2] = {{"AT+CEREG?", "+CEREG:"}, {"AT+CGREG?", "+CGREG:"}};
     char out[ESP_MODEM_C_API_STR_BUF_SIZE];
     int result = 0;
+    bool answered = false;
     for (int i = 0; i < 2; i++) {
-        if (esp_modem_at(dce, query[i][0], out, 1000) != ESP_OK) {
+        esp_err_t err = esp_modem_at(dce, query[i][0], out, 1000);
+        answered |= err != ESP_ERR_TIMEOUT;
+        if (err != ESP_OK) {
             continue;
         }
         const char *p = strstr(out, query[i][1]);
@@ -458,7 +471,7 @@ static int registration(void)
             }
         }
     }
-    return result;
+    return answered ? result : -1;
 }
 
 static int16_t signal_dbm(void)
@@ -473,12 +486,34 @@ static int16_t signal_dbm(void)
 /* Signal, network and cell, for the relay's link status and the flight log: wherever the modem takes AT commands (in
  * command mode, and on the CMUX command channel during a data call). The operator's name goes into name
  * (ESP_MODEM_C_API_STR_BUF_SIZE bytes), its access technology into *act (-1: none). */
+/* The operator's name (n bytes) and access technology (-1: not known) from AT+COPS?: our own command, with a
+ * short timeout. esp_modem's esp_modem_get_operator_name() waits 75 s for an answer (what AT+COPS=... may take),
+ * which would hold up the whole modem task, every 5 s, with a modem that stopped answering. */
+static void operator_name(char *name, size_t n, int *act)
+{
+    name[0] = '\0';
+    *act = -1;
+    char line[64];
+    if (command("AT+COPS?\r", 2000) != ESP_OK) {
+        return;
+    }
+    const char *open = strchr(answer_field("+COPS:", line, sizeof(line)), '"'); /* 0,0,"Turkcell",7 */
+    const char *close = open ? strchr(open + 1, '"') : NULL;
+    if (!close) {
+        return; /* no operator: not registered */
+    }
+    size_t len = (size_t)(close - open - 1) < n - 1 ? (size_t)(close - open - 1) : n - 1;
+    memcpy(name, open + 1, len);
+    name[len] = '\0';
+    if (close[1] == ',' && close[2] >= '0' && close[2] <= '9') {
+        *act = atoi(close + 2);
+    }
+}
+
 static int16_t read_radio(char *name, int *act)
 {
     int16_t dbm = signal_dbm();
-    name[0] = '\0';
-    *act = -1;
-    esp_modem_get_operator_name(dce, name, act);
+    operator_name(name, ESP_MODEM_C_API_STR_BUF_SIZE, act);
     bridge_set_radio(dbm, *act >= 0 && *act < 0xFF ? (uint8_t)*act : BRIDGE_RAT_UNKNOWN);
     cell_info_t cell;
     if (command("AT+CPSI?\r", 2000) != ESP_OK || !cell_parse(answer, &cell)) {
@@ -654,13 +689,14 @@ static void voice_tick(bool usable)
     if (usable && (uint32_t)(now - voice_try_ms) >= (voice_playing ? VOICE_EVERY_MS : VOICE_RETRY_MS)) {
         voice_try_ms = now;
         if (!voice_ready) {
-            /* as tried on the A7670E-FASE: the speaker phone path and the highest volumes */
-            command("AT+CSDVC=3\r", 2000);
-            command("AT+COUTGAIN=7\r", 2000);
+            /* as tried on the A7670E-FASE: the speaker phone path and the highest volumes; tried again at the next
+             * sound unless all of them took (else it might sound on the default path, at the default volume) */
+            bool ready = command("AT+CSDVC=3\r", 2000) == ESP_OK;
+            ready = command("AT+COUTGAIN=7\r", 2000) == ESP_OK && ready;
 #if CONFIG_BRIDGE_LOCATOR_SOUND_PHRASE
-            command("AT+CTTSPARAM=2,3,0,1,1\r", 2000); /* volume, system volume, digits, pitch, speed */
+            ready = command("AT+CTTSPARAM=2,3,0,1,1\r", 2000) == ESP_OK && ready; /* volume, digits, pitch... */
 #endif
-            voice_ready = true;
+            voice_ready = ready;
         }
         voice_playing = command(voice_command(), 3000) == ESP_OK;
         if (voice_playing) {
@@ -709,10 +745,19 @@ static bool wait_registration(uint32_t timeout_ms)
 {
     uint32_t start = now_ms(), last_log = start;
     bool denied_logged = false;
+    unsigned unanswered = 0;
     while ((uint32_t)(now_ms() - start) < timeout_ms) {
         int stat = registration();
         if (stat == 1 || stat == 5) {
             return true;
+        }
+        if (stat < 0 && ++unanswered >= 3) { /* restarted, perhaps at another rate: modem_task finds it again */
+            ESP_LOGW(TAG, "the modem stopped answering while it looked for the network");
+            sdlog_event("modem does not answer");
+            return false;
+        }
+        if (stat >= 0) {
+            unanswered = 0;
         }
         if (stat == 3 && !denied_logged) {
             denied_logged = true;
@@ -768,8 +813,9 @@ static void report_radio(void)
 #if CONFIG_BRIDGE_LOCATOR
 static unsigned cmux_failures;
 
-/* The modem refused the multiplexer: after the second time in a row, data calls go without it (and
- * without GNSS readings during them), remembered in flash like the UART speed. */
+/* The modem refused the multiplexer: after the second time in a row, data calls go without it (and without GNSS
+ * readings or the locator voice during them) until the next power-on. Not remembered in flash: two passing
+ * failures (a brownout, say) must not turn the locator off for good. */
 static void cmux_failed(void)
 {
     if (++cmux_failures < 2) {
@@ -777,14 +823,9 @@ static void cmux_failed(void)
         return;
     }
     cmux_off = true;
-    nvs_handle_t nvs;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
-        nvs_set_u8(nvs, NVS_NO_CMUX, 1);
-        nvs_commit(nvs);
-        nvs_close(nvs);
-    }
-    ESP_LOGW(TAG, "the modem does not take CMUX: data calls without it from now on, so no GNSS positions during "
-                  "them (erase the flash to try again)");
+    ESP_LOGW(TAG, "the modem does not take CMUX: data calls without it until the next power-on, so no GNSS "
+                  "positions during them");
+    sdlog_event("no CMUX: no GNSS readings during data calls");
     bridge_set_gnss(NULL);
 }
 #endif
@@ -863,7 +904,10 @@ static void hard_reset(void)
     sdlog_event("modem reset");
     bool restarting = false;
     if (dce) {
-        hang_up();
+        esp_modem_dce_mode_t mode = esp_modem_get_mode(dce);
+        if (in_cmux || mode == ESP_MODEM_MODE_DATA || mode == ESP_MODEM_MODE_CMUX) {
+            hang_up(); /* (not in command mode or unknown: esp_modem would spend some 20 s on "+++" for nothing) */
+        }
         bool answers = sync_modem(3000);
         if (!answers) {
             leave_cmux(); /* still multiplexed from the data call? */
@@ -881,7 +925,7 @@ static void hard_reset(void)
     }
 }
 
-typedef enum { LINK_PPP_LOST, LINK_RELAY_SILENT } link_end_t;
+typedef enum { LINK_PPP_LOST, LINK_RELAY_SILENT, LINK_RELAY_QUIET } link_end_t;
 
 #if CONFIG_BRIDGE_LOCATOR
 /* 1e-7 degrees as text, without floating point in printf */
@@ -926,10 +970,11 @@ static void read_gnss(void)
     if (command("AT+CGNSSINFO\r", 2000) != ESP_OK || !gnss_parse(answer, &fix)) {
         return; /* the next reading, in a few seconds */
     }
-    if (fix.fix >= GNSS_FIX_2D && fix.time && fix.time == last_time) {
+    uint32_t fix_time = fix.time; /* (before gnss_clear() zeroes it: each repeat of a stale fix must be caught) */
+    if (fix.fix >= GNSS_FIX_2D && fix_time && fix_time == last_time) {
         gnss_clear(&fix); /* the same fix again, its time standing still: the GNSS has lost it */
     }
-    last_time = fix.time;
+    last_time = fix_time;
     bridge_set_gnss(&fix);
     int has_fix = fix.fix >= GNSS_FIX_2D;
     if (has_fix && !shown_raw) { /* the modem's own words, once: their form differs between firmware versions */
@@ -954,10 +999,22 @@ static void read_gnss(void)
 }
 #endif
 
+/* The network as last read (within RADIO_EVERY_MS and a little): registered with an operator, and a signal. */
+static bool network_there(void)
+{
+    xSemaphoreTake(radio_lock, portMAX_DELAY);
+    bool there = radio_ms && (uint32_t)(now_ms() - radio_ms) < 3 * RADIO_EVERY_MS &&
+                 radio_dbm != BRIDGE_RSSI_UNKNOWN && radio_operator[0];
+    xSemaphoreGive(radio_lock);
+    return there;
+}
+
+static bool early_redial_done; /* in this spell of silence from the relay */
+
 /* Watches the connection until it ends; during a CMUX call, reads the GNSS and the signal too. */
 static link_end_t stay_online(void)
 {
-    uint32_t last_radio = now_ms();
+    uint32_t last_radio = now_ms(), packets = bridge_relay_packets();
 #if CONFIG_BRIDGE_LOCATOR
     uint32_t last_gnss = now_ms() - 60000;
 #endif
@@ -967,11 +1024,25 @@ static link_end_t stay_online(void)
             ESP_LOGW(TAG, "mobile data connection lost");
             return LINK_PPP_LOST;
         }
+        if (bridge_relay_packets() != packets) { /* the relay answers: a later silence gets its early redial */
+            packets = bridge_relay_packets();
+            early_redial_done = false;
+        }
         /* PPP can stay up while nothing gets through any more; redialling usually cures it */
-        if (bridge_relay_silence_ms() > RELAY_SILENCE_LIMIT_MS) {
+        uint32_t silence = bridge_relay_silence_ms();
+        if (silence > RELAY_SILENCE_LIMIT_MS) {
             ESP_LOGW(TAG, "nothing from the relay for %d minutes; redialling", RELAY_SILENCE_LIMIT_MS / 60000);
             sdlog_event("relay silent: redialling");
             return LINK_RELAY_SILENT;
+        }
+        /* the network there (registered, a signal) and still no relay: PPP may be wedged (a dead bearer after a gap
+         * in coverage, say). One early redial; then the 3 minutes above, whose second redial resets the modem. */
+        if (!early_redial_done && silence > RELAY_SILENCE_EARLY_MS && in_cmux && network_there()) {
+            early_redial_done = true;
+            ESP_LOGW(TAG, "nothing from the relay for %" PRIu32 " s although the network is there; redialling",
+                     silence / 1000);
+            sdlog_event("relay silent with the network there: redialling");
+            return LINK_RELAY_QUIET;
         }
         voice_tick(in_cmux);
         if (!in_cmux) {
@@ -1053,10 +1124,10 @@ static void modem_task(void *arg)
         bool heard = bridge_relay_packets() != relay_packets;
         if (heard || end == LINK_PPP_LOST) {
             silent = 0;
-        } else if (++silent >= 2) { /* redialling did not help: reset the modem */
+        } else if (end == LINK_RELAY_SILENT && ++silent >= 2) { /* redialling did not help: reset the modem */
             silent = 0;
             hard_reset();
-        }
+        } /* (an early redial does not count towards a reset) */
     }
 }
 
@@ -1070,24 +1141,31 @@ void modem_start(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, on_ip_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_LOST_IP, on_ip_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, on_ppp_status, NULL));
+    power_init(); /* first: whether the firmware controls the modem's power decides about the slow UART below */
     nvs_handle_t nvs;
     uint8_t slow = 0, no_cmux = 0;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_get_u8(nvs, NVS_SLOW_UART, &slow);
         nvs_get_u8(nvs, NVS_NO_CMUX, &no_cmux);
+        /* Before 1.8.5 a failure turned CMUX (and with it the GNSS locator) off for good, and the fast UART with
+         * the modem's power under the firmware's control: forgotten, tried again */
+        if (no_cmux) {
+            nvs_erase_key(nvs, NVS_NO_CMUX);
+        }
+        if (slow && power_switchable) {
+            nvs_erase_key(nvs, NVS_SLOW_UART);
+            slow = 0;
+        }
+        nvs_commit(nvs);
         nvs_close(nvs);
     }
     if (no_cmux) {
-        cmux_off = true;
-        bridge_set_gnss(NULL);
-        ESP_LOGW(TAG, "data calls without CMUX, so no GNSS positions during them: the modem did not take it before "
-                      "(erase the flash to try again)");
+        ESP_LOGI(TAG, "an earlier failure had turned CMUX off for good: trying it again");
     }
     if (slow) {
         fast_baud_failed = true;
-        ESP_LOGW(TAG, "modem UART stays at %d baud: it did not work at %d before (erase the flash to try again)",
-                 BOOT_BAUD, CONFIG_BRIDGE_MODEM_BAUD);
+        ESP_LOGW(TAG, "modem UART stays at %d baud: it did not work at %d before, with DIP switch \"4G\" on (erase the "
+                      "flash to try again)", BOOT_BAUD, CONFIG_BRIDGE_MODEM_BAUD);
     }
-    power_init();
     xTaskCreate(modem_task, "modem", 6144, NULL, 10, NULL);
 }

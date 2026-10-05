@@ -209,6 +209,12 @@ worst to best red, yellow, purple, blue:
 At power-on it first shows each colour once, red, yellow, purple and blue, a second each (a lamp
 test), while the modem starts up.
 
+Blue proves the way *from* the flight controller (its HEARTBEATs reach the board) and the session
+with the relay; it cannot see the wire the other way, from the board's TX to the flight
+controller's RX. That one shows in Mission Planner: once it is connected, parameters download
+and commands get their answers. The LED also takes up to 10 s to leave blue after the flight
+controller or the relay falls silent.
+
 The board's other lights are not the firmware's: the blue one is power, and the red one at the
 antenna end is the modem's own network light (steady while it searches, flashing once
 registered). The red part at the top, beside the logo, is the ESP32's ceramic antenna, not a light.
@@ -451,7 +457,9 @@ days after its last visit. Add it to the home screen (browser menu → *Add to H
 opens like an app.
 
 - **A new password:** `sudo python3 /opt/mavrelay/mavweb.py password` (`--random` makes one up);
-  every phone signs in again. After 5 wrong passwords from one address in 10 minutes, it waits.
+  every phone signs in again, so it is also the way to shut out a lost phone. After 5 wrong
+  passwords from one address in 10 minutes, or 30 from all addresses together, signing in waits
+  10 minutes; phones already signed in go on as before.
 - The page is a GCS agent that only watches, like the app with both switches off, so it costs the
   aircraft no mobile data. Photos asked for on the phone also come to the MavLTE app, and the
   other way round; the page keeps the newest 200 (in `/var/lib/mavrelay/web-photos`).
@@ -652,7 +660,9 @@ missed while the app was closed) travel over your laptop's internet.
 | MavLTE says the aircraft is not connected to the relay | The ESP32 log (`pio device monitor`): SIM, network registration, APN, relay address and key. |
 | ESP32 log shows `Vehicle key is not set` | Set it in menuconfig, rebuild and flash. |
 | `the modem does not answer on its UART` | Modem power: the 5 V supply, and whether the DIP switch or firmware turns the modem on. |
-| `the modem does not answer at 921600 baud` | The board's modem link cannot carry the fast rate; the firmware stays at 115200 from then on, which is enough for telemetry. With DIP switch "4G" on, power the board off and on once. To try the fast rate again, erase the flash (`pio run -t erase`) and upload. |
+| `the modem does not answer at 921600 baud` | The board's modem link cannot carry the fast rate; the firmware stays at 115200 until the next power-on, which is enough for telemetry. With DIP switch "4G" on, it stays at 115200 for good (the firmware cannot restart the modem then): power the board off and on once, and to try the fast rate again, erase the flash (`pio run -t erase`) and upload. |
+| `the modem does not take CMUX` | Data calls go without the multiplexer until the next power-on, so no GNSS positions and no locator voice during them. It is tried again at every power-on. |
+| `relay silent with the network there: redialling` (flight log) | The modem had the network and a signal, but nothing came from the relay for a minute: the data call is redialled once (a few seconds), which cures a mobile data connection that stalled after a gap in coverage. If the relay stays silent, it redials again after 3 minutes, and the second time resets the modem. |
 | `no usable SIM card` / `needs a PIN` / `locked (PUK needed)` / `rejected the PIN` | SIM seated contacts-down; remove the PIN with a phone. If the SIM rejects the PIN from menuconfig, the firmware remembers that and does not send it again, not even after a restart, so it cannot lock your SIM. It tries again once the PIN in menuconfig changes or the SIM has been unlocked in a phone. |
 | `searching for the network (no signal yet ...)` | LTE antenna on the main connector; coverage. |
 | `the network refused registration` | The SIM is not activated or has no data plan. |
@@ -662,6 +672,7 @@ missed while the app was closed) travel over your laptop's internet.
 | Agent connects, Mission Planner shows nothing | Mission Planner's port must match `--udp` (default 14550). Check `SERIALn_PROTOCOL` and `SERIALn_BAUD`, and that TX and RX are crossed. |
 | Another computer or phone cannot connect | The MavLTE card's IP must be 0.0.0.0 ([section 5](#5-mavlte-app-and-mission-planner)); for UDP, Mission Planner there connects with UDPCl, not UDP. The first time a port listens, Windows asks whether to let MavLTE through its firewall: tick the kind of network you are on (Windows often calls a home Wi-Fi *Public*). |
 | Mission Planner connects but commands are ignored | Signing is on and this Mission Planner does not have the key. |
+| Now and then a command or parameter read gets no answer (Mission Planner asks again) | The flight controller lost it on its serial port; everything reaches its pins. In Mission Planner, *Config → MAVFtp → @SYS → uarts.txt*: the bridge's port (`SERIALn`) shows `OE` (overrun) or `NE` (noise) above 0, and no `*` after `RX`, which means it receives without DMA. A flight controller that stops for a moment then loses what arrives meanwhile. Seen here: a SpeedyBee F405 WING (ArduPlane 4.7.1) stopped for half a second every 76 s while disarmed, and about 1 message in 300 from Mission Planner was lost on its SERIAL2. A port with `RX*` avoids it; on that board the only one is SERIAL1, the RC input, best left to the receiver. |
 | MavLTE says it cannot read its settings file | A line in `mavrelay.ini` it cannot make sense of, or the file saved in an encoding other than UTF-8; the message names the line. Fix it, or delete the file (`%LOCALAPPDATA%\MavLTE\mavrelay.ini` for `MavLTE.exe`) and enter the relay and key again. |
 | Data use higher than expected | Mission Planner raised the stream rates: set the "Ignore Streamrate" option and the rates, then reboot the flight controller. |
 | `No photo: the aircraft has no camera` | DIP switch CAM on, the camera's ribbon cable seated in its connector (contacts the right way round), *Camera* on in menuconfig. The ESP32 log says why. |
