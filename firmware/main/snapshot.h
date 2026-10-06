@@ -16,8 +16,9 @@
 
 #define SNAP_CHUNK 1024
 #define SNAP_MAX_CHUNKS 256 /* photos up to 256 KB: a 1024x768 JPEG from the OV5640 is 25-80 KB */
-#define SNAP_INFO_LEN 31
+#define SNAP_INFO_LEN 32 /* (before 1.8.9: 31, without the exposure) */
 #define SNAP_SIZES 3 /* 0: 320x240, 1: 640x480, 2: 1024x768 */
+#define SNAP_EXPOSURE_MOST 3 /* exposure steps either way, darker (-) or brighter (+); 0: as the camera sets it */
 #define SNAP_UNKNOWN_I32 INT32_MIN
 #define SNAP_UNKNOWN_HEADING 0xFFFF
 #define SNAP_ACK_DONE 0x01
@@ -35,8 +36,9 @@ typedef struct {
 } snap_where_t;
 
 typedef struct {
-    /* Take a photo, width x height, and hand it over with snap_photo_taken(). NULL: no camera. */
-    void (*take)(void *ctx, uint32_t photo_id, uint16_t width, uint16_t height);
+    /* Take a photo, width x height, exposure steps brighter (or darker: negative), and hand it over with
+     * snap_photo_taken(). NULL: no camera. */
+    void (*take)(void *ctx, uint32_t photo_id, uint16_t width, uint16_t height, int8_t exposure);
     /* The photo's bytes are no longer needed: sent (sent true), or given up. */
     void (*release)(void *ctx, uint32_t photo_id, bool sent);
     void *ctx;
@@ -70,6 +72,7 @@ typedef struct {
     bool taking; /* the camera is at work */
     uint32_t taking_id;
     uint16_t taking_w, taking_h;
+    int8_t taking_exposure;
     /* the photo on its way */
     bool sending;
     uint8_t info[SNAP_INFO_LEN];

@@ -39,7 +39,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.8.8"
+__version__ = "1.8.9"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -355,6 +355,13 @@ def net_mode(bits: int) -> int:
     return bits & 0x03 if bits & 0x03 in NET_NAMES else NET_AUTO
 
 
+def exposure_steps(body: bytes, at: int) -> int:
+    """The exposure a request asks for (see EXPOSURE), at offset at of its body: 0 if it does not say, and no
+    further than the steps there are."""
+    steps = EXPOSURE.unpack_from(body, at)[0] if len(body) >= at + EXPOSURE.size else 0
+    return max(-EXPOSURE_MOST, min(EXPOSURE_MOST, steps))
+
+
 def mono_ms() -> int:
     return int(time.monotonic() * 1000) & 0xFFFFFFFF
 
@@ -443,6 +450,10 @@ class LinkStatus(NamedTuple):
 
 SNAP_REQ, SNAP_INFO, SNAP_DATA, SNAP_ACK, SNAP_SYNC = range(8, 13)
 SNAP_REQ_BODY = struct.Struct("<IB")  # photo id (0 from a GCS agent: the relay picks it), size
+# after SNAP_REQ's size, and after SNAP_INFO's time (since 1.8.9): the photo's exposure, in steps brighter (negative:
+# darker) than the camera would take it, each about 1.4 times; 0, as it would (and all a request without it asks for)
+EXPOSURE = struct.Struct("<b")
+EXPOSURE_MOST = 3
 # photo id, bytes, width, height, latitude and longitude (1e-7 degrees), altitude above home (mm),
 # heading (centidegrees), status, time (unix seconds, filled in by the relay)
 SNAP_INFO_BODY = struct.Struct("<IIHHiiiHBI")
@@ -476,13 +487,17 @@ class PhotoInfo(NamedTuple):
     heading: int = UNKNOWN_HEADING  # centidegrees
     status: int = SNAP_OK
     time: int = 0  # unix seconds
+    exposure: Optional[int] = None  # the steps it was taken with (see EXPOSURE); None: not told (before 1.8.9)
 
     def pack(self) -> bytes:
-        return SNAP_INFO_BODY.pack(*self)
+        body = SNAP_INFO_BODY.pack(*self[:-1])
+        return body if self.exposure is None else body + EXPOSURE.pack(self.exposure)
 
     @classmethod
     def unpack(cls, body: bytes) -> "PhotoInfo":
-        return cls(*SNAP_INFO_BODY.unpack_from(body))
+        exposure = (EXPOSURE.unpack_from(body, SNAP_INFO_BODY.size)[0]
+                    if len(body) >= SNAP_INFO_BODY.size + EXPOSURE.size else None)
+        return cls(*SNAP_INFO_BODY.unpack_from(body), exposure=exposure)
 
     @property
     def chunks(self) -> int:
@@ -968,7 +983,9 @@ class PhotoStore:
                 try:
                     with open(os.path.join(self.folder, name), encoding="utf-8") as f:
                         meta = json.load(f)
-                    info = PhotoInfo(*(int(meta[field]) for field in PhotoInfo._fields))
+                    exposure = meta.get("exposure")  # (none before 1.8.9)
+                    info = PhotoInfo(*(int(meta[field]) for field in PhotoInfo._fields[:-1]),
+                                     exposure=None if exposure is None else int(exposure))
                 except (OSError, ValueError, KeyError, TypeError):
                     continue
                 self.stored[info.photo_id] = info
@@ -1033,7 +1050,7 @@ class PhotoStore:
     def on_packet(self, sess: "Session", ptype: int, body: bytes, now: float) -> None:
         if sess.role == ROLE_GCS:
             if ptype == SNAP_REQ and len(body) >= SNAP_REQ_BODY.size:
-                self._request(sess, SNAP_REQ_BODY.unpack_from(body)[1], now)
+                self._request(sess, SNAP_REQ_BODY.unpack_from(body)[1], exposure_steps(body, SNAP_REQ_BODY.size), now)
             elif ptype == SNAP_SYNC and len(body) >= SNAP_SYNC_BODY.size:
                 self._sync(sess, SNAP_SYNC_BODY.unpack_from(body)[0], now)
             elif ptype == SNAP_ACK and len(body) >= SNAP_ACK_HEAD.size:
@@ -1066,7 +1083,7 @@ class PhotoStore:
     def _tell(self, sess: "Session", info: PhotoInfo) -> None:
         self.relay._send(sess, SNAP_INFO, info.pack())
 
-    def _request(self, gcs: "Session", size: int, now: float) -> None:
+    def _request(self, gcs: "Session", size: int, exposure: int, now: float) -> None:
         gcs.wants_photos = True
         photo_id = self.new_id()
         vehicle = self.relay.vehicle
@@ -1074,9 +1091,10 @@ class PhotoStore:
             self._tell(gcs, PhotoInfo(photo_id, status=SNAP_NO_AIRCRAFT, time=int(time.time())))
             return
         size = min(size, len(SNAP_SIZES) - 1)
-        self.pending[photo_id] = [size, now, now, gcs.sid]
-        self.relay._send(vehicle, SNAP_REQ, SNAP_REQ_BODY.pack(photo_id, size))
-        slog.info("%s asks for a photo (%dx%d): photo %d", gcs.describe(), *SNAP_SIZES[size], photo_id)
+        self.pending[photo_id] = [size, now, now, gcs.sid, exposure]
+        self.relay._send(vehicle, SNAP_REQ, SNAP_REQ_BODY.pack(photo_id, size) + EXPOSURE.pack(exposure))
+        slog.info("%s asks for a photo (%dx%d, exposure %+d): photo %d", gcs.describe(), *SNAP_SIZES[size], exposure,
+                  photo_id)
 
     def _sync(self, gcs: "Session", newest: int, now: float) -> None:
         gcs.wants_photos = True
@@ -1125,7 +1143,7 @@ class PhotoStore:
     def pump(self, now: float) -> None:
         vehicle = self.relay.vehicle
         for photo_id, request in list(self.pending.items()):
-            size, asked, last, gcs_id = request
+            size, asked, last, gcs_id, exposure = request
             if now - asked > self.REQUEST_FOR:
                 del self.pending[photo_id]
                 gcs = self.relay.sessions.get(gcs_id)
@@ -1133,7 +1151,7 @@ class PhotoStore:
                     self._tell(gcs, PhotoInfo(photo_id, status=SNAP_NO_ANSWER, time=int(time.time())))
             elif vehicle is not None and now - last >= self.REQUEST_EVERY:
                 request[2] = now
-                self.relay._send(vehicle, SNAP_REQ, SNAP_REQ_BODY.pack(photo_id, size))
+                self.relay._send(vehicle, SNAP_REQ, SNAP_REQ_BODY.pack(photo_id, size) + EXPOSURE.pack(exposure))
         for photo_id, receiver in list(self.incoming.items()):
             if vehicle is not None and receiver.news and (receiver.complete or now - receiver.acked_at >= 0.5):
                 receiver.news, receiver.acked_at = False, now
@@ -2088,9 +2106,11 @@ class PhotoInbox:
     def sync(self) -> None:
         self.client.send_packet(SNAP_SYNC, SNAP_SYNC_BODY.pack(self.newest()))
 
-    def request(self, size: int) -> bool:
-        """Asks for a photo (size: index into SNAP_SIZES). False while not connected to the relay."""
-        if not self.client.send_packet(SNAP_REQ, SNAP_REQ_BODY.pack(0, size)):
+    def request(self, size: int, exposure: int = 0) -> bool:
+        """Asks for a photo (size: index into SNAP_SIZES; exposure: steps brighter or darker, see EXPOSURE). False
+        while not connected to the relay."""
+        exposure = max(-EXPOSURE_MOST, min(EXPOSURE_MOST, exposure))
+        if not self.client.send_packet(SNAP_REQ, SNAP_REQ_BODY.pack(0, size) + EXPOSURE.pack(exposure)):
             return False
         self.asked_at, self.problem = time.monotonic(), ""
         return True
@@ -2348,7 +2368,8 @@ class PhotoOutbox:
             elif self.busy:
                 self._answer(photo_id, SNAP_BUSY)
             else:
-                self.answers[photo_id] = self._take(photo_id, min(size, len(SNAP_SIZES) - 1), now)
+                self.answers[photo_id] = self._take(photo_id, min(size, len(SNAP_SIZES) - 1),
+                                                    exposure_steps(body, SNAP_REQ_BODY.size), now)
                 while len(self.answers) > 16:
                     del self.answers[next(iter(self.answers))]
         elif ptype == SNAP_ACK and self.sender is not None and len(body) >= SNAP_ACK_HEAD.size:
@@ -2357,15 +2378,15 @@ class PhotoOutbox:
                 self.sender.on_ack(flags, body[SNAP_ACK_HEAD.size:], now)
 
     def _answer(self, photo_id: int, status: int) -> None:
-        self.client.send_packet(SNAP_INFO, PhotoInfo(photo_id, status=status).pack())
+        self.client.send_packet(SNAP_INFO, PhotoInfo(photo_id, status=status, exposure=0).pack())
 
-    def _take(self, photo_id: int, size: int, now: float) -> int:
+    def _take(self, photo_id: int, size: int, exposure: int, now: float) -> int:
         if self.capture is None:
             self._answer(photo_id, SNAP_NO_CAMERA)
             return SNAP_NO_CAMERA
         width, height = SNAP_SIZES[size]
         try:
-            jpeg = self.capture(width, height)
+            jpeg = self.capture(width, height, exposure)
         except Exception as exc:  # a camera fault must not take the link down with it
             vlog.warning("camera: %s", exc)
             jpeg = None
@@ -2374,10 +2395,10 @@ class PhotoOutbox:
             return SNAP_FAILED
         lat, lon, alt, heading = self.where() if self.where else (UNKNOWN_I32, UNKNOWN_I32, UNKNOWN_I32,
                                                                   UNKNOWN_HEADING)
-        info = PhotoInfo(photo_id, len(jpeg), width, height, lat, lon, alt, heading)
+        info = PhotoInfo(photo_id, len(jpeg), width, height, lat, lon, alt, heading, exposure=exposure)
         self.sender = PhotoSender(info, BytesSource(jpeg), self.client.send_packet, now)
         self.rate = RateControl(self.cap())
-        vlog.info("photo %d taken: %d KB, %dx%d", photo_id, len(jpeg) // 1024, width, height)
+        vlog.info("photo %d taken: %d KB, %dx%d, exposure %+d", photo_id, len(jpeg) // 1024, width, height, exposure)
         return SNAP_OK
 
     def pump(self, now: float) -> None:

@@ -652,16 +652,18 @@ typedef struct {
     int takes, releases;
     uint32_t take_id, release_id;
     uint16_t width, height;
+    int8_t exposure;
     bool sent;
 } camera_log_t;
 
-static void fake_take(void *ctx, uint32_t photo_id, uint16_t width, uint16_t height)
+static void fake_take(void *ctx, uint32_t photo_id, uint16_t width, uint16_t height, int8_t exposure)
 {
     camera_log_t *c = ctx;
     c->takes++;
     c->take_id = photo_id;
     c->width = width;
     c->height = height;
+    c->exposure = exposure;
 }
 
 static void fake_release(void *ctx, uint32_t photo_id, bool sent)
@@ -691,6 +693,14 @@ static void request(snap_outbox_t *o, uint32_t photo_id, uint8_t size, uint32_t 
 {
     uint8_t body[5] = {(uint8_t)photo_id, (uint8_t)(photo_id >> 8), (uint8_t)(photo_id >> 16),
                        (uint8_t)(photo_id >> 24), size};
+    snap_input(o, TUN_SNAP_REQ, body, sizeof(body), now);
+}
+
+/* ... as relays since 1.8.9 ask: with the exposure */
+static void request_exposed(snap_outbox_t *o, uint32_t photo_id, uint8_t size, int8_t exposure, uint32_t now)
+{
+    uint8_t body[6] = {(uint8_t)photo_id, (uint8_t)(photo_id >> 8), (uint8_t)(photo_id >> 16),
+                       (uint8_t)(photo_id >> 24), size, (uint8_t)exposure};
     snap_input(o, TUN_SNAP_REQ, body, sizeof(body), now);
 }
 
@@ -737,9 +747,10 @@ static void test_snapshot(void)
     snap_config_t cfg = {.take = fake_take, .release = fake_release, .ctx = &cam};
     snap_init(&o, &t, &cfg);
 
-    /* asked for a medium photo: the camera starts */
+    /* asked for a medium photo: the camera starts (a request from a relay before 1.8.9: no exposure, 0) */
+    cam.exposure = 9;
     request(&o, 1000, 1, now);
-    CHECK(cam.takes == 1 && cam.take_id == 1000 && cam.width == 640 && cam.height == 480);
+    CHECK(cam.takes == 1 && cam.take_id == 1000 && cam.width == 640 && cam.height == 480 && cam.exposure == 0);
     CHECK(snap_busy(&o) && w.n == 0);
     request(&o, 1001, 0, now); /* another one meanwhile: busy */
     CHECK(last_status(&w, 1001) == SNAP_BUSY && cam.takes == 1);
@@ -756,6 +767,7 @@ static void test_snapshot(void)
     CHECK(w.body[0][8] == (640 & 0xFF) && w.body[0][9] == 640 >> 8 && w.body[0][10] == 480 - 256);
     CHECK(u32(w.body[0] + 12) == 411234567u && u32(w.body[0] + 20) == 120000u && w.body[0][26] == SNAP_OK);
     CHECK(w.body[0][24] == (4500 & 0xFF) && w.body[0][25] == 4500 >> 8);
+    CHECK(w.body[0][31] == 0); /* the exposure it was taken with (since 1.8.9) */
     for (uint32_t ms = 100; ms <= 900; ms += 100) {
         snap_poll(&o, now + ms, 32768);
     }
@@ -827,6 +839,30 @@ static void test_snapshot(void)
     request(&o, 1005, 0, now + 73000);
     snap_photo_taken(&o, 1005, SNAP_OK, photo, (size_t)SNAP_MAX_CHUNKS * SNAP_CHUNK + 1, NULL, now + 73000);
     CHECK(last_status(&w, 1005) == SNAP_FAILED && cam.release_id == 1005 && !snap_busy(&o));
+
+    /* the exposure asked for (1.8.9): passed to the camera and told back in SNAP_INFO; beyond the steps there are,
+     * as far as they go */
+    request_exposed(&o, 3004, 2, 2, now + 74000);
+    CHECK(cam.take_id == 3004 && cam.width == 1024 && cam.exposure == 2);
+    snap_photo_taken(&o, 3004, SNAP_OK, photo, 1000, NULL, now + 74000);
+    CHECK(o.info[31] == 2);
+    ack(&o, 3004, SNAP_ACK_DONE | SNAP_ACK_HAVE_INFO, 0x01, now + 74100);
+    snap_poll(&o, now + 74100, 32768);
+    request_exposed(&o, 3005, 0, -3, now + 75000);
+    CHECK(cam.take_id == 3005 && cam.exposure == -3);
+    snap_photo_taken(&o, 3005, SNAP_OK, photo, 1000, NULL, now + 75000);
+    CHECK((int8_t)o.info[31] == -3);
+    ack(&o, 3005, SNAP_ACK_DONE | SNAP_ACK_HAVE_INFO, 0x01, now + 75100);
+    snap_poll(&o, now + 75100, 32768);
+    request_exposed(&o, 3006, 0, 100, now + 76000);
+    CHECK(cam.take_id == 3006 && cam.exposure == SNAP_EXPOSURE_MOST);
+    w.n = 0;
+    request_exposed(&o, 3007, 0, -100, now + 76000); /* busy with 3006: the answer has no exposure */
+    CHECK(last_status(&w, 3007) == SNAP_BUSY && w.n == 1 && w.body[0][31] == 0);
+    snap_photo_taken(&o, 3006, SNAP_FAILED, NULL, 0, NULL, now + 76500);
+    request_exposed(&o, 3008, 0, -100, now + 77000);
+    CHECK(cam.take_id == 3008 && cam.exposure == -SNAP_EXPOSURE_MOST);
+    snap_photo_taken(&o, 3008, SNAP_FAILED, NULL, 0, NULL, now + 77500);
 
     /* no camera at all */
     snap_config_t none = {.release = fake_release, .ctx = &cam};

@@ -168,6 +168,30 @@ main {
 .sizes button[aria-checked="true"] { background: var(--accent); color: var(--on-accent); }
 .sizes button:disabled { color: var(--dim); cursor: default; }
 .sizes button[aria-checked="true"]:disabled { background: var(--border); color: var(--muted); }
+/* the photo's exposure: darker, brighter */
+.exposure { flex: 1 1 9em; display: flex; overflow: hidden; border: 1px solid var(--border); border-radius: 6px; }
+.exposure button {
+  padding: 9px 16px;
+  border: 0;
+  background: var(--field);
+  color: var(--text);
+  font-size: 16px;
+  cursor: pointer;
+}
+.exposure button:disabled { color: var(--dim); cursor: default; }
+.exposure span {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  padding: 0 8px;
+  border-right: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+  background: var(--field);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .network { max-width: 15em; } /* the aircraft's network, beside its Link */
 .network button { padding: 6px 12px; }
 .network.pending button[aria-checked="true"] { background: var(--amber); } /* asked for, not taken yet */

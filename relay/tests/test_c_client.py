@@ -132,14 +132,14 @@ class CVehicleTest(unittest.IsolatedAsyncioTestCase):
                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await self.until(lambda: relay.vehicle is not None and agent.client.is_connected)
         await asyncio.sleep(0.5)
-        self.assertTrue(agent.photos.request(2))
+        self.assertTrue(agent.photos.request(2, exposure=-2))
         await self.until(lambda: saved or agent.photos.problem, timeout=10)
         self.assertEqual(agent.photos.problem, "")
         path, info = saved[0]
         with open(path, "rb") as f:
             self.assertEqual(f.read(), bytes((i * 13 + 7) & 0xFF for i in range(30000)))
-        self.assertEqual((info.width, info.height, info.lat, info.lon, info.alt, info.heading),
-                         (1024, 768, 411234567, 289876543, 120_000, 4500))
+        self.assertEqual((info.width, info.height, info.lat, info.lon, info.alt, info.heading, info.exposure),
+                         (1024, 768, 411234567, 289876543, 120_000, 4500, -2))
         with open(path[:-4] + ".json") as f:
             self.assertEqual(json.load(f)["latitude"], 41.1234567)
 
@@ -173,6 +173,7 @@ class CVehicleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((stats["photos"], stats["bad"]), ("1", "0"))
         err = err.decode()
         self.assertIn("harness: voice on\nharness: voice off", err)
+        self.assertIn("(1024x768, exposure -2)", err)
         self.assertLess(err.index("harness: network 0\n"), err.index("harness: photo"))  # its first PONG
         self.assertIn("harness: voice off\nharness: network 1\nharness: network 0\n", err)
 

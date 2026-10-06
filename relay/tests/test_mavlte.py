@@ -89,7 +89,9 @@ class GuiTest(unittest.TestCase):
             self.vehicle = mr.TunnelClient(mr.ROLE_VEHICLE, KEY_V, "127.0.0.1", port,
                                            on_data=self.vehicle_inbox.append)
             # its camera takes JPEG; the tests may take it away (capture None: "no camera")
-            self.outbox = outbox = mr.PhotoOutbox(self.vehicle, capture=lambda width, height: JPEG,
+            self.captured = []  # (width, height, exposure) of each photo the aircraft took
+            self.outbox = outbox = mr.PhotoOutbox(self.vehicle, capture=lambda width, height, exposure:
+                                                  self.captured.append((width, height, exposure)) or JPEG,
                                                   where=lambda: (411234567, 289876543, 120_000, 4500),
                                                   cap=lambda: 64 * 1024)
             self.vehicle.on_packet, self.vehicle.on_session = outbox.on_packet, outbox.on_session
@@ -333,7 +335,31 @@ class GuiTest(unittest.TestCase):
         self.assertEqual(app.camera.thumbnail.path, path)
         self.assertTrue(self.text(app.camera.last).startswith("Last photo "))
         self.assertIn("120 m", self.text(app.camera.last))
+        self.assertEqual(self.captured, [(320, 240, 0)])
         self.pump(lambda: app.camera.enabled, what="ready for the next")
+
+        # brighter (1.8.9): two steps up, remembered, sent with the request, and on the photo's caption
+        stepper = app.camera.exposure
+        self.assertEqual((stepper.value, self.text(stepper.label)), (0, "EV 0"))
+        stepper.step(1)
+        stepper.step(1)
+        self.assertEqual((stepper.value, self.text(stepper.label)), (2, "EV +2"))
+        self.assertEqual(self.text(app.camera.status), "EV +2: brighter than the camera would take it")
+        self.assertEqual(mavlte.Settings.load(self.config).photo_exposure, 2)
+        shown.clear()
+        app.snapshot()
+        self.pump(lambda: shown, what="the brighter photo in the viewer")
+        self.assertEqual(self.captured[-1], (320, 240, 2))
+        with open(shown[0][:-4] + ".json") as f:
+            self.assertEqual(json.load(f)["exposure"], 2)
+        self.assertTrue(self.text(app.camera.last).endswith(" · EV +2"))
+        # no further than the steps there are; the button at the end greys out
+        for _ in range(5):
+            stepper.step(1)
+        self.assertEqual((stepper.value, stepper.up.cget("fg"), stepper.down.cget("fg")), (3, mavlte.DIM, mavlte.TEXT))
+        for _ in range(9):
+            stepper.step(-1)
+        self.assertEqual((stepper.value, self.text(stepper.label), stepper.down.cget("fg")), (-3, "EV −3", mavlte.DIM))
 
     def test_snapshot_without_a_camera(self):
         app = self.app
@@ -883,6 +909,16 @@ class PhotoFilesTest(unittest.TestCase):
                                      short=True)
         self.assertEqual(short, time.strftime("%H:%M:%S", time.localtime(1790000003)))  # nothing else known
         self.assertEqual(mavlte.photo_meta(os.path.join(tmp.name, "other.jpg")), {})
+
+    def test_exposure_setting(self):
+        """1.8.9: the photo's exposure, kept in the settings: a number of steps, no further than there are."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = os.path.join(tmp.name, "mavrelay.ini")
+        for written, read in (("2", 2), ("-3", -3), ("9", 3), ("-9", -3), ("bright", 0), ("", 0)):
+            with open(config, "w") as f:
+                f.write(f"[gcs]\nphoto_exposure = {written}\n")
+            self.assertEqual(mavlte.Settings.load(config).photo_exposure, read, written)
 
     def test_photo_folder_setting(self):
         tmp = tempfile.TemporaryDirectory()

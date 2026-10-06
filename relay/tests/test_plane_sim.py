@@ -414,6 +414,18 @@ class CameraTest(unittest.TestCase):
         jpeg = plane_sim.camera_picture(320, 240, plane_sim.FcState())  # the flight controller not heard yet
         self.assertEqual(jpeg[:2], b"\xff\xd8")
 
+    def test_exposure(self):
+        """1.8.9: the exposure asked for, as the board's camera takes it: brighter up, darker down."""
+        fc = plane_sim.FcState()
+        fc.feed(fc_telemetry(0), time.monotonic())
+        means = []
+        for exposure in (-2, 0, 2):
+            with plane_sim.Image.open(io.BytesIO(plane_sim.camera_picture(320, 240, fc, exposure=exposure))) as img:
+                grey = img.convert("L").crop((0, 0, 320, 220))  # (above the caption)
+                means.append(sum(grey.getdata()) / (320 * 220))
+        self.assertLess(means[0] * 1.2, means[1])
+        self.assertLess(means[1] * 1.2, means[2])
+
 
 @unittest.skipUnless(plane_sim, "needs tkinter")
 class NetworkTest(unittest.TestCase):

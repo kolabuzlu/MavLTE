@@ -48,8 +48,8 @@ burst was lost.
 | 5    | PONG    | S → C | session / seq | `t_ms u32` (echo), `flags u8` (bit 0: a GCS is connected; to the vehicle, bit 1: sound the speaker, bits 2-3: the [network](#network)) |
 | 6    | REJECT  | S → C | the rejected session / 0 | `reason u8` (1 = unknown or expired session) |
 | 7    | STATUS  | S → GCS | session / seq | `flags u8, rat u8, rtt_ms u16, up_loss_permille u16, down_loss_permille u16, rssi_dbm i16, idle_ms u16`, then (since 1.8.7) `sinr_db i8`, then (since 1.8.8) `network u8` (flags: bit 0 vehicle online, bits 1-3 the [locator voice](#locator-voice); see [Network](#network)) |
-| 8    | SNAP_REQ  | GCS → S → V | session / seq | `photo_id u32, size u8` (see [Snapshots](#snapshots)) |
-| 9    | SNAP_INFO | V → S → GCS | session / seq | `photo_id u32, bytes u32, width u16, height u16, lat i32, lon i32, alt_mm i32, heading_cdeg u16, status u8, time u32` |
+| 8    | SNAP_REQ  | GCS → S → V | session / seq | `photo_id u32, size u8`, then (since 1.8.9) `exposure i8` (see [Snapshots](#snapshots)) |
+| 9    | SNAP_INFO | V → S → GCS | session / seq | `photo_id u32, bytes u32, width u16, height u16, lat i32, lon i32, alt_mm i32, heading_cdeg u16, status u8, time u32`, then (since 1.8.9) `exposure i8` |
 | 10   | SNAP_DATA | V → S → GCS | session / seq | `photo_id u32, chunk u16`, then the chunk (1024 bytes, the last one shorter) |
 | 11   | SNAP_ACK  | GCS → S → V | session / seq | `photo_id u32, flags u8` (bit 0: all there, bit 1: have the SNAP_INFO), then a bitmap of the chunks received |
 | 12   | SNAP_SYNC | GCS → S | session / seq | `newest_photo_id u32` |
@@ -141,7 +141,12 @@ Each leg (aircraft to relay, relay to GCS agent) carries it the same way, and ea
 acknowledges what it has.
 
 1. A GCS agent sends SNAP_REQ with `photo_id` 0 and a size: 0 = 320×240, 1 = 640×480,
-   2 = 1024×768 (larger values mean the largest). The server picks the photo id, its own unix
+   2 = 1024×768 (larger values mean the largest), and (since 1.8.9) an exposure: steps brighter
+   (negative: darker) than the camera would take it, from -3 to +3 (further means the furthest;
+   without it, 0: as the camera would). The ESP32 firmware makes each step about 1.4 times the
+   brightness its camera's automatic exposure aims for. The server passes the exposure on with its
+   own SNAP_REQ, and the vehicle tells the one it took the photo with in its SNAP_INFO (absent from
+   a vehicle before 1.8.9: not known). The server picks the photo id, its own unix
    time (and one more than the last if that is not larger), so ids grow across server restarts.
    Without an online vehicle it answers at once with SNAP_INFO status NO_AIRCRAFT; otherwise it
    passes SNAP_REQ with the id on to the vehicle, and again every 2 s until the vehicle answers.

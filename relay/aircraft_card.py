@@ -28,6 +28,21 @@ LIVE_S = 15.0  # a position report older than this (the module sends one every 5
 SIZE_NAMES = ("small", "medium", "large")  # mr.SNAP_SIZES
 # typical JPEG sizes from the aircraft's OV5640 (bright, detailed scenes: the upper end)
 SIZE_HINTS = ("320×240, about 5-10 KB", "640×480, about 10-30 KB", "1024×768, about 25-80 KB")
+# The photo's exposure (1.8.9): steps brighter (+) or darker (-) than the camera would take it, each about 1.4 times;
+# 0 as it would. Up: the ground beside a white aircraft that fills the middle (the camera exposes for it); down: a
+# bright sky or snow.
+EXPOSURE_MOST = mr.EXPOSURE_MOST
+
+
+def exposure_text(steps: int) -> str:
+    """'EV 0', 'EV +2', 'EV −1' (a minus sign)."""
+    return "EV 0" if not steps else f"EV {'+' if steps > 0 else '−'}{abs(steps)}"
+
+
+def exposure_hint(steps: int) -> str:
+    if not steps:
+        return "EV 0: as the camera sets it"
+    return f"{exposure_text(steps)}: {'brighter' if steps > 0 else 'darker'} than the camera would take it"
 
 
 class Shown(NamedTuple):
@@ -370,4 +385,7 @@ def photo_caption(meta: dict, short: bool = False, clock: bool = True) -> str:
         parts.append(f"heading {heading / 100:.0f}°")
     if not short and meta.get("width"):
         parts.append(f"{meta['width']}×{meta.get('height')}, {meta.get('size', 0) / 1024:.0f} KB")
+    exposure = meta.get("exposure")  # (none before 1.8.9)
+    if isinstance(exposure, int) and not isinstance(exposure, bool) and exposure:
+        parts.append(exposure_text(exposure))
     return " · ".join(parts)

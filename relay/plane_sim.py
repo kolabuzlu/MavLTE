@@ -57,7 +57,7 @@ import mavrelay as mr
 import sitl_demo
 
 try:
-    from PIL import Image, ImageDraw, ImageFilter
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 except ImportError:  # no camera then: the aircraft answers that it has none
     Image = None
 
@@ -285,10 +285,11 @@ class FcState:
             self.alt = self.alt_mm / 1000
 
 
-def camera_picture(width: int, height: int, fc: FcState, quality: int = CAMERA_QUALITY) -> bytes:
+def camera_picture(width: int, height: int, fc: FcState, quality: int = CAMERA_QUALITY, exposure: int = 0) -> bytes:
     """What the simulator's camera sees, looking ahead: sky, and fields that change as the plane flies
     (the same place gives the same fields), the horizon tilted as it rolls and moved as it pitches,
-    sensor noise, and a caption. A JPEG of about the size the board's camera would make."""
+    sensor noise, and a caption. A JPEG of about the size the board's camera would make. exposure: steps
+    brighter (+) or darker (-), each about 1.4 times, as the board's camera takes them."""
     known = fc.lat != mr.UNKNOWN_I32
     rng = random.Random(f"{fc.lat // 10000},{fc.lon // 10000}" if known else 0)  # 100 m squares
     big = int(math.hypot(width, height)) + 4  # drawn larger, turned by the roll, then cut to size
@@ -319,6 +320,8 @@ def camera_picture(width: int, height: int, fc: FcState, quality: int = CAMERA_Q
     img = img.crop((left, top, left + width, top + height))
     noise = Image.effect_noise((width, height), 22).convert("RGB")  # real photos are neither flat nor sharp
     img = Image.blend(img, noise, 0.12).filter(ImageFilter.GaussianBlur(0.6))
+    if exposure:
+        img = ImageEnhance.Brightness(img).enhance(1.4 ** exposure)
     caption = [time.strftime("%H:%M:%S"), "MavLTE Plane Simulator"]
     if fc.alt is not None:
         caption.insert(1, f"{fc.alt:.0f} m")
@@ -803,9 +806,10 @@ class Plane:
             return mr.RSSI_UNKNOWN, mr.RAT_UNKNOWN
         return SIGNALS[self.signal][1], rat
 
-    def _capture(self, width: int, height: int) -> bytes:
-        jpeg = camera_picture(width, height, self.fc)
-        log.info("camera: photo %d×%d, %d KB, on its way", width, height, round(len(jpeg) / 1024))
+    def _capture(self, width: int, height: int, exposure: int = 0) -> bytes:
+        jpeg = camera_picture(width, height, self.fc, exposure=exposure)
+        log.info("camera: photo %d×%d, %d KB, exposure %+d, on its way", width, height, round(len(jpeg) / 1024),
+                 exposure)
         return jpeg
 
     def _where(self) -> Tuple[int, int, int, int]:

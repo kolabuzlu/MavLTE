@@ -95,6 +95,7 @@ typedef struct {
     bool release; /* else take */
     uint32_t photo_id;
     uint16_t width, height;
+    int8_t exposure; /* steps brighter (darker: negative) than the camera would */
 } camera_job_t;
 #endif
 
@@ -202,11 +203,12 @@ static void tun_packet_cb(void *ctx, uint8_t type, const uint8_t *body, size_t l
 /* ---- snapshots (callbacks called with lock held) */
 
 #if CONFIG_BRIDGE_CAMERA
-static void snap_take_cb(void *ctx, uint32_t photo_id, uint16_t width, uint16_t height)
+static void snap_take_cb(void *ctx, uint32_t photo_id, uint16_t width, uint16_t height, int8_t exposure)
 {
-    ESP_LOGI(TAG, "photo %" PRIu32 " asked for (%ux%u)", photo_id, width, height);
-    sdlog_event("photo %" PRIu32 " asked for (%ux%u)", photo_id, width, height);
-    const camera_job_t job = {.release = false, .photo_id = photo_id, .width = width, .height = height};
+    ESP_LOGI(TAG, "photo %" PRIu32 " asked for (%ux%u, exposure %+d)", photo_id, width, height, exposure);
+    sdlog_event("photo %" PRIu32 " asked for (%ux%u, exposure %+d)", photo_id, width, height, exposure);
+    const camera_job_t job = {.release = false, .photo_id = photo_id, .width = width, .height = height,
+                              .exposure = exposure};
     if (xQueueSend(camera_jobs, &job, 0) != pdTRUE) {
         snap_photo_taken(&snap, photo_id, SNAP_FAILED, NULL, 0, NULL, now_ms());
     }
@@ -247,7 +249,7 @@ static void camera_task(void *arg)
         }
         const uint8_t *jpeg = NULL;
         size_t len = 0;
-        uint8_t status = camera_take(job.width, job.height, &jpeg, &len);
+        uint8_t status = camera_take(job.width, job.height, job.exposure, &jpeg, &len);
         uint32_t now = now_ms();
         xSemaphoreTake(lock, portMAX_DELAY);
         snap_where_t where = {SNAP_UNKNOWN_I32, SNAP_UNKNOWN_I32, SNAP_UNKNOWN_I32, SNAP_UNKNOWN_HEADING};

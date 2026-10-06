@@ -235,6 +235,22 @@ class CardTest(unittest.TestCase):
         self.assertEqual(card.photo_caption(meta, short=True, clock=False), "120 m · heading 45°")
         self.assertTrue(card.photo_caption(meta, short=True).endswith(" · 120 m · heading 45°"))
         self.assertEqual(card.photo_time({}), 0)
+        # the exposure it was taken with (1.8.9), when not as the camera would
+        meta["exposure"] = 2
+        self.assertTrue(card.photo_caption(meta, clock=False).endswith(" · 1024×768, 40 KB · EV +2"))
+        self.assertEqual(card.photo_caption(meta, short=True, clock=False), "120 m · heading 45° · EV +2")
+        meta["exposure"] = -1
+        self.assertTrue(card.photo_caption(meta, short=True, clock=False).endswith(" · EV −1"))
+        for nothing in (0, None, True, "2"):
+            meta["exposure"] = nothing
+            self.assertNotIn("EV", card.photo_caption(meta, clock=False))
+
+    def test_exposure(self):
+        self.assertEqual(card.EXPOSURE_MOST, 3)
+        self.assertEqual([card.exposure_text(s) for s in (-3, -1, 0, 2)], ["EV −3", "EV −1", "EV 0", "EV +2"])
+        self.assertEqual(card.exposure_hint(0), "EV 0: as the camera sets it")
+        self.assertEqual(card.exposure_hint(2), "EV +2: brighter than the camera would take it")
+        self.assertEqual(card.exposure_hint(-1), "EV −1: darker than the camera would take it")
 
 
 if __name__ == "__main__":

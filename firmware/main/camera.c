@@ -85,7 +85,32 @@ static esp_err_t start(framesize_t frame_size, size_t buffer)
     return err;
 }
 
-uint8_t camera_take(uint16_t width, uint16_t height, const uint8_t **jpeg, size_t *len)
+/* The exposure asked for, before the frames thrown away settle it: the brightness the camera's automatic
+ * exposure aims for, about 1.4 times brighter or darker each step. On the OV5640 its target (AEC: the average
+ * luminance, 44 by default, held within about 8 % either way, and changed faster outside twice that); others
+ * (the OV2640) by their own exposure level, as far as it goes. 0 leaves the camera as it sets itself. */
+static void set_exposure(int8_t steps)
+{
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s || steps == 0) {
+        return;
+    }
+    if (s->id.PID == OV5640_PID && s->set_reg) {
+        static const uint8_t targets[2 * SNAP_EXPOSURE_MOST + 1] = {16, 22, 31, 44, 62, 88, 124};
+        int target = targets[steps + SNAP_EXPOSURE_MOST];
+        int high = target * 27 / 25, low = target * 23 / 25;
+        int fast_high = high * 2 > 255 ? 255 : high * 2;
+        if (s->set_reg(s, 0x3a0f, 0xff, high) || s->set_reg(s, 0x3a10, 0xff, low) ||
+            s->set_reg(s, 0x3a1b, 0xff, high) || s->set_reg(s, 0x3a1e, 0xff, low) ||
+            s->set_reg(s, 0x3a11, 0xff, fast_high) || s->set_reg(s, 0x3a1f, 0xff, low / 2)) {
+            ESP_LOGW(TAG, "the camera did not take the exposure %+d", steps);
+        }
+    } else if (s->set_ae_level) {
+        s->set_ae_level(s, steps < -2 ? -2 : steps > 2 ? 2 : steps);
+    }
+}
+
+uint8_t camera_take(uint16_t width, uint16_t height, int8_t exposure, const uint8_t **jpeg, size_t *len)
 {
     camera_release();
     framesize_t frame_size;
@@ -112,6 +137,7 @@ uint8_t camera_take(uint16_t width, uint16_t height, const uint8_t **jpeg, size_
         camera_release();
         return SNAP_FAILED;
     }
+    set_exposure(exposure);
     /* the first frames after a start are too dark or too bright: throw them away */
     int64_t until = esp_timer_get_time() + SETTLE_MS * 1000LL;
     camera_fb_t *fb = NULL;
@@ -132,7 +158,8 @@ uint8_t camera_take(uint16_t width, uint16_t height, const uint8_t **jpeg, size_
     photo = fb;
     *jpeg = fb->buf;
     *len = fb->len;
-    ESP_LOGI(TAG, "photo %ux%u, %u KB", (unsigned)fb->width, (unsigned)fb->height, (unsigned)((fb->len + 512) / 1024));
+    ESP_LOGI(TAG, "photo %ux%u, %u KB, exposure %+d", (unsigned)fb->width, (unsigned)fb->height,
+             (unsigned)((fb->len + 512) / 1024), exposure);
     return SNAP_OK;
 }
 
@@ -143,6 +170,14 @@ void camera_release(void)
         photo = NULL;
     }
     if (running) {
+        /* The OV5640's outputs off before it stops (its next start, the driver's reset, turns them on again): its PCLK
+         * is on GPIO46 of V2 boards, a strapping pin, which it held high once a photo was taken, so that an upload over
+         * USB failed ("Wrong boot mode") until DIP switch CAM was off. */
+        sensor_t *s = esp_camera_sensor_get();
+        if (s && s->id.PID == OV5640_PID && s->set_reg) {
+            s->set_reg(s, 0x3017, 0xff, 0x00);
+            s->set_reg(s, 0x3018, 0xff, 0x00);
+        }
         esp_camera_deinit();
         running = false;
     }

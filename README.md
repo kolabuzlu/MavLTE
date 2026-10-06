@@ -162,8 +162,9 @@ wired to the modem and never show up on the PC.)
 
 With 4G ON the modem runs anyway, but the firmware can then only reset it by AT command, which
 does not reach a modem that has switched itself off; the log warns about it. On V2 boards the
-camera's clock line is on GPIO46, which the ESP32 reads while it starts: if flashing ever fails
-with the camera on, switch CAM off for the upload.
+camera's clock line is on GPIO46, which the ESP32 reads while it starts: since 1.8.9 the firmware
+switches the camera's outputs off once a photo is sent, so flashing works with CAM on. If it ever
+fails with "Wrong boot mode" (while a photo is on its way, say), switch CAM off for the upload.
 
 **The camera** (the OV5640 that comes with V2 boards, an OV2640 on V1 boards, on its 24-pin
 connector) is started only when a photo is asked for and stopped once it is sent, so between
@@ -416,9 +417,13 @@ server and the GCS key (later: ☰ → Settings). Both switches start off. Then:
   same switch.
 - **Snapshot**, at the bottom of the *Aircraft* panel, asks the aircraft for a photo, whatever the
   switches: pick **Small** (320×240, about 5–10 KB), **Medium** (640×480, 10–30 KB) or **Large**
-  (1024×768, 25–80 KB) beside it. The line below shows the photo arriving; it then opens in a
-  viewer with when it was taken, the position, the altitude above home and the heading (arrow
-  keys: older and newer photos). The thumbnail opens the last one again.
+  (1024×768, 25–80 KB) beside it. **− EV +** beside that sets the exposure, from EV −3 to EV +3:
+  each step about 1.4 times brighter (+) or darker (−) than the camera would take the photo,
+  EV 0 as it would. Up when the white aircraft fills the middle of the picture and the ground
+  beside it comes out dark (the camera exposes for the aircraft); down for a bright sky or snow.
+  The app keeps your choice. The line below shows the photo arriving; it then opens in a viewer
+  with when it was taken, the position, the altitude above home, the heading and the exposure
+  if not EV 0 (arrow keys: older and newer photos). The thumbnail opens the last one again.
 - Photos go to **Pictures\MavLTE** (`photo_dir` in `mavrelay.ini` to change it), named by date
   and time, each with a `.json` beside it holding the same notes. Photos taken while the app was
   closed (asked for from another laptop, say) arrive by themselves when it connects.
@@ -455,10 +460,10 @@ server itself may connect: reach it through an SSH tunnel,
 
 The app's *Aircraft* panel also comes as a web page, for when you go looking for the aircraft with
 only a phone: its link and signal, its **Network** (Auto, 2G, LTE), **Position** with **Map** and
-**Copy**, **Module**, the **Voice** switch, and **Snapshot** with the last photo (tap it for the
-whole screen, swipe for the ones before). It says what the app says, in the same colours. It runs
-on the relay server, so no laptop has to be on. Telemetry stays with Mission Planner: the page has
-none.
+**Copy**, **Module**, the **Voice** switch, and **Snapshot** with the photo size and exposure (each
+phone keeps its own) and the last photo (tap it for the whole screen, swipe for the ones before).
+It says what the app says, in the same colours. It runs on the relay server, so no laptop has to
+be on. Telemetry stays with Mission Planner: the page has none.
 
 **Map** opens the moving map on the whole screen, as in the app, with the track the page's server
 kept (the last three hours or so, also while no phone looked): drag it, pinch or **−** and **+**

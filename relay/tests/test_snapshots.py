@@ -34,6 +34,21 @@ class PhotoPartsTest(unittest.TestCase):
         self.assertEqual(mr.PhotoInfo(1).chunks, 0)
         self.assertEqual(mr.PhotoInfo.unpack(mr.PhotoInfo(7, status=mr.SNAP_BUSY).pack()).lat, mr.UNKNOWN_I32)
 
+    def test_exposure(self):
+        """1.8.9: the exposure a photo was taken with, a byte after its info's time; none before."""
+        old = mr.PhotoInfo(1790000000, 45000, 640, 480, *WHERE, mr.SNAP_OK, 1790000003)
+        self.assertIsNone(old.exposure)
+        self.assertEqual(len(old.pack()), 31)
+        for exposure in (-3, 0, 2):
+            info = old._replace(exposure=exposure)
+            self.assertEqual(len(info.pack()), 32)
+            self.assertEqual(mr.PhotoInfo.unpack(info.pack()), info)
+        self.assertIsNone(mr.PhotoInfo.unpack(old.pack()).exposure)
+        # what a request asks for: 0 without the byte, never beyond the steps there are
+        req = mr.SNAP_REQ_BODY.pack(0, 1)
+        self.assertEqual([mr.exposure_steps(req + extra, 5) for extra in (b"", b"\x02", b"\xfe", b"\x09", b"\x80")],
+                         [0, 2, -2, 3, -3])
+
     def test_largest_packets_fit(self):
         self.assertLessEqual(mr.SNAP_DATA_HEAD.size + mr.SNAP_CHUNK, mr.MAX_PAYLOAD)
         bitmap = (mr.SNAP_MAX_BYTES // mr.SNAP_CHUNK + 7) // 8
@@ -244,8 +259,8 @@ class RelayPhotoTest(unittest.TestCase):
         laptop = self.connect(mr.ROLE_GCS, self.LAPTOP)
         self.packet(mr.ROLE_GCS, laptop, self.LAPTOP, mr.SNAP_REQ, mr.SNAP_REQ_BODY.pack(0, 1))
         [req] = self.to(self.PLANE, mr.SNAP_REQ)
-        photo_id, size = mr.SNAP_REQ_BODY.unpack(req)
-        self.assertEqual(size, 1)
+        photo_id, size = mr.SNAP_REQ_BODY.unpack_from(req)
+        self.assertEqual((size, mr.exposure_steps(req, 5), len(req)), (1, 0, 6))  # (an agent before 1.8.9: 0)
         self.aircraft_sends(plane, photo_id, data)
         self.pump()
         return photo_id, plane, laptop
@@ -276,13 +291,45 @@ class RelayPhotoTest(unittest.TestCase):
         now = time.monotonic()
         self.relay.photos.pump(now + 1.0)
         self.relay.photos.pump(now + 2.5)
-        reqs = [mr.SNAP_REQ_BODY.unpack(b) for b in self.to(self.PLANE, mr.SNAP_REQ)]
+        reqs = [mr.SNAP_REQ_BODY.unpack_from(b) for b in self.to(self.PLANE, mr.SNAP_REQ)]
         self.assertEqual(len(reqs), 2)
         self.assertEqual(reqs[0], reqs[1])
         self.assertEqual(reqs[0][1], 2)  # an unknown size: the largest
         self.relay.photos.pump(now + 21.0)
         [info] = self.infos_to(self.LAPTOP)
         self.assertEqual((info.photo_id, info.status), (reqs[0][0], mr.SNAP_NO_ANSWER))
+
+    def test_exposure_asked_for_passed_on_and_kept(self):
+        """1.8.9: the exposure an agent asks for goes to the aircraft with the relay's request, and again with each
+        repeat of it; the one the photo was taken with comes back, goes to the agents and is kept with the photo."""
+        plane = self.connect(mr.ROLE_VEHICLE, self.PLANE)
+        laptop = self.connect(mr.ROLE_GCS, self.LAPTOP)
+        with self.assertLogs("mavrelay.relay", "INFO") as logs:
+            self.packet(mr.ROLE_GCS, laptop, self.LAPTOP, mr.SNAP_REQ, mr.SNAP_REQ_BODY.pack(0, 2) + b"\x09")
+        self.assertIn("(1024x768, exposure +3)", logs.output[0])  # (no further than the steps there are)
+        self.relay.photos.pump(time.monotonic() + 2.5)
+        reqs = self.to(self.PLANE, mr.SNAP_REQ)
+        self.assertEqual([(mr.SNAP_REQ_BODY.unpack_from(r)[1], mr.exposure_steps(r, 5)) for r in reqs],
+                         [(2, 3), (2, 3)])
+        photo_id = mr.SNAP_REQ_BODY.unpack_from(reqs[0])[0]
+        data = photo_bytes(3000)
+        info = mr.PhotoInfo(photo_id, len(data), 1024, 768, *WHERE, exposure=3)
+        self.packet(mr.ROLE_VEHICLE, plane, self.PLANE, mr.SNAP_INFO, info.pack())
+        for i in range(info.chunks):
+            chunk = data[i * mr.SNAP_CHUNK:(i + 1) * mr.SNAP_CHUNK]
+            self.packet(mr.ROLE_VEHICLE, plane, self.PLANE, mr.SNAP_DATA, mr.SNAP_DATA_HEAD.pack(photo_id, i) + chunk)
+        self.pump()
+        self.assertEqual(self.infos_to(self.LAPTOP)[0].exposure, 3)
+        with open(os.path.join(self.folder, f"{photo_id}.json")) as f:
+            self.assertEqual(json.load(f)["exposure"], 3)
+        self.assertEqual(self.new_relay().photos.stored[photo_id].exposure, 3)
+        # a photo kept before 1.8.9 has none
+        with open(os.path.join(self.folder, f"{photo_id}.json")) as f:
+            meta = json.load(f)
+        del meta["exposure"]
+        with open(os.path.join(self.folder, f"{photo_id}.json"), "w") as f:
+            json.dump(meta, f)
+        self.assertIsNone(self.new_relay().photos.stored[photo_id].exposure)
 
     def test_photo_is_kept_and_passed_on(self):
         data = photo_bytes(5000)
@@ -314,7 +361,7 @@ class RelayPhotoTest(unittest.TestCase):
     def test_sync_sends_what_the_agent_misses(self):
         first, plane, laptop = self.take_photo(photo_bytes(3000, seed=1))
         self.packet(mr.ROLE_GCS, laptop, self.LAPTOP, mr.SNAP_REQ, mr.SNAP_REQ_BODY.pack(0, 0))
-        second = mr.SNAP_REQ_BODY.unpack(self.to(self.PLANE, mr.SNAP_REQ)[-1])[0]
+        second = mr.SNAP_REQ_BODY.unpack_from(self.to(self.PLANE, mr.SNAP_REQ)[-1])[0]
         self.aircraft_sends(plane, second, photo_bytes(2000, seed=2))
         self.pump()
         self.assertGreater(second, first)
@@ -330,7 +377,7 @@ class RelayPhotoTest(unittest.TestCase):
         tablet = self.connect(mr.ROLE_GCS, self.TABLET)
         self.packet(mr.ROLE_GCS, tablet, self.TABLET, mr.SNAP_SYNC, mr.SNAP_SYNC_BODY.pack(0))
         self.packet(mr.ROLE_GCS, laptop, self.LAPTOP, mr.SNAP_REQ, mr.SNAP_REQ_BODY.pack(0, 1))
-        photo_id = mr.SNAP_REQ_BODY.unpack(self.to(self.PLANE, mr.SNAP_REQ)[-1])[0]
+        photo_id = mr.SNAP_REQ_BODY.unpack_from(self.to(self.PLANE, mr.SNAP_REQ)[-1])[0]
         answer = mr.PhotoInfo(photo_id, status=mr.SNAP_NO_CAMERA).pack()
         self.packet(mr.ROLE_VEHICLE, plane, self.PLANE, mr.SNAP_INFO, answer)
         self.packet(mr.ROLE_VEHICLE, plane, self.PLANE, mr.SNAP_INFO, answer)  # its answer to a repeated request
@@ -463,19 +510,20 @@ class LiveSnapshotTest(unittest.IsolatedAsyncioTestCase):
     async def test_photo_on_request(self):
         data = photo_bytes(30_000)
         sizes = []
-        plane, _ = self.aircraft(lambda w, h: sizes.append((w, h)) or data)
+        plane, _ = self.aircraft(lambda w, h, e: sizes.append((w, h, e)) or data)
         agent = self.agent("laptop")
         await self.until(lambda: plane.is_connected and agent.client.is_connected)
         await self.until(lambda: self.relay.vehicle is not None and self.relay.vehicle.last_rx > 0)
-        self.assertTrue(agent.photos.request(2))
+        self.assertTrue(agent.photos.request(2, exposure=2))
         await self.until(lambda: agent.photos_saved)
         [(path, info)] = agent.photos_saved
-        self.assertEqual(sizes, [(1024, 768)])
+        self.assertEqual((sizes, info.exposure), ([(1024, 768, 2)], 2))
         with open(path, "rb") as f:
             self.assertEqual(f.read(), data)
         with open(path[:-4] + ".json") as f:
             meta = json.load(f)
         self.assertEqual((meta["latitude"], meta["longitude"], meta["altitude_m"]), (41.1234567, 28.9876543, 120.0))
+        self.assertEqual(meta["exposure"], 2)
         self.assertEqual(os.path.basename(path), time.strftime("MavLTE_%Y-%m-%d_%H-%M-%S_", time.localtime(info.time))
                          + f"{info.photo_id}.jpg")
         self.assertEqual(agent.photos.newest(), info.photo_id)
@@ -499,7 +547,7 @@ class LiveSnapshotTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_relay_restart_in_the_middle_of_a_photo(self):
         data = photo_bytes(40_000)
-        plane, outbox = self.aircraft(lambda w, h: data, cap=8192)  # 5 s or more on the way
+        plane, outbox = self.aircraft(lambda w, h, e: data, cap=8192)  # 5 s or more on the way
         agent = self.agent("laptop")
         await self.until(lambda: plane.is_connected and agent.client.is_connected)
         await self.until(lambda: self.relay.vehicle is not None)

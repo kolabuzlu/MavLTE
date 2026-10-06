@@ -116,7 +116,7 @@ void snap_init(snap_outbox_t *o, tun_client_t *tun, const snap_config_t *cfg)
 }
 
 static void pack_info(uint8_t *out, uint32_t photo_id, uint32_t size, uint16_t width, uint16_t height,
-                      const snap_where_t *where, uint8_t status)
+                      const snap_where_t *where, uint8_t status, int8_t exposure)
 {
     put_u32(out, photo_id);
     put_u32(out + 4, size);
@@ -128,12 +128,13 @@ static void pack_info(uint8_t *out, uint32_t photo_id, uint32_t size, uint16_t w
     put_u16(out + 24, where ? where->heading : SNAP_UNKNOWN_HEADING);
     out[26] = status;
     put_u32(out + 27, 0); /* time: the relay's clock */
+    out[31] = (uint8_t)exposure; /* (since 1.8.9) */
 }
 
 static void send_status(snap_outbox_t *o, uint32_t photo_id, uint8_t status)
 {
     uint8_t body[SNAP_INFO_LEN];
-    pack_info(body, photo_id, 0, 0, 0, NULL, status);
+    pack_info(body, photo_id, 0, 0, 0, NULL, status, 0);
     tun_send_packet(o->tun, TUN_SNAP_INFO, body, sizeof(body));
 }
 
@@ -166,6 +167,9 @@ void snap_input(snap_outbox_t *o, uint8_t type, const uint8_t *body, size_t len,
     if (type == TUN_SNAP_REQ && len >= 5) {
         uint32_t photo_id = get_u32(body);
         unsigned size = body[4] < SNAP_SIZES ? body[4] : SNAP_SIZES - 1;
+        int exposure = len >= 6 ? (int8_t)body[5] : 0; /* (a relay before 1.8.9 sends none) */
+        exposure = exposure < -SNAP_EXPOSURE_MOST ? -SNAP_EXPOSURE_MOST
+                   : exposure > SNAP_EXPOSURE_MOST ? SNAP_EXPOSURE_MOST : exposure;
         int i = find_answer(o, photo_id);
         if (i >= 0) { /* asked again: our answer has not reached the relay yet */
             if (o->answer[i] != SNAP_OK) { /* (a photo's SNAP_INFO goes again by itself) */
@@ -182,7 +186,9 @@ void snap_input(snap_outbox_t *o, uint8_t type, const uint8_t *body, size_t len,
             o->taking_id = photo_id;
             o->taking_w = snap_sizes[size][0];
             o->taking_h = snap_sizes[size][1];
-            o->cfg.take(o->cfg.ctx, photo_id, o->taking_w, o->taking_h); /* may hand the photo over at once */
+            o->taking_exposure = (int8_t)exposure;
+            /* (may hand the photo over at once) */
+            o->cfg.take(o->cfg.ctx, photo_id, o->taking_w, o->taking_h, o->taking_exposure);
         }
     } else if (type == TUN_SNAP_ACK && len >= 5 && o->sending && get_u32(body) == o->photo_id) {
         uint8_t flags = body[4];
@@ -226,7 +232,7 @@ void snap_photo_taken(snap_outbox_t *o, uint32_t photo_id, uint8_t status, const
     o->data = jpeg;
     o->size = (uint32_t)len;
     o->chunks = (uint16_t)((len + SNAP_CHUNK - 1) / SNAP_CHUNK);
-    pack_info(o->info, photo_id, (uint32_t)len, o->taking_w, o->taking_h, where, SNAP_OK);
+    pack_info(o->info, photo_id, (uint32_t)len, o->taking_w, o->taking_h, where, SNAP_OK, o->taking_exposure);
     memset(o->acked, 0, sizeof(o->acked));
     memset(o->sent, 0, sizeof(o->sent));
     o->info_acked = o->info_sent = o->done = false;

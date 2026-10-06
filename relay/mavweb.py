@@ -395,19 +395,21 @@ class WebPage:
         """The aircraft's network (mr.NET_*); False while there is no session with the relay."""
         return self.call(lambda: self.agent.set_network(mode))
 
-    def snapshot(self, size: int) -> Optional[str]:
-        """Asks the aircraft for a photo; None, or why not (as the card says it)."""
+    def snapshot(self, size: int, exposure: int = 0) -> Optional[str]:
+        """Asks the aircraft for a photo (exposure: steps brighter or darker, aircraft_card.EXPOSURE_MOST); None, or
+        why not (as the card says it)."""
         def go() -> Optional[str]:
             agent = self.agent
             status = agent.vehicle_status() if agent.client.session else None
             camera = aircraft_card.camera(agent, aircraft_card.is_online(status), size, time.monotonic())
             if not camera.ready:
                 return camera.text
-            return None if agent.photos.request(size) else "Not connected to the relay"
+            return None if agent.photos.request(size, exposure) else "Not connected to the relay"
 
         problem = self.call(go)
         if problem is None:
-            wlog.info("asking the aircraft for a photo (%s, %d×%d)", aircraft_card.SIZE_NAMES[size], *mr.SNAP_SIZES[size])
+            wlog.info("asking the aircraft for a photo (%s, %d×%d, %s)", aircraft_card.SIZE_NAMES[size],
+                      *mr.SNAP_SIZES[size], aircraft_card.exposure_text(exposure))
         return problem
 
 
@@ -583,10 +585,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json(503, {"error": "Not connected to the relay"})
             wlog.info("the aircraft's network chosen on the page: %s, from %s", mr.NET_NAMES[mode], self.who())
             return self.send_json(200, {"ok": True})
-        size = data.get("size")
-        if isinstance(size, bool) or size not in (0, 1, 2):
+        size, exposure = data.get("size"), data.get("exposure", 0)  # (a page before 1.8.9 sends no exposure)
+        if isinstance(size, bool) or size not in (0, 1, 2) or isinstance(exposure, bool) or not isinstance(exposure, int) \
+                or abs(exposure) > aircraft_card.EXPOSURE_MOST:
             return self.send_json(400, {"error": "Bad request"})
-        problem = self.page.snapshot(size)
+        problem = self.page.snapshot(size, exposure)
         if problem:
             return self.send_json(409, {"error": problem})
         self.send_json(200, {"ok": True})

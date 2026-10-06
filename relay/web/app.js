@@ -13,6 +13,13 @@
     if (saved === "0" || saved === "1" || saved === "2") size = Number(saved);
   } catch (e) { /* private window: Medium */ }
 
+  const EXPOSURE_MOST = 3; // aircraft_card.EXPOSURE_MOST
+  let exposure = 0; // the photo's exposure chosen on this phone: steps darker (-) or brighter (+)
+  try {
+    const saved = Number(localStorage.getItem("mavlte.exposure"));
+    if (Number.isInteger(saved) && Math.abs(saved) <= EXPOSURE_MOST) exposure = saved;
+  } catch (e) { /* private window: 0 */ }
+
   let state = null; // the newest card from the server
   let timer = 0;
   let failures = 0;
@@ -104,6 +111,7 @@
     if (cam.fraction !== null) $("progress-bar").style.width = Math.min(100, cam.fraction * 100).toFixed(1) + "%";
     $("snapshot").disabled = !cam.ready;
     for (const b of $("sizes").children) b.disabled = cam.busy;
+    paintExposure(cam.busy);
     showPhoto(s.photo);
   }
 
@@ -127,6 +135,12 @@
     } else if (!$("viewer").hidden && at === 0) { // the viewer was on the newest: it stays on the newest
       openViewer(p.id);
     }
+  }
+
+  function paintExposure(busy) {
+    $("ev").textContent = exposure === 0 ? "EV 0" : "EV " + (exposure > 0 ? "+" : "−") + Math.abs(exposure);
+    $("ev-down").disabled = busy || exposure <= -EXPOSURE_MOST;
+    $("ev-up").disabled = busy || exposure >= EXPOSURE_MOST;
   }
 
   function paintSizes() {
@@ -270,7 +284,7 @@
   $("snapshot").addEventListener("click", async () => {
     $("snapshot").disabled = true;
     try {
-      const r = await api("/api/snapshot", { size });
+      const r = await api("/api/snapshot", { size, exposure });
       if (r.status === 401) return showSignin();
       if (r.ok) clickedAt = Date.now();
       else paint($("cam-status"), await why(r, "No photo"), "red");
@@ -288,6 +302,16 @@
       } catch (e) { /* remembered until the page closes */ }
       paintSizes();
       poll();
+    });
+  }
+
+  for (const [id, by] of [["ev-down", -1], ["ev-up", 1]]) {
+    $(id).addEventListener("click", () => {
+      exposure = Math.max(-EXPOSURE_MOST, Math.min(EXPOSURE_MOST, exposure + by));
+      try {
+        localStorage.setItem("mavlte.exposure", String(exposure));
+      } catch (e) { /* remembered until the page closes */ }
+      paintExposure(false);
     });
   }
 
@@ -555,5 +579,6 @@
   });
 
   paintSizes();
+  paintExposure(true);
   poll();
 })();

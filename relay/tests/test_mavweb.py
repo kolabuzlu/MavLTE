@@ -64,7 +64,9 @@ class WebTest(unittest.TestCase):
             transport, _ = await self.loop.create_datagram_endpoint(lambda: self.relay, local_addr=("127.0.0.1", 0))
             self.vehicle = mr.TunnelClient(mr.ROLE_VEHICLE, KEY_V, "127.0.0.1", transport.get_extra_info("sockname")[1],
                                            on_data=lambda data: None)
-            self.outbox = outbox = mr.PhotoOutbox(self.vehicle, capture=lambda width, height: JPEG,
+            self.captured = []  # (width, height, exposure) of each photo the aircraft took
+            self.outbox = outbox = mr.PhotoOutbox(self.vehicle, capture=lambda width, height, exposure:
+                                                  self.captured.append((width, height, exposure)) or JPEG,
                                                   where=lambda: (411234567, 289876543, 120_000, 4500),
                                                   cap=lambda: 64 * 1024)
             self.vehicle.on_packet, self.vehicle.on_session = outbox.on_packet, outbox.on_session
@@ -274,6 +276,9 @@ class WebTest(unittest.TestCase):
             self.assertEqual(self.request("POST", "/api/voice", body, cookie)[0], 400, body)
         for size in (3, -1, True, "1", None):
             self.assertEqual(self.request("POST", "/api/snapshot", {"size": size}, cookie)[0], 400, size)
+        for exposure in (4, -4, "1", True, 1.5, None):
+            self.assertEqual(self.request("POST", "/api/snapshot", {"size": 0, "exposure": exposure}, cookie)[0], 400,
+                             exposure)
         for body in ({"mode": 3}, {"mode": -1}, {"mode": True}, {"mode": "1"}, {"mode": None}, {}):
             self.assertEqual(self.request("POST", "/api/network", body, cookie)[0], 400, body)
         self.assertEqual(self.relay.network.mode, mr.NET_AUTO)
@@ -377,6 +382,16 @@ class WebTest(unittest.TestCase):
         [listed] = json.loads(body)
         self.assertEqual(listed["id"], photo["id"])
         self.assertTrue(listed["caption"].startswith("41.123457, 28.987654 · 120 m above home · heading 45° · 320×240"))
+        self.assertEqual(self.captured, [(320, 240, 0)])  # (a page before 1.8.9 sends no exposure: 0)
+
+        # brighter (1.8.9): the exposure the phone chose goes with the request, and comes back with the photo
+        self.wait(cookie, lambda s: s["camera"]["ready"], "ready for the next")
+        with self.assertLogs("mavrelay.web", "INFO") as logs:
+            self.assertEqual(self.request("POST", "/api/snapshot", {"size": 1, "exposure": 2}, cookie)[0], 200)
+        self.assertIn("(medium, 640×480, EV +2)", logs.output[-1])
+        s = self.wait(cookie, lambda s: s["photo"] is not None and s["photo"]["id"] != photo["id"], "the second photo")
+        self.assertEqual(self.captured[-1], (640, 480, 2))
+        self.assertEqual(s["photo"]["caption"], "120 m · heading 45° · EV +2")
 
         self.wait(cookie, lambda s: s["camera"]["ready"], "ready again")
         self.outbox.capture = None  # its CAM switch off

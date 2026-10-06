@@ -135,10 +135,11 @@ static bool card_send(void *ctx, uint8_t type, const uint8_t *body, size_t len)
     return tun_send_packet(&tun, type, body, len);
 }
 
-static void take(void *ctx, uint32_t photo_id, uint16_t width, uint16_t height)
+static void take(void *ctx, uint32_t photo_id, uint16_t width, uint16_t height, int8_t exposure)
 {
     (void)ctx;
-    fprintf(stderr, "harness: photo %u asked for (%ux%u)\n", (unsigned)photo_id, width, height);
+    fprintf(stderr, "harness: photo %u asked for (%ux%u, exposure %+d)\n", (unsigned)photo_id, width, height,
+            exposure);
     const snap_where_t where = {411234567, 289876543, 120000, 4500};
     snap_photo_taken(&snap, photo_id, SNAP_OK, photo, sizeof(photo), &where, now_ms());
 }

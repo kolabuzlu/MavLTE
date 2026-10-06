@@ -115,6 +115,7 @@ class Settings:
     udp: str = "127.0.0.1:14550"
     photo_dir: str = ""  # empty: Pictures\MavLTE
     photo_size: str = "medium"
+    photo_exposure: int = 0  # steps brighter (+) or darker (-), see aircraft_card.EXPOSURE_MOST
     problem: str = ""  # why the settings file could not be read: the app then starts without it
 
     @classmethod
@@ -135,6 +136,11 @@ class Settings:
         s.photo_dir = conf.get("photo_dir", "").strip()
         size = conf.get("photo_size", "").strip().lower()
         s.photo_size = size if size in SIZE_NAMES else s.photo_size
+        try:
+            exposure = int(conf.get("photo_exposure", "0").strip() or 0)
+        except ValueError:
+            exposure = 0
+        s.photo_exposure = max(-aircraft_card.EXPOSURE_MOST, min(aircraft_card.EXPOSURE_MOST, exposure))
         return s
 
     def photo_folder(self) -> str:
@@ -257,11 +263,11 @@ class AgentRunner:
 
         self._call(go())
 
-    def snapshot(self, size: int) -> bool:
+    def snapshot(self, size: int, exposure: int = 0) -> bool:
         """Asks the aircraft for a photo. False while there is no session with the relay."""
         async def go() -> bool:
             agent = self.agent
-            return agent is not None and agent.photos is not None and agent.photos.request(size)
+            return agent is not None and agent.photos is not None and agent.photos.request(size, exposure)
 
         return self._call(go())
 
@@ -600,6 +606,46 @@ class Segments(tk.Frame):
                 label.configure(bg=BORDER if on else FIELD, fg=MUTED if on else DIM)
 
 
+class Stepper(tk.Frame):
+    """A value from -most to +most, one step down or up with the buttons at its sides; as tall as Segments."""
+
+    def __init__(self, master, app: "App", value: int, most: int, text: Callable[[int], str],
+                 command: Callable[[int], None]) -> None:
+        super().__init__(master, bg=BORDER, padx=1, pady=1)
+        self.most, self.text, self.command = most, text, command
+        pad, pady = round(7 * app.scale), round(3 * app.scale)
+        self.down = tk.Label(self, text="−", font=app.font_small, padx=pad, pady=pady, cursor="hand2")
+        self.down.pack(side="left")
+        widest = max((text(v) for v in range(-most, most + 1)), key=len)
+        self.label = tk.Label(self, text=text(value), font=app.font_small, width=len(widest), padx=round(2 * app.scale),
+                              pady=pady)
+        self.label.pack(side="left", padx=1)
+        self.up = tk.Label(self, text="+", font=app.font_small, padx=pad, pady=pady, cursor="hand2")
+        self.up.pack(side="left")
+        self.down.bind("<Button-1>", lambda _e: self.step(-1))
+        self.up.bind("<Button-1>", lambda _e: self.step(1))
+        self.value, self.enabled = value, True
+        self._paint()
+
+    def step(self, by: int) -> None:
+        value = max(-self.most, min(self.most, self.value + by))
+        if self.enabled and value != self.value:
+            self.value = value
+            self._paint()
+            self.command(value)
+
+    def set_enabled(self, enabled: bool) -> None:
+        if enabled != self.enabled:
+            self.enabled = enabled
+            self._paint()
+
+    def _paint(self) -> None:
+        self.label.configure(text=self.text(self.value), bg=FIELD, fg=TEXT if self.enabled else DIM)
+        for button, end in ((self.down, -self.most), (self.up, self.most)):
+            usable = self.enabled and self.value != end
+            button.configure(bg=FIELD, fg=TEXT if usable else DIM, cursor="hand2" if usable else "")
+
+
 class CameraRow(tk.Frame):
     """Snapshot, at the bottom of the Aircraft card: a photo from the aircraft's camera, by way of the
     relay."""
@@ -622,6 +668,10 @@ class CameraRow(tk.Frame):
         self.button.pack(side="left")
         self.size = Segments(top, app, self.SIZES, SIZE_NAMES.index(app.settings.photo_size), app.choose_size)
         self.size.pack(side="left", padx=(pad, 0))
+        # the exposure (1.8.9): brighter for the ground beside the white aircraft that fills the middle, or darker
+        self.exposure = Stepper(top, app, app.settings.photo_exposure, aircraft_card.EXPOSURE_MOST,
+                                aircraft_card.exposure_text, app.choose_exposure)
+        self.exposure.pack(side="left", padx=(pad, 0))
         self.status = tk.Label(left, text="", bg=SURFACE, fg=DIM, font=app.font_small, anchor="w", justify="left")
         self.status.pack(fill="x", pady=(round(3 * s), 0))
         self.bar_h = max(3, round(3 * s))
@@ -1781,10 +1831,11 @@ class App:
     def snapshot(self) -> None:
         if not self.camera.enabled:
             return
-        size = self.camera.size.selected
-        if self.runner.running and self.runner.snapshot(size):
+        size, exposure = self.camera.size.selected, self.camera.exposure.value
+        if self.runner.running and self.runner.snapshot(size, exposure):
             self.clicked_at = time.monotonic()
-            log.info("asking the aircraft for a photo (%s, %d×%d)", SIZE_NAMES[size], *mr.SNAP_SIZES[size])
+            log.info("asking the aircraft for a photo (%s, %d×%d, %s)", SIZE_NAMES[size], *mr.SNAP_SIZES[size],
+                     aircraft_card.exposure_text(exposure))
         else:
             self.camera.show("Not connected to the relay", RED)
 
@@ -1798,6 +1849,11 @@ class App:
         self.network.set_pending(True)  # asked for: the aircraft takes it within seconds
         if not (self.runner.running and self.runner.set_network(index)):
             self._show_network(self.runner.agent, None)  # no session: as it was (the next poll greys it out)
+
+    def choose_exposure(self, steps: int) -> None:
+        self.settings.photo_exposure = steps
+        self._remember("photo_exposure")
+        self.camera.show(aircraft_card.exposure_hint(steps))
 
     def choose_size(self, index: int) -> None:
         self.settings.photo_size = SIZE_NAMES[index]
@@ -2031,6 +2087,7 @@ class App:
         self.camera.show(cam.text, PALETTE[cam.color], cam.fraction)
         self.camera.set_enabled(cam.ready)
         self.camera.size.set_enabled(not cam.busy)
+        self.camera.exposure.set_enabled(not cam.busy)
 
     def _show_network(self, agent, status: Optional[mr.LinkStatus]) -> None:
         shown = aircraft_card.network(agent, status)
