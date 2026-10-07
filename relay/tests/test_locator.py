@@ -56,10 +56,11 @@ class PositionTest(unittest.TestCase):
         self.assertEqual(mr.Position().fc_silent, mr.U16_UNKNOWN)  # not heard since the module started
 
     def test_cell_curve(self):
-        """The user's scale: 4.20 V full, 3.40 V empty, along a Li-ion curve; the same as the firmware's."""
-        self.assertEqual([mr.cell_percent(mv) for mv in (4300, 4200, 3950, 3800, 3750, 3450, 3400, 3000)],
-                         [100, 100, 74, 55, 47, 3, 0, 0])
-        self.assertEqual([mr.cell_mv(pct) for pct in (100, 55, 0)], [4200, 3800, 3400])
+        """The user's scale: 4.10 V and above full, 3.40 V empty, along a Li-ion curve; the same as the firmware's."""
+        self.assertEqual([mr.cell_percent(mv) for mv in (4300, 4200, 4150, 4100, 4095, 3950, 3800, 3750, 3450, 3400,
+                                                         3000)],
+                         [100, 100, 100, 100, 99, 82, 62, 54, 4, 0, 0])
+        self.assertEqual([mr.cell_mv(pct) for pct in (100, 62, 0)], [4100, 3800, 3400])
         for pct in range(101):  # the simulator's voltage gives its charge back
             self.assertEqual(mr.cell_percent(mr.cell_mv(pct)), pct)
         with open(os.path.join(os.path.dirname(__file__), "..", "..", "firmware", "main", "locator.c"),

@@ -1435,15 +1435,17 @@ static void test_log_times(void)
 
 static void test_cell_percent(void)
 {
-    /* the user's endpoints, 4.20 V full and 3.40 V empty, and the curve's points between them */
-    static const uint16_t points[][2] = {{4200, 100}, {4100, 90}, {4000, 79}, {3900, 68}, {3800, 55},
-                                         {3700, 38},  {3600, 21}, {3500, 6},  {3400, 0}};
+    /* the user's endpoints, 4.10 V full and 3.40 V empty, and the curve's points between them */
+    static const uint16_t points[][2] = {{4100, 100}, {4000, 88}, {3900, 76}, {3800, 62},
+                                         {3700, 45},  {3600, 26}, {3500, 8},  {3400, 0}};
     for (size_t i = 0; i < sizeof(points) / sizeof(points[0]); i++) {
         CHECK(locator_cell_percent(points[i][0]) == points[i][1]);
     }
+    CHECK(locator_cell_percent(4150) == 100 && locator_cell_percent(4200) == 100); /* above 4.10 V: full all the same */
     CHECK(locator_cell_percent(4298) == 100 && locator_cell_percent(65535) == 100); /* on USB or the BEC: the rail */
+    CHECK(locator_cell_percent(4095) == 99 && locator_cell_percent(4050) == 94);
     CHECK(locator_cell_percent(3399) == 0 && locator_cell_percent(0) == 0);
-    CHECK(locator_cell_percent(3950) == 74 && locator_cell_percent(3750) == 47 && locator_cell_percent(3450) == 3);
+    CHECK(locator_cell_percent(3950) == 82 && locator_cell_percent(3750) == 54 && locator_cell_percent(3450) == 4);
     uint8_t last = 0;
     for (unsigned mv = 3300; mv <= 4300; mv++) { /* never down as the voltage goes up */
         uint8_t pct = locator_cell_percent((uint16_t)mv);

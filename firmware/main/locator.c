@@ -197,8 +197,8 @@ bool gnss_parse(const char *answer, gnss_fix_t *out)
 
 uint8_t locator_cell_percent(uint16_t mv)
 {
-    static const uint16_t curve[][2] = {{4200, 100}, {4100, 90}, {4000, 79}, {3900, 68}, {3800, 55},
-                                        {3700, 38},  {3600, 21}, {3500, 6},  {3400, 0}};
+    static const uint16_t curve[][2] = {{4100, 100}, {4000, 88}, {3900, 76}, {3800, 62},
+                                        {3700, 45},  {3600, 26}, {3500, 8},  {3400, 0}};
     if (mv >= curve[0][0]) {
         return 100;
     }

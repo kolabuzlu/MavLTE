@@ -39,7 +39,7 @@ import time
 from collections import Counter, deque
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-__version__ = "1.8.9"
+__version__ = "1.8.10"
 
 log = logging.getLogger("mavrelay")
 slog = log.getChild("relay")  # one logger per role, so combined logs (sitl_demo.py) stay readable
@@ -708,10 +708,9 @@ BATTERY_UNKNOWN = 0xFF
 # BEC) powers the board it reads the converter feeding that rail (about 4.3 V), more than a Li-ion cell holds
 EXTERNAL_POWER_MV = 4250
 # The charge of the board's 18650 cell from its voltage, as the firmware reckons it (locator_cell_percent() in
-# firmware/main/locator.c): 4.20 V full and 3.40 V empty (the modem's lowest supply), along a Li-ion discharge curve
-# in between: mV, %.
-CELL_CURVE = ((4200, 100), (4100, 90), (4000, 79), (3900, 68), (3800, 55), (3700, 38), (3600, 21), (3500, 6),
-              (3400, 0))
+# firmware/main/locator.c): 4.10 V and above full (the most the gauge reads on the cell after a full charge) and
+# 3.40 V empty (the modem's lowest supply), along a Li-ion discharge curve in between: mV, %.
+CELL_CURVE = ((4100, 100), (4000, 88), (3900, 76), (3800, 62), (3700, 45), (3600, 26), (3500, 8), (3400, 0))
 
 
 def cell_percent(mv: int) -> int:

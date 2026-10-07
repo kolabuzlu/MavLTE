@@ -37,8 +37,9 @@ void gnss_clear(gnss_fix_t *out);
  * false if there is no +CGNSSINFO: line in it; a line without a position gives a fix of GNSS_FIX_NONE. */
 bool gnss_parse(const char *answer, gnss_fix_t *out);
 
-/* The charge of the board's 18650 cell (0-100 %) from its voltage (mV): 4.20 V full and 3.40 V empty (the user's
- * endpoints; the A7670E's lowest supply: below it the modem stops), along a Li-ion cell's discharge curve in between,
+/* The charge of the board's 18650 cell (0-100 %) from its voltage (mV): 4.10 V and above full, 3.40 V empty (the
+ * user's endpoints: 4.10 V is the most the gauge reads on the cell after a full charge, the cell then running the board;
+ * 3.40 V is the A7670E's lowest supply: below it the modem stops), along a Li-ion cell's discharge curve in between,
  * whose voltage stays flat through the middle and falls fast near empty. relay/mavrelay.py has the same CELL_CURVE. */
 uint8_t locator_cell_percent(uint16_t mv);
 

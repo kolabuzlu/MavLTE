@@ -257,10 +257,12 @@ flight controller. Either:
   takes over without a break. On V2 boards the gauge measures the board's supply rail, not the
   cell: while USB or the BEC powers the board, the rail is about 4.3 V, which MavLTE shows as
   *external power*; on the cell alone, it is the cell. The charge comes from the cell's voltage:
-  4.20 V is 100 % and 3.40 V is 0 % (the modem's lowest supply: below it, the module stops), along
-  a Li-ion cell's curve, which stays flat through the middle and falls fast near empty: 4.0 V is
-  79 %, 3.8 V 55 %, 3.7 V 38 %, 3.6 V 21 %, 3.5 V 6 %. The gauge shares the camera's bus, whose
-  pull-up resistors take their power from the camera: with DIP switch CAM off, it does not answer.
+  4.10 V and above is 100 % (the most the gauge reads on the cell after a full charge, the cell
+  then running the board) and 3.40 V is 0 % (the modem's lowest supply: below it, the module
+  stops), along a Li-ion cell's curve, which stays flat through the middle and falls fast near
+  empty: 4.0 V is 88 %, 3.8 V 62 %, 3.7 V 45 %, 3.6 V 26 %, 3.5 V 8 %. The gauge shares the
+  camera's bus, whose pull-up resistors take their power from the camera: with DIP switch CAM off,
+  it does not answer.
 
 The bursts are strongest on 2G (GSM/EDGE), and the board has less buffer capacitance on the
 modem's supply than SIMCom asks for: keep the supply wires short and thick, and where LTE
